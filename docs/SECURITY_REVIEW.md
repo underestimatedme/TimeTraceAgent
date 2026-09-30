@@ -583,6 +583,141 @@ A folder workspace has no git history to isolate a run in, so the control is
   read (by absolute path) and put them in its reply; the reply is redacted
   for known secret patterns only. The same holds for chat turns.
 
+## Addendum 2026-09-30: protocol 2 (remote control, approvals, self-check) — 0.4.0
+
+Reviewed against Claude Code 2.1.285 and Codex CLI 0.155.1; server contract
+Valley `docs/remote-control-protocol.md` (protocol 2).
+
+### Claude task runs are bidirectional stream-json
+
+- Argv (`adapters/claude.build_stream_cmd`): `-p --input-format stream-json
+  --output-format stream-json --verbose --permission-mode default
+  --permission-prompts host --permission-prompt-tool stdio
+  --disallowedTools "Bash(git push:*)" "Bash(git push*)"`, the configured
+  `--allowedTools`, `--setting-sources user` (H-5), `--append-system-prompt
+  SAFETY_RULES`. The prompt is **no longer an argv element**: it and every
+  appended instruction are stream-json user messages on stdin, so H-4 no
+  longer applies to task runs (`safe_positional` stays for the text-mode
+  paths). `acceptEdits` (the old default) becomes `default` so that every
+  edit reaches the rule table below; an explicitly widened
+  `permission_mode` (e.g. `bypassPermissions`) is still honoured and still
+  voids these guarantees (I-1).
+- Protocol confirmed from local sources, not guessed: the CLI's own zod
+  schemas for the `can_use_tool` control request and the permission result
+  (`{behavior: allow, updatedInput?, toolUseID?}` /
+  `{behavior: deny, message, interrupt?, toolUseID?}`), the print-mode
+  routing, and the Agent SDK 0.3.156 host; plus a live probe of the control
+  channel with an `initialize` request only (no user message, no model
+  call). **Finding:** `--permission-prompts host` alone does *not* send
+  prompts to the stdio host — the CLI routes them there only with
+  `--permission-prompt-tool stdio` (what the SDK passes); without it an
+  "ask" is resolved locally and denied. Both flags are passed.
+  `permission_mode default` is a hidden alias in 2.1.285 (`--help` lists
+  `manual`); both parse.
+- Unknown control requests (hook callbacks, MCP messages, elicitation) get
+  an error response; no hooks or SDK MCP servers are ever registered.
+  `control_cancel_request` withdraws a pending prompt.
+- stdin closes once every written user message has been answered by a
+  `result` (or after 5 s of silence following a result, when the CLI folded
+  a mid-turn message into the running turn); the process group is SIGKILLed
+  after every exit, as before. Tests: a fake CLI (`tests/fake_claude_stream.py`)
+  that speaks the confirmed protocol (`tests/test_claude_stream.py`).
+
+### Local permission rules (`timetrace/approvals.py`)
+
+Evaluated before anything is sent to the phone; a phone approval can never
+override a deny.
+
+- deny: `git push` anywhere in a compound command, `git remote
+  add|set-url|remove|rename|…`, `git config` writes, creating / renaming /
+  deleting branches, `git switch`, `git checkout -b/-B/--orphan`,
+  `git worktree|update-ref|symbolic-ref|filter-branch|replace`, `sudo`;
+  file writes outside the worktree (paths resolved with symlinks followed),
+  into its `.git` or CI configuration; any read or command touching a
+  credential location (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`,
+  `~/.config/gh`, `~/.docker/config.json`, `~/.kube`, `~/.timetrace` outside
+  the worktree itself, `~/.claude/.credentials.json`, `~/.claude.json`,
+  `~/.codex/auth.json`, `Library/Keychains`, `security find-*-password`).
+- allow: reads and edits inside the worktree; one simple command (no `;`,
+  `&`, `|`, redirection, backticks or `$(`) from `ls cat head tail wc pwd
+  grep rg find file stat which` or `git status|diff|log|show|rev-parse|
+  ls-files|blame|add|commit`, without git global options (`-c`, `-C`, …),
+  without `--output` / `--ext-diff` / `--pre` / `find -exec|-delete|…`,
+  and with every path argument inside the worktree.
+- ask: everything else → `approval_requested` with the redacted input
+  (`redact_deep`, strings cut, ≤ 3.5 KB of JSON as Valley measures it) and a
+  redacted one-line summary. No decision within 10 minutes (or Valley's
+  `reason: "expired"`) → deny with 「用户未批准，请换一种不需要该操作的做法或结束并说明」.
+  The wait pauses Claude's `timeout_seconds` clock; the lease keeps being
+  renewed by the job thread, so it never expires during a wait.
+- `remember` ("本任务内同类都允许"): tool + the first two words of a simple
+  command, in memory for this job only; compound commands are never
+  remembered or matched; deny rules are checked first.
+- *Residual risk:* the shell parsing is heuristic. Obfuscated commands
+  (`eval`, variables, `sh -c "…"`) are not auto-allowed but fall to "ask",
+  and the phone can approve them; a phone-approved command runs as the user
+  **without an OS sandbox** (Claude Code has none here), with network. The
+  worktree `pushurl = no_push://blocked` still stops a plain `git push`, but
+  an approved command can push by URL or do anything else the user can.
+  `remember` of e.g. `npm run` covers every script. Approve only what you
+  understand; the summary and input shown are redacted, not complete.
+
+### Controls (interrupt / append)
+
+- Controls and decisions arrive only on the lease-renewal response of the
+  job's own attempt, are de-duplicated by id, and apply to task jobs only
+  (chat, review, check and import jobs never get a RunControl).
+- Interrupt kills the tool's process group (as a cancel does), keeps the
+  worktree and branch, and writes a checkpoint (`reason
+  interrupted_by_user`, verified with `verify_metadata` before the runner's
+  git snapshot, H-2). Completion that reached the computer first wins; a
+  cancel (`desired_action`) or shutdown still dominates. A resume job
+  (`resume_of_job_id`) goes through the existing checkpoint validation and
+  resumes the checkpoint's session and branch; `resume_note` is sent as the
+  next user message (Codex: after SAFETY_RULES, as every Codex prompt).
+- Append: Claude → a stream-json user message (never argv). Codex, or a
+  Claude session that no longer reads stdin → `queued_next_turn`, then after
+  the turn `exec resume` / `--resume` in the same job with exactly the same
+  sandbox and read-only parameters (H-3), after re-running the zero-spend
+  gate; a closed gate fences the job as before. The text is not echoed back
+  in any event. SAFETY_RULES stays the system prompt of the session.
+- Folder workspaces: Claude runs with stream-json input for appends but
+  `--permission-prompts none` (nothing is ever asked; restricted mode as
+  before). Interrupt runs the folder change check; changes outside the
+  output directory fail the job instead.
+
+### Self-check, pause, sleep prevention, reset credits, audit
+
+- Self-check (`timetrace/health.py`): login state from the cached zero-spend
+  verdict (`claude auth status` / `codex login status`) and the presence of
+  the local login; `shutil.disk_usage` of the workspace volumes; `git status
+  --porcelain --untracked-files=no` in each registered **main checkout**
+  with `SAFE_GIT` (no hooks, no fsmonitor). Only ok/expired/missing, a
+  number and booleans leave the computer.
+- `timetrace agent pause|resume` writes `~/.timetrace/local_pause.json`
+  (0600, separate from runner_state.json so the agent cannot overwrite it);
+  Valley cannot lift it.
+- `caffeinate -i -w <agent pid>` (fixed argv, `/usr/bin/caffeinate`) while
+  any job runs; it exits by itself with the agent.
+- Reset credits: a short-lived `codex app-server` (sanitized environment,
+  20 s timeout, killed afterwards) with `initialize` → `initialized` →
+  `account/rateLimits/read`. `app_server_request` refuses
+  `account/rateLimitResetCredit/*` (test: the fake app-server's transcript
+  never contains the consume method). Only credit ids, types, statuses,
+  times and descriptions (≤ 200 chars) are reported, keyed by the opaque
+  account digest (L-5). Any failure reports `status: unknown`, never 0.
+- `~/.timetrace/audit.log`: created 0600 with `O_APPEND | O_NOFOLLOW`,
+  bounded fields, local only. Approval entries hold the redacted summary,
+  never the input.
+
+### Verification
+
+`tests/test_claude_stream.py`, `tests/test_approvals.py`,
+`tests/test_remote_control.py`, `tests/test_remote_jobs.py`,
+`tests/test_self_check.py`, `tests/test_claude_adapter.py`
+(`StreamCmdTest`, `StreamAdapterTest`), `tests/test_cli.py`,
+`tests/test_cloud.py`.
+
 ## Verification
 
 - Conversation import: `tests/test_import_parse.py`.
