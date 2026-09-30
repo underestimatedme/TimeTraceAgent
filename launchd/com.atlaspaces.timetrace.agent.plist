@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Replace __TIMETRACE_BIN__ with the absolute path of cli/bin/timetrace and __HOME__ with your home. -->
+    <key>Label</key>
+    <string>com.atlaspaces.timetrace.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__TIMETRACE_BIN__</string>
+        <string>agent</string>
+        <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>TIMETRACE_HOME</key>
+        <string>__HOME__/.timetrace</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.timetrace/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.timetrace/daemon.err</string>
+</dict>
+</plist>

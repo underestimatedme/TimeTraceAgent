@@ -1,0 +1,12 @@
+#!/bin/sh
+# timetrace launcher: runs the package from the repo checkout without installation.
+# Resolves symlinks so `ln -s .../bin/timetrace /opt/homebrew/bin/timetrace` works.
+SELF="$0"
+while [ -L "$SELF" ]; do
+    DIR="$(cd "$(dirname "$SELF")" && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")/.." && pwd)"
+# Unbuffered so the pairing code from `timetrace cloud login` appears at once, even when piped to a log.
+PYTHONUNBUFFERED=1 PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m timetrace "$@"
