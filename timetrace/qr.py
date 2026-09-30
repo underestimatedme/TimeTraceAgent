@@ -3,7 +3,8 @@
 Byte mode, error correction M (falling back to L when M does not fit),
 versions 1-6 — plenty for a timetrace://pair link. `encode` returns a square
 matrix of booleans (True = dark); `render_half_blocks` turns it into lines
-of Unicode half blocks so two module rows fit in one terminal line.
+of Unicode half blocks so two module rows fit in one terminal line (see
+timetrace.pairscreen for the pairing screen built on it).
 """
 from typing import List
 
@@ -76,8 +77,8 @@ def _codewords(payload: bytes, version: int, level: str) -> List[int]:
     return out
 
 
-def _choose(payload: bytes):
-    for level in ("M", "L"):
+def _choose(payload: bytes, levels=("M", "L")):
+    for level in levels:
         for version in range(1, MAX_VERSION + 1):
             _, block_count, data_len = _BLOCKS[(version, level)]
             if 12 + 8 * len(payload) <= block_count * data_len * 8:
@@ -208,9 +209,10 @@ def _penalty(m: Matrix) -> int:
     return score + max(0, k) * 10
 
 
-def encode(text: str) -> Matrix:
+def encode(text: str, levels=("M", "L")) -> Matrix:
+    """Smallest version at the first level of `levels` that fits (M, then L)."""
     payload = text.encode("utf-8")
-    version, level = _choose(payload)
+    version, level = _choose(payload, tuple(levels))
     codewords = _codewords(payload, version, level)
     best = None
     for mask in range(8):
@@ -225,19 +227,28 @@ def encode(text: str) -> Matrix:
     return best[1]
 
 
-def render_half_blocks(matrix: Matrix, border: int = 2) -> List[str]:
-    """Light modules are drawn, dark ones left blank: print it light-on-dark
-    (e.g. white on black) so the phone camera sees dark modules on white."""
+QUIET_ZONE = 4  # modules of light margin the standard asks for on every side
+
+
+def render_half_blocks(matrix: Matrix, border: int = QUIET_ZONE, dark: bool = False) -> List[str]:
+    """Two module rows per text line, `border` light modules around the code.
+
+    dark=False draws the light modules and leaves dark ones blank: for a
+    terminal whose own colours are light-on-dark. dark=True draws the dark
+    modules: for black-on-white colours set by the caller (ANSI). A code with
+    an odd row count gets one more light row at the bottom."""
     rows = len(matrix)
     cols = len(matrix[0]) if matrix else 0
     height, width = rows + 2 * border, cols + 2 * border
 
-    def light(r: int, c: int) -> bool:
-        r, c = r - border, c - border
-        if 0 <= r < rows and 0 <= c < cols:
-            return not matrix[r][c]
-        return True
+    def drawn(r: int, c: int) -> bool:
+        light = True
+        if r < height:
+            r, c = r - border, c - border
+            if 0 <= r < rows and 0 <= c < cols:
+                light = not matrix[r][c]
+        return light != dark
 
     glyphs = {(True, True): "█", (True, False): "▀", (False, True): "▄", (False, False): " "}
-    return ["".join(glyphs[(light(r, c), light(r + 1, c))] for c in range(width))
+    return ["".join(glyphs[(drawn(r, c), drawn(r + 1, c))] for c in range(width))
             for r in range(0, height, 2)]

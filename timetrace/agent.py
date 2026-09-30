@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict
 
 from timetrace.cloud import CloudError
 from timetrace.db import Database
-from timetrace import checks, folder, quota, results, worktree
+from timetrace import checks, folder, quota, results, runner_state, worktree
 from timetrace.process import tail_text
 from timetrace.redact import redact
 from timetrace.checkpoints import Checkpoint, checkpoint_problem
@@ -259,6 +259,7 @@ class Agent:
         try:
             counts = self.report_quota_counts(now)
             self.log("quota: " + ", ".join("%s %d" % (p, n) for p, n in counts.items()))
+            runner_state.record(self.home, quota_reported_at=int(now), quota_samples=sum(counts.values()))
         except Exception as exc:
             self.log("quota report failed: %s" % exc.__class__.__name__)
         if self._inventory is None:
@@ -272,6 +273,8 @@ class Agent:
             try:
                 self.cloud.update_inventory(self.access_token(), *current)
                 self._last_inventory = current
+                runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
+                                    inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
             except Exception as exc:
                 self.log("inventory push failed: %s" % exc.__class__.__name__)

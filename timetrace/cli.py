@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from timetrace import __version__, checks, config, folder, limits, qr, quota, render, scheduler, worktree
+from timetrace import (__version__, checks, config, folder, limits, pairscreen, qr, quota, render, runner_state,
+                       scheduler, worktree)
 from timetrace.agent import Agent, install_stop_handlers, restore_handlers
 from timetrace.cloud import CloudClient
 from timetrace.credentials import CredentialStore, SessionManager
@@ -65,40 +66,48 @@ def _pair_link(user_code: str, name: str, expires_at: Optional[int] = None) -> s
     tail = ("&exp=%d" % expires_at if expires_at else "") + "&platform=darwin&v=1"
     with_name = "%s&name=%s%s" % (base, quote(name, safe=""), tail)
     try:
-        qr.encode(with_name)
+        qr.encode(with_name, levels=("M",))
         return with_name
     except ValueError:
         return base + tail
 
 
-def _print_pair_qr(link: str, out=print) -> None:
-    lines = qr.render_half_blocks(qr.encode(link))
-    colour = out is print and sys.stdout.isatty()
-    for line in lines:
-        # White on black whatever the terminal theme, so the phone sees dark
-        # modules on a light background.
-        out("\x1b[97;40m%s\x1b[0m" % line if colour else line)
+def _live_countdown(screen: "pairscreen.PairScreen") -> bool:
+    """Rewrite the countdown in place only on a real terminal tall enough to
+    still show the countdown line (cursor-up stops at the top of the screen)."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "") == "dumb":
+        return False
+    return shutil.get_terminal_size((80, 24)).lines > screen.rows_below_countdown() + 2
 
 
 def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_rounds: int = 5) -> int:
     """Device-code pairing with the phone (QR code or typed code). Stores the
-    runner credentials in the Keychain and reports inventory and quota."""
+    runner credentials in the Keychain and reports inventory and quota. An
+    expired code is replaced by a fresh one, up to `max_rounds` times."""
     cloud = _cloud(cfg)
     name = platform.node() or "Mac"
+    colour = out is print and pairscreen.color_supported()
     for round_no in range(max_rounds):
         auth = cloud.create_device_authorization(name, "darwin", __version__)
         if round_no:
             out()
             out("上一个二维码已过期，已生成新的二维码：")
-        else:
-            out("用刻迹 iPhone App 的「你的 AI → 扫码绑定」扫描下方二维码（或用相机扫描）：")
         out()
         expires_in = int(auth["expires_in"])
-        _print_pair_qr(_pair_link(auth["user_code"], name, int(time.time()) + expires_in), out)
-        out()
-        out("扫不了码时，在「你的 AI → 绑定电脑」中输入：%s" % auth["user_code"])
-        out("授权码 %d 分钟内有效，正在等待确认…" % max(1, expires_in // 60))
-        result = _await_pairing(cloud, auth, cfg, db, home, out)
+        # Black on white whatever the terminal theme, so the phone sees dark
+        # modules on a light background.
+        screen = pairscreen.PairScreen(_pair_link(auth["user_code"], name, int(time.time()) + expires_in),
+                                       name, auth["user_code"], expires_in, ansi=colour,
+                                       colours=pairscreen.black_on_white())
+        for line in screen.lines():
+            out(line)
+        out("正在等待手机确认…")
+        tick = None
+        if out is print and _live_countdown(screen):
+            def tick(remaining, screen=screen):
+                sys.stdout.write(screen.update_sequence(remaining, extra_below=1))
+                sys.stdout.flush()
+        result = _await_pairing(cloud, auth, cfg, db, home, out, tick=tick)
         if result is not None:
             return result
     if out is print:
@@ -108,9 +117,11 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
     return 1
 
 
-def _await_pairing(cloud, auth, cfg, db, home, out) -> Optional[int]:
-    """Poll one authorization. Returns 0 once bound, None when it expired."""
+def _await_pairing(cloud, auth, cfg, db, home, out, tick=None) -> Optional[int]:
+    """Poll one authorization. Returns 0 once bound, None when it expired.
+    `tick(remaining_seconds)` is called every second between polls."""
     deadline = time.time() + int(auth["expires_in"])
+    interval = max(1, int(auth.get("interval") or 5))
     while time.time() < deadline:
         approval = cloud.poll_device_authorization(auth["device_code"])
         if approval.get("status") == "approved":
@@ -123,8 +134,10 @@ def _await_pairing(cloud, auth, cfg, db, home, out) -> Optional[int]:
             try:
                 adapters = _adapters(cfg)
                 token = credentials["access_token"]
-                cloud.update_inventory(token, _runner_workspaces(db), _runner_tools(cfg, adapters), _max_parallel(cfg),
-                                       _max_parallel_per_tool(cfg))
+                workspaces, tools = _runner_workspaces(db), _runner_tools(cfg, adapters)
+                cloud.update_inventory(token, workspaces, tools, _max_parallel(cfg), _max_parallel_per_tool(cfg))
+                runner_state.record(home, inventory_pushed_at=int(time.time()), inventory_workspaces=len(workspaces),
+                                    inventory_tools=len(tools))
                 Agent(db, cloud, adapters, home, lambda: token).report_quota()
                 out("已上报工具清单与额度，手机上几秒内可见")
             except Exception as exc:
@@ -132,7 +145,12 @@ def _await_pairing(cloud, auth, cfg, db, home, out) -> Optional[int]:
             return 0
         if approval.get("status") == "expired":
             return None
-        time.sleep(max(1, int(auth.get("interval") or 5)))
+        if tick is None:
+            time.sleep(interval)
+            continue
+        for _ in range(interval):
+            tick(max(0.0, deadline - time.time()))
+            time.sleep(1)
     return None
 
 
