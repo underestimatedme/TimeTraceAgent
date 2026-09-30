@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from timetrace import (__version__, checks, config, folder, limits, pairscreen, qr, quota, render, runner_state,
-                       scheduler, toolpath, worktree)
+                       scheduler, statusline_hook, toolpath, worktree)
 from timetrace.agent import Agent, install_stop_handlers, restore_handlers
 from timetrace.cloud import CloudClient
 from timetrace.credentials import CredentialStore, SessionManager
@@ -575,6 +575,8 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
             print(line)
         if name in adapters:
             _print_tool_quota(adapters[name])
+    for line in _statusline_lines(home, db):
+        print(line)
     diagnostics = lock_diagnostics(home)
     for message in diagnostics:
         print("Execution lock: %s" % message)
@@ -665,8 +667,12 @@ def _install_runner(home: Path, out=print, resolutions=None) -> Path:
 
 def cmd_agent_install(args: argparse.Namespace) -> int:
     home, _, _ = _open(args)
-    destination = _install_runner(home)
+    _, resolutions = _discover_tools(home, Path.home())
+    destination = _install_runner(home, resolutions=resolutions)
     print("Runner 已安装并启动：%s" % destination)
+    claude = resolutions.get("claude")
+    if claude is not None and claude.path and not getattr(args, "no_statusline", False):
+        _install_statusline()  # a failure is reported but does not fail the install
     return 0
 
 
@@ -787,6 +793,20 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
         out("  跳过；需要时运行 `timetrace agent install`，或前台运行 `timetrace agent run`。")
         if hidden and installed_path is not None:
             out("  注意：已安装的后台 Runner 仍找不到 %s，运行 `timetrace agent install` 修复。" % "、".join(hidden))
+    claude = resolutions.get("claude")
+    if claude is not None and claude.path and not args.no_statusline:
+        if statusline_hook.installed(user_home, home):
+            out("  Claude 状态栏钩子：已安装")
+        else:
+            if args.yes:
+                wanted = True
+            else:
+                answer = ask("  让刻迹读取 Claude 额度（安装状态栏钩子）？[Y/n] ")
+                wanted = answer is not None and answer.lower() in ("", "y", "yes", "是", "好")
+            if wanted:
+                _install_statusline(out=lambda m: out("  " + m), err=lambda m: out("  " + m))
+            else:
+                out("  跳过状态栏钩子；需要时运行 `timetrace statusline --install`。")
     out()
     out("完成。随时运行 `timetrace agent doctor` 检查状态。" if result == 0 else "部分步骤未完成，见上方提示。")
     return result
@@ -1010,6 +1030,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     """
     if args.install:
         return _install_statusline()
+    if args.uninstall:
+        return _uninstall_statusline()
     raw = sys.stdin.read()
     try:
         doc = json.loads(raw) if raw.strip() else {}
@@ -1017,6 +1039,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         doc = {}
     home, cfg, db = _open(args)
     now = int(time.time())
+    runner_state.record(home, statusline_seen_at=now)
     rl = doc.get("rate_limits") or {}
     samples = []
     for key, w in rl.items():
@@ -1046,29 +1069,49 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_statusline() -> int:
-    """Register `timetrace statusline` as the statusLine command in ~/.claude/settings.json."""
-    settings = Path(os.path.expanduser("~/.claude/settings.json"))
-    data: Dict[str, Any] = {}
-    if settings.exists():
-        try:
-            data = json.loads(settings.read_text(encoding="utf-8") or "{}")
-        except ValueError:
-            print("error: %s is not valid JSON; fix it first" % settings, file=sys.stderr)
-            return 1
-    timetrace_bin = " ".join(shlex.quote(part) for part in timetrace_command())
-    current = data.get("statusLine")
-    if current and "timetrace" not in json.dumps(current):
-        print("existing statusLine kept, not overwriting: %s" % json.dumps(current), file=sys.stderr)
-        print("add `%s statusline` to that script yourself, e.g. pipe stdin through it" % timetrace_bin,
-              file=sys.stderr)
+def _install_statusline(out=print, err=None) -> int:
+    """Register `<timetrace> statusline` as Claude Code's statusLine command,
+    chaining (never overwriting) a status line the user already has."""
+    err = err or (lambda message: print(message, file=sys.stderr))
+    home = config.home()
+    try:
+        result, detail = statusline_hook.install(Path.home(), home, timetrace_command())
+    except (OSError, ValueError) as exc:
+        err("状态栏钩子未安装：%s 不是有效的 JSON 或无法写入（%s），请先修好它"
+            % (statusline_hook.settings_path(Path.home()), exc.__class__.__name__))
         return 1
-    data["statusLine"] = {"type": "command", "command": "%s statusline" % timetrace_bin}
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print("statusLine set in %s → %s statusline" % (settings, timetrace_bin))
-    print("restart Claude Code; quota samples from your interactive sessions now flow into timetrace")
+    if result == "refused":
+        err("状态栏钩子未安装：%s" % detail)
+        return 1
+    if result == "chained":
+        out("状态栏钩子已安装（与你原来的状态栏命令串联，原设置已备份；timetrace statusline --uninstall 可还原）")
+    elif result == "unchanged":
+        out("状态栏钩子：已安装")
+    else:
+        out("状态栏钩子已安装：%s" % detail)
+    if result != "unchanged":
+        out("重启 Claude Code 后，你自己在 Claude Code 里用掉的额度也会同步到刻迹")
     return 0
+
+
+def _uninstall_statusline() -> int:
+    try:
+        result = statusline_hook.uninstall(Path.home(), config.home())
+    except (OSError, ValueError) as exc:
+        print("error: %s: %s" % (statusline_hook.settings_path(Path.home()), exc.__class__.__name__), file=sys.stderr)
+        return 1
+    print({"restored": "已还原原来的状态栏命令", "removed": "已移除状态栏钩子",
+           "absent": "没有安装状态栏钩子"}[result])
+    return 0
+
+
+def _statusline_lines(home: Path, db: Database) -> List[str]:
+    if not statusline_hook.installed(Path.home(), home):
+        return ["Claude 状态栏钩子: 未安装 → 运行 timetrace statusline --install"]
+    last = db.latest_sample_at("statusline")
+    if last:
+        return ["Claude 状态栏钩子: 已安装；上次额度样本 %s" % _iso_local(last)]
+    return ["Claude 状态栏钩子: 已安装；还没有收到额度样本（在 Claude Code 里发一条消息后会出现）"]
 
 
 # ---- parser ---------------------------------------------------------------------
@@ -1124,6 +1167,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.set_defaults(fn=cmd_events)
 
     sl = sub.add_parser("statusline", help="Claude Code statusLine hook: ingest interactive quota")
+    sl.add_argument("--uninstall", action="store_true",
+                    help="remove the hook from ~/.claude/settings.json, restoring a chained original")
     sl.add_argument("--install", action="store_true",
                     help="register this command in ~/.claude/settings.json")
     sl.set_defaults(fn=cmd_statusline)
@@ -1168,6 +1213,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--yes", "-y", action="store_true", help="accept the defaults without asking")
     st.add_argument("--no-pair", dest="no_pair", action="store_true", help="skip pairing with the phone")
     st.add_argument("--no-agent", dest="no_agent", action="store_true", help="skip installing the LaunchAgent")
+    st.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                    help="skip installing the Claude Code statusLine hook")
     st.set_defaults(fn=cmd_setup)
 
     conf = sub.add_parser("config", help="read or change ~/.timetrace/config.json")
@@ -1188,7 +1235,10 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--interval", type=int, default=5)
     ar.set_defaults(fn=cmd_agent_run)
     agent_sub.add_parser("doctor", help="check pairing, tools and workspaces").set_defaults(fn=cmd_agent_doctor)
-    agent_sub.add_parser("install", help="install the macOS LaunchAgent").set_defaults(fn=cmd_agent_install)
+    ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
+    ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                    help="do not register the Claude Code statusLine hook")
+    ai.set_defaults(fn=cmd_agent_install)
     return p
 
 

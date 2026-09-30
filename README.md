@@ -88,13 +88,13 @@ tta --version
 1. 检查 `claude` / `codex` 是否安装、是否通过零付费核验（同 `timetrace agent doctor`）；
 2. 登记允许远程任务使用的 Git 仓库（同 `timetrace workspace add`，可登记多个，回车结束）；
 3. 与手机绑定：终端显示二维码，用 App「你的 AI → 扫码绑定」扫描（同 `timetrace cloud login`）；
-4. 安装并启动后台 Runner LaunchAgent（同 `timetrace agent install`）。
+4. 安装并启动后台 Runner LaunchAgent（同 `timetrace agent install`），找到 `claude` 时再问一次是否安装 Claude Code 状态栏钩子（默认是）。
 
 脚本化安装可以用参数代替提问：
 
 ```sh
 timetrace setup --repo ~/code/TimeTrace --yes            # 登记仓库、绑定、安装 LaunchAgent，全部取默认
-timetrace setup --repo ~/code/a --repo ~/code/b --no-pair --no-agent --yes
+timetrace setup --repo ~/code/a --repo ~/code/b --no-pair --no-agent --no-statusline --yes
 ```
 
 已绑定的电脑不会被 `--yes` 重新绑定；输入结束（EOF）视为跳过。
@@ -281,11 +281,19 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | 终端（timetrace 无头运行） | `codex exec` 结束后立刻 `account/rateLimits/read` | 每次 `claude -p` 的 `rate_limit_event` |
 | 软件（你自己在 Codex 应用 / Claude Code 里用） | 同一接口，服务端真值，天然包含应用内消耗 | **`timetrace statusline`**：挂进 Claude Code 状态栏，每次刷新把 `rate_limits` 写进库 |
 
-装 Claude Code 状态栏钩子（会往 `~/.claude/settings.json` 写 `statusLine`，已有别的状态栏脚本时不覆盖）：
+`timetrace setup`（会问一次「让刻迹读取 Claude 额度（安装状态栏钩子）？」，默认是）和 `timetrace agent install`（加 `--no-statusline` 跳过）
+在找到 `claude` 时会自动安装 Claude Code 状态栏钩子：往 `~/.claude/settings.json` 写入
+`statusLine = "<timetrace 的绝对路径> statusline"`。也可以手动：
 
 ```sh
-timetrace statusline --install
+timetrace statusline --install     # 重复运行不会重复包装
+timetrace statusline --uninstall   # 移除；原来有自己的状态栏时原样还原
 ```
+
+已经有自己的状态栏命令时不会覆盖，而是串联：生成 `~/.timetrace/statusline-chain.sh`，把同一份 stdin JSON 先交给
+`timetrace statusline`（记录额度，输出丢弃，失败也不影响）再交给你原来的命令，状态栏显示的仍是你原来的输出。
+原来的 `statusLine` 记在 `~/.timetrace/statusline-original.json`，`settings.json` 首次修改前备份为
+`settings.json.timetrace-backup`。`timetrace agent doctor` 会显示钩子是否已安装、上次收到额度样本的时间。
 
 之后 Claude Code 的状态栏会显示 `timetrace · 5h 86% · 7d 97% · codex 35% · ⏳ 3h12m`，同时你交互会话里撞到的限流（100%）会让守护进程停止往 Claude 派工，直到 `resets_at` 过去或有新样本。
 

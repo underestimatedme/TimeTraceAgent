@@ -417,6 +417,11 @@ class Database:
         )
         return int(cur.lastrowid)
 
+    def latest_sample_at(self, source: str) -> Optional[int]:
+        """Time of the newest sample from `source` (e.g. "statusline")."""
+        row = self.conn.execute("SELECT MAX(at) FROM sample WHERE source=?", (source,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
     def latest_samples(self) -> List[Dict[str, Any]]:
         """One row per bucket: the newest sample joined with bucket metadata."""
         rows = self.conn.execute(
