@@ -120,8 +120,14 @@ class CloudClient:
 
     def update_inventory(self, token: str, workspaces: list, tools: list,
                          max_parallel: Optional[int] = None,
-                         max_parallel_per_tool: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+                         max_parallel_per_tool: Optional[Dict[str, int]] = None,
+                         extras: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """`extras`: the protocol-2 fields (protocol_version, agent_version,
+        accepting_local, health, reset_credits)."""
         body = {"workspaces": workspaces, "tools": tools}
+        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits"):
+            if extras and key in extras:
+                body[key] = extras[key]
         if max_parallel is not None:
             body["max_parallel"] = int(max_parallel)
         if max_parallel_per_tool is not None:

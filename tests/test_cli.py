@@ -215,6 +215,41 @@ class CliTest(unittest.TestCase):
         self.assertIn("套餐: prolite", out)
         self.assertIn("本周 剩余 89%", out)
 
+    def test_agent_pause_and_resume_are_local_and_audited(self):
+        from timetrace import audit, config, pause
+        code, out, _ = self.run_cli("agent", "pause")
+        self.assertEqual(code, 0)
+        self.assertIn("已暂停接活", out)
+        home = config.home()
+        self.assertTrue(pause.paused(home))
+        with patch("timetrace.cli._adapters", return_value={}), \
+             patch("timetrace.cli.CredentialStore.load", return_value=None):
+            _, doctor, _ = self.run_cli("agent", "doctor")
+        self.assertIn("已在电脑上暂停", doctor)
+        self.assertIn("协议 2", doctor)
+        self.assertIn("0.4.0", doctor)
+        self.run_cli("agent", "resume")
+        self.assertFalse(pause.paused(home))
+        self.assertEqual([e["event"] for e in audit.read(home)], ["pause", "resume"])
+
+    def test_doctor_shows_reset_credits_read_only(self):
+        class CodexLike:
+            def capabilities(self):
+                return {"can_read_quota": False}
+            def capability_details(self):
+                return {"can_enforce_zero_spend": True, "auth_method": "chatgpt", "verified_at": 1000}
+            def plan_tier(self):
+                return "plus"
+            def reset_credits_entry(self):
+                return {"pool_id": "pool-codex-ab", "status": "ok", "available_count": 2,
+                        "credits": [{"id": "c1", "status": "available", "description": "Welcome"}]}
+        with patch("timetrace.cli._adapters", return_value={"codex": CodexLike()}), \
+             patch("timetrace.cli.shutil.which", return_value="/test/codex"), \
+             patch("timetrace.cli.CredentialStore.load", return_value=None):
+            _, out, _ = self.run_cli("agent", "doctor")
+        self.assertIn("Codex 重置机会: 可用 2 次", out)
+        self.assertIn("Welcome", out)
+
     def test_doctor_labels_claude_windows_in_chinese(self):
         from timetrace.models import Sample
 

@@ -31,6 +31,8 @@ DEFAULTS: Dict[str, Any] = {
     # `check_env_drop` names more to remove, `check_env_keep` secret-named
     # ones a check needs (never an AI tool's).
     "check_env_drop": [],
+    # Keep the Mac from idle-sleeping (`caffeinate -i`) while a job runs.
+    "prevent_sleep": True,
     "check_env_keep": [],
     "claude": {
         "bin": "claude",

@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from timetrace import (__version__, checks, config, folder, limits, pairscreen, qr, quota, render, runner_state,
-                       scheduler, statusline_hook, toolpath, worktree)
-from timetrace.agent import Agent, install_stop_handlers, restore_handlers
+from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
+                       render, runner_state, scheduler, statusline_hook, toolpath, worktree)
+from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
+from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient
 from timetrace.credentials import CredentialStore, SessionManager
 from timetrace.db import Database
@@ -420,7 +421,12 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
                   max_parallel=_max_parallel(cfg), max_parallel_per_tool=_max_parallel_per_tool(cfg),
                   workspace_wait=WORKSPACE_WAIT_SECONDS,
                   check_env_drop=_str_list(cfg.get("check_env_drop")),
-                  check_env_keep=_str_list(cfg.get("check_env_keep")))
+                  check_env_keep=_str_list(cfg.get("check_env_keep")),
+                  report_protocol=True,
+                  health_check=lambda: health.check(adapters, db.list_workspaces(), home),
+                  reset_credits=lambda: _reset_credits(adapters),
+                  sleep_guard=SleepGuard() if cfg.get("prevent_sleep", True) else None,
+                  user_home=str(Path.home()))
     # Startup upkeep pushes the inventory once and reports quota right away.
     agent.maintain(force=True)
     if args.once:
@@ -434,6 +440,68 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
     finally:
         restore_handlers(previous)
     return 0
+
+
+def _reset_credits(adapters: Dict[str, Any]) -> list:
+    """Inventory `reset_credits`: one entry per Codex login (read only)."""
+    reader = getattr(adapters.get(CODEX), "reset_credits_entry", None)
+    entry = reader() if callable(reader) else None
+    return [entry] if entry else []
+
+
+def cmd_agent_pause(args: argparse.Namespace) -> int:
+    home, _, _ = _open(args)
+    value = args.agent_cmd == "pause"
+    pause.set_paused(home, value)
+    audit.record(home, "pause" if value else "resume", source="local")
+    if value:
+        print("已暂停接活：这台电脑不再领取新任务，正在运行的任务继续。手机无法解除本地暂停；运行 timetrace agent resume 恢复。")
+    else:
+        print("已恢复接活。")
+    return 0
+
+
+_LOGIN_LABEL = {"ok": "正常", "expired": "已过期 → 在这台 Mac 上重新登录", "missing": "未登录"}
+
+
+def _health_lines(report: Dict[str, Any]) -> List[str]:
+    lines = []
+    for tool in ("claude", "codex"):
+        state = report.get(tool + "_login")
+        if state:
+            lines.append("  %s 登录: %s" % (tool, _LOGIN_LABEL.get(state, state)))
+    free = report.get("disk_free_gb")
+    if free is not None:
+        level = "（不足 1 GB：不接新任务）" if free < 1 else ("（偏少，建议留出 5 GB）" if free < 5 else "")
+        lines.append("  磁盘剩余: %.1f GB%s" % (free, level))
+    for ws in report.get("workspaces") or []:
+        if not ws.get("exists"):
+            state = "目录不存在"
+        elif not ws.get("git"):
+            state = "文件夹（非 Git）"
+        else:
+            state = {True: "Git，干净", False: "Git，有未提交的改动"}.get(ws.get("clean"), "Git")
+        lines.append("  工作区 %s: %s" % (ws.get("id"), state))
+    return lines
+
+
+def _reset_credit_lines(adapters: Dict[str, Any]) -> List[str]:
+    reader = getattr(adapters.get(CODEX), "reset_credits_entry", None)
+    if not callable(reader):
+        return []
+    try:
+        entry = reader()
+    except Exception as exc:
+        return ["  Codex 重置机会: 暂时读不到（%s）" % exc.__class__.__name__]
+    if not entry:
+        return ["  Codex 重置机会: 没有 Codex 登录"]
+    if entry.get("status") != "ok":
+        return ["  Codex 重置机会: 暂时读不到"]
+    lines = ["  Codex 重置机会: 可用 %d 次（只读；在官方客户端里使用）" % entry["available_count"]]
+    for credit in entry.get("credits") or []:
+        lines.append("    %s %s%s" % (credit.get("status"), credit.get("description") or credit.get("id"),
+                                     "，%s 过期" % credit["expires_at"] if credit.get("expires_at") else ""))
+    return lines
 
 
 def _iso_local(epoch) -> str:
@@ -576,6 +644,20 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
         if name in adapters:
             _print_tool_quota(adapters[name])
     for line in _statusline_lines(home, db):
+        print(line)
+    print("电脑端版本: %s（协议 %d）" % (__version__, PROTOCOL_VERSION))
+    local = pause.state(home)
+    print("接活: %s" % ("已在电脑上暂停 → 运行 timetrace agent resume 恢复" if local["paused"] else "本机未暂停"))
+    print("防休眠: %s" % ("开启（有任务运行时 caffeinate -i）" if cfg.get("prevent_sleep", True) else "关闭"))
+    print("自检:")
+    try:
+        report = health.check(adapters, workspaces, home)
+    except Exception as exc:
+        report = {}
+        print("  自检失败（%s）" % exc.__class__.__name__)
+    for line in _health_lines(report):
+        print(line)
+    for line in _reset_credit_lines(adapters):
         print(line)
     diagnostics = lock_diagnostics(home)
     for message in diagnostics:
@@ -1235,6 +1317,9 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--interval", type=int, default=5)
     ar.set_defaults(fn=cmd_agent_run)
     agent_sub.add_parser("doctor", help="check pairing, tools and workspaces").set_defaults(fn=cmd_agent_doctor)
+    agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
+                         ).set_defaults(fn=cmd_agent_pause)
+    agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
     ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                     help="do not register the Claude Code statusLine hook")
