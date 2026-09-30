@@ -16,14 +16,16 @@ tta setup                          # 检查工具 → 登记仓库 → 扫码绑
 Claude/Codex 的登录凭据不会上传：iPhone 只把任务发给 Valley，本机 `timetrace agent` 通过出站 HTTPS 领取任务，再调用当前 macOS 用户已经登录的 CLI。
 
 ```sh
-timetrace cloud login                    # 终端显示二维码，用 iPhone「你的 AI → 扫码绑定」扫描后确认
+timetrace cloud login                    # 终端显示二维码，在刻迹「我的电脑 → 绑定新电脑」扫描后确认
 timetrace workspace add ~/code/TimeTrace # 只显式开放这个仓库
 timetrace agent doctor                   # 检查配对、CLI 和工作区
 timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
 
-`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，二维码下方的 8 位码照旧可以在「你的 AI → 绑定新电脑」里手动输入。二维码按白底黑码输出，终端窗口太窄时把窗口拉宽一些再扫。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
+`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
+
+二维码用半块字符绘制（两行模块占一行文字，约 49×25 字符，80 列终端放得下），四周留 4 个模块的静区。彩色终端里强制白底黑码，与终端主题无关；设置了 `NO_COLOR`、`TERM=dumb` 或输出不是终端时改为不带颜色的反相字符（适合深色背景的终端）。上方框内的「2 分钟内有效（剩余 1:45）」每秒原地刷新，不会重印二维码；过期后自动换新码，最多 5 轮。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
 
 Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.timetrace.runner`）；access token 15 分钟轮换。每个远程任务仍进入独立 worktree，且 push 被禁用。电脑关机、休眠或未登录时，Valley 只保留排队任务，不会在云端接管本地代码或账号。
 
@@ -141,6 +143,39 @@ launchctl kickstart -k gui/$(id -u)/com.atlaspaces.timetrace.agent   # 改配置
 
 `launchd/com.atlaspaces.timetrace.agent.plist` 是同样内容的模板，手工安装时把 `__TIMETRACE_BIN__`、`__HOME__` 换成实际路径。
 
+## 故障排查
+
+### 手机上看不到 claude / codex（「工具未检测到」）
+
+launchd 启动 Runner 时不读你的 shell 配置，PATH 是固定的。通过 npm/nvm、Volta、bun、pnpm、mise、asdf 安装的
+`claude` / `codex`（以及它们依赖的 `node`）在终端里能用，后台 Runner 却找不到。
+
+`timetrace setup`、`timetrace agent install` 和 `timetrace agent doctor` 会自动处理：
+
+1. 用登录 shell 查找（`$SHELL -lic 'command -v claude'`，8 秒超时），找不到再扫描常见位置：
+   `~/.local/bin`、`~/.claude/local`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.volta/bin`、`~/.bun/bin`、
+   `~/.npm-global/bin`、`$(npm config get prefix)/bin`、`~/Library/pnpm`、`~/.local/share/pnpm`、
+   `~/.local/share/mise/installs/*/*/bin`（含 `latest`）、`~/.local/share/mise/shims`、`~/.asdf/installs/*/*/bin`、
+   `~/.asdf/shims`、`~/.nvm/versions/node/*/bin`（新版本优先）、`/Applications/Codex.app/Contents/{Resources,MacOS}`；
+2. 找到的绝对路径记为 `claude.bin` / `codex.bin`（标记为自动发现，之后会随 node 升级重新解析；你用
+   `timetrace config set` 显式设置的值永远不会被覆盖）；
+3. `agent install` 生成的 LaunchAgent PATH 在原有缺省目录之外，加入每个工具所在目录，以及 `node` 所在目录
+   （npm 装的 CLI 是 `#!/usr/bin/env node` 脚本，node 也必须在 PATH 上；优先用和工具装在一起的那个 node）。
+
+`timetrace agent doctor` 对每个工具分别列出：终端（登录 shell）里找到的路径、后台 Runner（LaunchAgent 的 PATH）
+能否找到、版本、零付费核验结论和原因；两者不一致时给出修复命令。它还会显示 LaunchAgent 是否已安装/正在运行，
+以及 Runner 上次上报工具清单和额度的时间。仍然找不到时：
+
+```sh
+timetrace config set claude.bin /path/to/claude
+timetrace agent install
+```
+
+### 工作区为 0
+
+没有登记仓库时手机无法派发远程任务（`timetrace workspace add <path>` 登记），但工具清单和额度照常上报，
+手机上仍能看到这台电脑的工具和剩余额度。
+
 ## 配置 `~/.timetrace/config.json`（都是可选项，下面是缺省值）
 
 ```json
@@ -176,7 +211,8 @@ timetrace config set upload_output_tail false       # 布尔：true/false、on/o
 timetrace config set interval_sec 60
 ```
 
-嵌套项（`claude`、`codex`）和列表（`allowed_repos`）请直接编辑 `config.json`。改完后重启 Runner 才会生效。
+工具路径也可以用命令设置：`timetrace config set claude.bin /path/to/claude`（`codex.bin` 同理），之后运行 `timetrace agent install`。
+其余嵌套项（`claude`、`codex` 的其他字段）和列表（`allowed_repos`）请直接编辑 `config.json`。改完后重启 Runner 才会生效。
 
 | 项 | 缺省 | 说明 |
 | --- | --- | --- |

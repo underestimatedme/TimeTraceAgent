@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from timetrace import (__version__, checks, config, folder, limits, pairscreen, qr, quota, render, runner_state,
-                       scheduler, worktree)
+                       scheduler, toolpath, worktree)
 from timetrace.agent import Agent, install_stop_handlers, restore_handlers
 from timetrace.cloud import CloudClient
 from timetrace.credentials import CredentialStore, SessionManager
@@ -396,6 +396,9 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return 1
     cloud = _cloud(cfg)
     state = {"sessions": SessionManager(CredentialStore(), cloud)}
+    # Absolute `<tool>.bin` paths (and the node next to them) reach PATH even
+    # when the LaunchAgent was installed before the tool was.
+    toolpath.extend_runtime_path(str((cfg.get(name) or {}).get("bin") or "") for name in TOOLS)
     adapters = _adapters(cfg)
 
     def token() -> str:
@@ -440,29 +443,79 @@ def _iso_local(epoch) -> str:
         return "未知时间"
 
 
-def cmd_agent_doctor(args: argparse.Namespace) -> int:
-    home, cfg, db = _open(args)
-    paired = CredentialStore().load() is not None
-    print("Valley: %s" % cfg["cloud_base_url"])
-    print("配对: %s" % ("已完成" if paired else "未完成"))
-    print("工作区: %d" % len(db.list_workspaces()))
-    adapters = _adapters(cfg)
+_SOURCE_LABEL = {"login_shell": "登录 shell 找到", "scan": "在常见安装位置找到", "config": "来自配置"}
+_VISIBILITY_REASON = {
+    "binary_missing": "配置的路径不存在或不可执行",
+    "not_on_path": "LaunchAgent 的 PATH 里没有它所在的目录",
+    "node_not_on_path": "它是 node 脚本，但 LaunchAgent 的 PATH 里没有 node",
+}
+
+
+def _discover_tools(home: Path, user_home: Optional[Path] = None):
+    """Resolve claude / codex (and node) the way the login shell does and record
+    each absolute path found as `<tool>.bin`, unless the user set one. Returns
+    (the reloaded config, {tool: toolpath.Resolution})."""
+    user_home = Path(user_home or Path.home())
+    resolutions: Dict[str, toolpath.Resolution] = {}
+    npm_bin = None
     for name in TOOLS:
-        lines, _ = _tool_check(name, cfg, adapters)
-        for line in lines:
-            print(line)
-        if name in adapters:
-            _print_tool_quota(adapters[name])
-    diagnostics = lock_diagnostics(home)
-    for message in diagnostics:
-        print("Execution lock: %s" % message)
-    return 0 if paired and db.list_workspaces() and not diagnostics else 1
+        explicit = config.explicit_tool_bin(home, name)
+        res = toolpath.resolve_tool(name, user_home, configured=explicit or None)
+        if not res.path and not explicit:
+            # Last resort, it costs one more shell: the npm global prefix.
+            npm_bin = npm_bin or toolpath.npm_global_bin(user_home) or ""
+            if npm_bin:
+                res = toolpath.resolve_tool(name, user_home, npm_bin=npm_bin)
+        if res.path and not explicit:
+            config.store_tool_bin(home, name, res.path)
+        resolutions[name] = res
+    return config.load(home), resolutions
 
 
-def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any]):
-    """Binary location and zero-spend verdict of one tool: (lines, verified)."""
+def _tool_version(binary: str, node: Optional[str] = None, run=subprocess.run) -> str:
+    """`<tool> --version`, first line; never starts a model run."""
+    env = dict(os.environ)
+    if node:
+        env["PATH"] = toolpath.join_path([os.path.dirname(node)] + env.get("PATH", "").split(":"))
+    try:
+        proc = run([binary, "--version"], capture_output=True, text=True, timeout=15,
+                   stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return "未知（%s）" % exc.__class__.__name__
+    text = ((proc.stdout or "").strip() or (proc.stderr or "").strip()).splitlines()
+    if proc.returncode != 0 or not text:
+        return "未知（exit %d）" % proc.returncode
+    return text[0].strip()[:80]
+
+
+def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolution=None,
+                runner_path: Optional[str] = None, show_version: bool = False):
+    """Location, Runner visibility, version and zero-spend verdict of one tool:
+    (lines, verified). `runner_path` is the LaunchAgent PATH (None: not
+    installed, visibility not checked)."""
     binary = str(cfg.get(name, {}).get("bin", name))
-    lines = ["%s: %s" % (name, shutil.which(binary) or "未找到")]
+    found = resolution.path if resolution is not None else shutil.which(binary)
+    if found:
+        label = _SOURCE_LABEL.get(resolution.source) if resolution is not None else ""
+        lines = ["%s: %s%s" % (name, found, "（%s）" % label if label else "")]
+    else:
+        lines = ["%s: 未找到" % name]
+        if resolution is not None and resolution.searched:
+            lines.append("  已查找: " + "、".join(resolution.searched))
+        lines.append("  修复: 运行 timetrace config set %s.bin /path/to/%s 然后 timetrace agent install" % (name, name))
+    if found and resolution is not None:
+        if resolution.needs_node and not resolution.node:
+            lines.append("  注意: %s 是 node 脚本，但没有找到 node" % name)
+        if runner_path is not None:
+            ok, reason = toolpath.runner_visibility(found, resolution.needs_node, runner_path)
+            if ok:
+                lines.append("  后台 Runner: 能找到")
+            else:
+                lines.append("  后台 Runner: 找不到 —— %s" % _VISIBILITY_REASON.get(reason, reason))
+                lines.append("  修复: 运行 timetrace agent install（LaunchAgent 的 PATH 会加入 %s）"
+                             % "、".join(dict.fromkeys(resolution.dirs)))
+    if found and show_version:
+        lines.append("  版本: %s" % _tool_version(found, resolution.node if resolution is not None else None))
     try:
         details = adapters[name].capability_details() if name in adapters else {}
     except Exception as exc:
@@ -473,6 +526,59 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any]):
     else:
         lines.append("  零付费核验: 未通过（%s）→ 该工具不会被派发任务" % (details.get("unsupported_reason") or "unknown"))
     return lines, verified
+
+
+def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
+    """LaunchAgent installed / running, and when the Runner last reached Valley."""
+    lines = []
+    if toolpath.installed_launch_path(user_home) is None:
+        lines.append("后台 Runner: 未安装 → 运行 timetrace agent install")
+    else:
+        state = toolpath.launch_agent_state(run=launchctl) if launchctl else toolpath.launch_agent_state()
+        if state["running"]:
+            lines.append("后台 Runner: 已安装，运行中（pid %s）" % state["pid"])
+        elif state["loaded"]:
+            lines.append("后台 Runner: 已安装，已加载但未在运行 → 查看 ~/.timetrace/daemon.err")
+        else:
+            lines.append("后台 Runner: 已安装，未加载 → 运行 timetrace agent install")
+    st = runner_state.load(home)
+    if st.get("inventory_pushed_at"):
+        lines.append("上次上报工具清单: %s（%s 个工作区，%s 个工具）" % (
+            _iso_local(st["inventory_pushed_at"]), st.get("inventory_workspaces", "?"), st.get("inventory_tools", "?")))
+    else:
+        lines.append("上次上报工具清单: 从未上报")
+    if st.get("quota_reported_at"):
+        lines.append("上次上报额度: %s" % _iso_local(st["quota_reported_at"]))
+    return lines
+
+
+def cmd_agent_doctor(args: argparse.Namespace) -> int:
+    home, cfg, db = _open(args)
+    user_home = Path.home()
+    cfg, resolutions = _discover_tools(home, user_home)
+    paired = CredentialStore().load() is not None
+    print("Valley: %s" % cfg["cloud_base_url"])
+    print("配对: %s" % ("已完成" if paired else "未完成 → 运行 timetrace cloud login"))
+    for line in _runner_lines(home, user_home):
+        print(line)
+    workspaces = db.list_workspaces()
+    if workspaces:
+        print("工作区: %d" % len(workspaces))
+    else:
+        print("工作区: 0 —— 没有登记仓库，手机无法派发远程任务；运行 timetrace workspace add <path> 登记"
+              "（工具清单和额度仍会照常上报）")
+    adapters = _adapters(cfg)
+    runner_path = toolpath.installed_launch_path(user_home)
+    for name in TOOLS:
+        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path, show_version=True)
+        for line in lines:
+            print(line)
+        if name in adapters:
+            _print_tool_quota(adapters[name])
+    diagnostics = lock_diagnostics(home)
+    for message in diagnostics:
+        print("Execution lock: %s" % message)
+    return 0 if paired and workspaces and not diagnostics else 1
 
 
 def _print_tool_quota(adapter) -> None:
@@ -514,9 +620,10 @@ def timetrace_command() -> List[str]:
     return [sys.executable, "-m", "timetrace"]
 
 
-def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -> Path:
+def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run, path: Optional[str] = None) -> Path:
     """Write ~/Library/LaunchAgents/com.atlaspaces.timetrace.agent.plist and (re)load it.
-    Generated with plistlib, so any path is escaped correctly."""
+    Generated with plistlib, so any path is escaped correctly. `path` is the
+    Runner's PATH (toolpath.launch_path); defaults to the fixed system dirs."""
     user_home = Path(user_home or Path.home())
     destination = user_home / "Library" / "LaunchAgents" / "com.atlaspaces.timetrace.agent.plist"
     data_dir = user_home / ".timetrace"
@@ -524,8 +631,9 @@ def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -
         "Label": "com.atlaspaces.timetrace.agent",
         "ProgramArguments": timetrace_command() + ["agent", "run"],
         "EnvironmentVariables": {
-            # claude's native installer uses ~/.local/bin; Homebrew one of the others.
-            "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:%s" % (user_home / ".local" / "bin"),
+            # claude's native installer uses ~/.local/bin; Homebrew one of the others;
+            # plus the directories of the tools (and node) found in the login shell.
+            "PATH": path or toolpath.join_path(toolpath.default_path_dirs(user_home)),
             "TIMETRACE_HOME": str(data_dir),
         },
         "RunAtLoad": True,
@@ -540,8 +648,24 @@ def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -
     return destination
 
 
+def _install_runner(home: Path, out=print, resolutions=None) -> Path:
+    """`agent install` / setup step 4: find the tools, then write the
+    LaunchAgent with their directories (and node's) on its PATH."""
+    user_home = Path.home()
+    if resolutions is None:
+        _, resolutions = _discover_tools(home, user_home)
+    for name, res in resolutions.items():
+        if res.path:
+            out("  %s: %s" % (name, res.path))
+        else:
+            out("  %s: 未找到（运行 timetrace config set %s.bin /path/to/%s 然后 timetrace agent install）"
+                % (name, name, name))
+    return install_launch_agent(path=toolpath.launch_path(user_home, resolutions.values()))
+
+
 def cmd_agent_install(args: argparse.Namespace) -> int:
-    destination = install_launch_agent()
+    home, _, _ = _open(args)
+    destination = _install_runner(home)
     print("Runner 已安装并启动：%s" % destination)
     return 0
 
@@ -573,14 +697,32 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
     out("刻迹 Runner 设置（%s）" % home)
     out()
     out("1/4 检查本机 AI 工具")
+    user_home = Path.home()
+    cfg, resolutions = _discover_tools(home, user_home)
     adapters = _adapters(cfg)
     verified = []
+    installed_path = toolpath.installed_launch_path(user_home)
+    # What the Runner sees today: the installed LaunchAgent's PATH, else the
+    # fixed default an install without discovery would get.
+    runner_path = installed_path if installed_path is not None else toolpath.join_path(
+        toolpath.default_path_dirs(user_home))
+    hidden = []
     for name in TOOLS:
-        lines, ok = _tool_check(name, cfg, adapters)
+        lines, ok = _tool_check(name, cfg, adapters, resolutions.get(name))
         for line in lines:
             out(line)
         if ok:
             verified.append(name)
+        res = resolutions.get(name)
+        if res is not None and res.path:
+            visible, reason = toolpath.runner_visibility(res.path, res.needs_node, runner_path)
+            if not visible:
+                hidden.append(name)
+                out("  注意：%s 在终端里能找到（%s），但后台 Runner 的 PATH 里没有（%s）。"
+                    % (name, res.path, _VISIBILITY_REASON.get(reason, reason)))
+                out("        %s第 4 步安装后台 Runner 时会把 %s 加入它的 PATH。"
+                    % ("已记下 %s.bin；" % name if res.source != "config" else "",
+                       "、".join(dict.fromkeys(res.dirs))))
     if not verified:
         out("  注意：没有工具通过零付费核验，Runner 不会派发任务。请先用订阅账号登录 claude / codex（不要用 API key）。")
     out()
@@ -636,13 +778,15 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
     out("4/4 后台 Runner（macOS LaunchAgent，开机自动运行）")
     if confirm("  安装并启动后台 Runner？", args.no_agent):
         try:
-            destination = install_launch_agent()
+            destination = _install_runner(home, out, resolutions)
             out("  已安装：%s" % destination)
         except Exception as exc:
             out("  安装失败：%s；可稍后运行 `timetrace agent install`" % exc.__class__.__name__)
             result = result or 1
     else:
         out("  跳过；需要时运行 `timetrace agent install`，或前台运行 `timetrace agent run`。")
+        if hidden and installed_path is not None:
+            out("  注意：已安装的后台 Runner 仍找不到 %s，运行 `timetrace agent install` 修复。" % "、".join(hidden))
     out()
     out("完成。随时运行 `timetrace agent doctor` 检查状态。" if result == 0 else "部分步骤未完成，见上方提示。")
     return result
@@ -661,6 +805,8 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("%s = %s" % (key, config.format_value(cfg.get(key))))
             for tool, value in _max_parallel_per_tool(cfg).items():
                 print("%s.%s = %d" % (config.PER_TOOL_KEY, tool, value))
+            for key in config.TOOL_BIN_KEYS:
+                print("%s = %s" % (key, (cfg.get(key.split(".")[0]) or {}).get("bin", "")))
             return 0
         if args.config_cmd == "get":
             if args.key.startswith(config.PER_TOOL_KEY + "."):
@@ -669,6 +815,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                 if tool not in limits:
                     config.parse_value(args.key, "1")  # raises naming the tools
                 print(limits[tool])
+                return 0
+            if args.key in config.TOOL_BIN_KEYS:
+                print((config.load(home).get(args.key.split(".")[0]) or {}).get("bin", ""))
                 return 0
             if args.key not in config.scalar_keys():
                 config.parse_value(args.key, "")  # raises with the list of keys
@@ -682,6 +831,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.key in ("cloud_base_url", "upload_output_tail", "interval_sec", "max_parallel") \
             or args.key.startswith(config.PER_TOOL_KEY + "."):
         print("restart the Runner to apply: launchctl kickstart -k gui/%d/com.atlaspaces.timetrace.agent" % os.getuid())
+    if args.key in config.TOOL_BIN_KEYS:
+        print("然后运行 timetrace agent install，让后台 Runner 使用它（并把它的目录加入 PATH）")
     return 0
 
 

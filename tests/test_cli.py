@@ -269,6 +269,15 @@ class CliTest(unittest.TestCase):
         git("commit", "-q", "-m", "init", cwd=self.repo)
         self._old = os.environ.get("TIMETRACE_HOME")
         os.environ["TIMETRACE_HOME"] = str(self.home)
+        # No real login shell, no real ~/Library/LaunchAgents: tool discovery
+        # has its own tests (test_toolpath) with a fake HOME.
+        user_home = root / "user"
+        user_home.mkdir()
+        for target, value in (("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
+                              ("timetrace.cli.Path.home", lambda: user_home)):
+            p = patch(target, new=value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self):
         if self._old is None:
