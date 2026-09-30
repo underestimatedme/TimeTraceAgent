@@ -220,6 +220,12 @@ class Database:
              json.dumps(event, ensure_ascii=False, sort_keys=True), now or _now()),
         )
 
+    def last_remote_seq(self, job_id: str, attempt_id: str) -> int:
+        """The highest event seq queued for this attempt (0 when none)."""
+        row = self.conn.execute("SELECT MAX(seq) FROM remote_outbox WHERE job_id=? AND attempt_id=?",
+                                (job_id, attempt_id)).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def pending_remote_events(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM remote_outbox WHERE sent_at IS NULL ORDER BY id"

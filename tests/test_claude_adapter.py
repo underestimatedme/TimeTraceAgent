@@ -117,5 +117,103 @@ class BuildCmdTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--setting-sources") + 1], "user,project")
 
 
+class StreamCmdTest(unittest.TestCase):
+    cfg = {"bin": "claude", "permission_mode": "acceptEdits", "model": None, "extra_args": [],
+           "allowed_tools": ["Bash(git add:*)"]}
+
+    def test_task_run_is_bidirectional_with_host_permission_prompts(self):
+        cmd = claude.build_stream_cmd(self.cfg, session_id="abc")
+        self.assertEqual(cmd[:7], ["claude", "-p", "--input-format", "stream-json", "--output-format",
+                                   "stream-json", "--verbose"])
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "default")
+        self.assertEqual(cmd[cmd.index("--permission-prompts") + 1], "host")
+        self.assertEqual(cmd[cmd.index("--permission-prompt-tool") + 1], "stdio")
+        self.assertEqual(cmd[cmd.index("--session-id") + 1], "abc")
+        i = cmd.index("--disallowedTools")
+        self.assertEqual(cmd[i + 1:i + 3], ["Bash(git push:*)", "Bash(git push*)"])
+        self.assertEqual(cmd[cmd.index("--setting-sources") + 1], "user")
+        self.assertEqual(cmd[cmd.index("--append-system-prompt") + 1], SAFETY_RULES)
+        # The prompt is never an argv element (it goes over stdin).
+        self.assertTrue(cmd[-1] == SAFETY_RULES or cmd[-2].startswith("--"))
+
+    def test_resume_and_explicit_widening_are_kept(self):
+        cmd = claude.build_stream_cmd(dict(self.cfg, permission_mode="bypassPermissions"), resume="s1")
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "s1")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "bypassPermissions")
+
+    def test_folder_stream_run_keeps_restricted_mode_and_never_asks(self):
+        cmd = claude.build_stream_folder_cmd(self.cfg, "/ws", session_id="s1")
+        self.assertIn("--restricted", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertEqual(cmd[cmd.index("--permission-prompts") + 1], "none")
+        self.assertNotIn("--permission-prompt-tool", cmd)
+        self.assertEqual(cmd[cmd.index("--add-dir") + 1], "/ws")
+        self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], "Bash")
+
+
+class StreamAdapterTest(unittest.TestCase):
+    """ClaudeAdapter + RunControl against the fake stream-json CLI."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name).resolve()
+        self.transcript = self.d / "t.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_adapter(self, turns, on_event=None):
+        import os, threading
+        from unittest.mock import patch
+        from timetrace.billing import StaticBilling
+        from timetrace.remote_control import RunControl
+        scenario = self.d / "s.json"
+        scenario.write_text(json.dumps({"turns": turns}))
+        fake = str(Path(__file__).with_name("fake_claude_stream.py"))
+        adapter = claude.ClaudeAdapter({"bin": fake, "allowed_tools": []}, billing=StaticBilling(True),
+                                       credentials=lambda: {})
+        cancel = threading.Event()
+        control = RunControl("j1", self.d / "home", cancel, root=str(self.d), user_home=str(self.d / "user"))
+        stop = threading.Event()
+        def pump():
+            while not stop.is_set():
+                for event in control.take_events():
+                    if on_event:
+                        on_event(control, event)
+                stop.wait(.02)
+        t = threading.Thread(target=pump, daemon=True); t.start()
+        env = {"TT_FAKE_SCENARIO": str(scenario), "TT_FAKE_TRANSCRIPT": str(self.transcript)}
+        try:
+            with patch.dict(os.environ, env):
+                result = adapter.start("build it", str(self.d), "11111111-2222-3333-4444-555555555555",
+                                       str(self.d / "run.log"), cancel, control=control)
+        finally:
+            stop.set(); t.join(2)
+        for event in control.take_events():
+            if on_event:
+                on_event(control, event)
+        records = [json.loads(l) for l in self.transcript.read_text().splitlines()]
+        return result, records
+
+    def test_phone_approved_command_continues_the_run(self):
+        seen = []
+        def approve(control, event):
+            seen.append(event)
+            if event["type"] == "approval_requested":
+                control.apply_lease({"approvals": [{"request_id": event["request_id"], "decision": "approve",
+                                                    "remember": False}]})
+        result, records = self.run_adapter([[{"permission": {"tool": "Bash", "input": {"command": "npm test"}}},
+                                             {"permission": {"tool": "Bash", "input": {"command": "git push"}}},
+                                             {"result": "all green"}]], approve)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output, "all green")
+        argv = records[0]["argv"]
+        self.assertNotIn("build it", argv)
+        replies = [r["decision"]["reply"]["response"]["behavior"] for r in records if "decision" in r]
+        self.assertEqual(replies, ["allow", "deny"])  # git push: local rule, never asked
+        self.assertEqual([e["type"] for e in seen], ["approval_requested", "approval_resolved"])
+
+
 if __name__ == "__main__":
     unittest.main()

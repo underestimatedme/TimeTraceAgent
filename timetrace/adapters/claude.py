@@ -17,6 +17,7 @@ from timetrace.adapters.base import CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVI
 from timetrace.billing import billing_env_keys, claude_verifier
 from timetrace import tiers
 from timetrace.adapters import claude_usage
+from timetrace.claude_stream import run_stream
 from timetrace.models import CLAUDE, RunResult, Sample
 from timetrace.quota import merge_capabilities
 
@@ -114,6 +115,73 @@ def build_folder_cmd(
     return cmd
 
 
+# Remote task runs (protocol 2) are bidirectional: the prompt and appended
+# instructions go in as stream-json user messages on stdin (never argv), and
+# permission prompts come back to the runner over the same channel.
+STREAM_IO = ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+# Who answers permission prompts. `--permission-prompts host` alone is not
+# enough: Claude Code 2.1.285 routes prompts to the stdio host only with
+# `--permission-prompt-tool stdio` (what the Agent SDK passes).
+HOST_PROMPTS = ["--permission-prompts", "host", "--permission-prompt-tool", "stdio"]
+# Push is denied by the CLI itself as well as by the local rules; the
+# documented prefix form and the older glob form.
+PUSH_DENIED = ["Bash(git push:*)", "Bash(git push*)"]
+# Configured permission modes that only mean "the default for task runs";
+# a stream run replaces them with `default` so every edit and command that
+# Claude would auto-accept reaches the local rule table.
+DEFAULT_MODES = ("", "acceptEdits", "default", "manual")
+
+
+def stream_permission_mode(cfg: Dict[str, Any]) -> str:
+    mode = str(cfg.get("permission_mode") or "")
+    return "default" if mode in DEFAULT_MODES else mode
+
+
+def build_stream_cmd(cfg: Dict[str, Any], session_id: Optional[str] = None,
+                     resume: Optional[str] = None) -> List[str]:
+    """A remote task run in its worktree: stream-json both ways, permission
+    prompts answered by the runner (local rules, then the phone)."""
+    cmd = [cfg.get("bin", "claude"), "-p"] + STREAM_IO
+    if resume:
+        cmd += ["--resume", resume]
+    elif session_id:
+        cmd += ["--session-id", session_id]
+    cmd += ["--permission-mode", stream_permission_mode(cfg)]
+    cmd += HOST_PROMPTS
+    cmd += ["--disallowedTools"] + PUSH_DENIED
+    allowed = list(cfg.get("allowed_tools") or [])
+    if allowed:
+        cmd += ["--allowedTools"] + allowed
+    if cfg.get("model"):
+        cmd += ["--model", cfg["model"]]
+    # H-5: project settings are worktree content.
+    if cfg.get("setting_sources", "user"):
+        cmd += ["--setting-sources", str(cfg.get("setting_sources", "user"))]
+    cmd += ["--append-system-prompt", SAFETY_RULES]
+    cmd += list(cfg.get("extra_args") or [])
+    return cmd
+
+
+def build_stream_folder_cmd(cfg: Dict[str, Any], workspace: str, session_id: Optional[str] = None,
+                            resume: Optional[str] = None) -> List[str]:
+    """A folder-workspace run with stream-json input (for appended
+    instructions). Same containment as build_folder_cmd; nothing is ever
+    asked: `--permission-prompts none` denies every prompt locally."""
+    cmd = [cfg.get("bin", "claude"), "-p"] + STREAM_IO
+    if resume:
+        cmd += ["--resume", resume]
+    elif session_id:
+        cmd += ["--session-id", session_id]
+    cmd += ["--permission-mode", "acceptEdits", "--permission-prompts", "none"]
+    cmd += ["--add-dir", workspace]
+    cmd += ["--restricted", "--strict-mcp-config"]
+    cmd += ["--disallowedTools"] + list(FOLDER_DENIED_TOOLS)
+    if cfg.get("model"):
+        cmd += ["--model", cfg["model"]]
+    cmd += ["--append-system-prompt", FOLDER_RULES]
+    return cmd
+
+
 def safe_positional(prompt: str) -> str:
     """The prompt is untrusted (it comes from the phone through Valley). A
     leading "-" would make Claude's option parser read it as a flag such as
@@ -192,7 +260,10 @@ def _int_or_none(v: Any) -> Optional[int]:
 
 class ClaudeAdapter(ToolAdapter):
     name = CLAUDE
-    adapter_version = "claude-code/0.4"
+    adapter_version = "claude-code/0.5"
+    # Runs accept a RunControl (`control=`): stream-json input, appended
+    # instructions while running, permission prompts answered by the host.
+    interactive_runs = True
 
     def __init__(self, cfg: Dict[str, Any], billing=None, credentials=None):
         self.cfg = cfg
@@ -232,21 +303,35 @@ class ClaudeAdapter(ToolAdapter):
         })
 
 
-    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
+    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+              control=None) -> RunResult:
+        if control is not None:
+            return self._run_stream(build_stream_cmd(self.cfg, session_id=session_id), cwd, log_file, prompt,
+                                    session_id, cancel_event, control)
         return self._run(build_cmd(self.cfg, prompt, session_id=session_id), cwd, log_file,
-						 session_id, cancel_event)
+                         session_id, cancel_event)
 
-    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
+    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+               control=None) -> RunResult:
+        if control is not None:
+            return self._run_stream(build_stream_cmd(self.cfg, resume=session_id), cwd, log_file, prompt,
+                                    session_id, cancel_event, control)
         return self._run(build_cmd(self.cfg, prompt, resume=session_id), cwd, log_file,
                          session_id, cancel_event)
 
     def start_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
-                     cancel_event=None) -> RunResult:
+                     cancel_event=None, control=None) -> RunResult:
+        if control is not None:
+            return self._run_stream(build_stream_folder_cmd(self.cfg, workspace, session_id=session_id), cwd,
+                                    log_file, prompt, session_id, cancel_event, control)
         return self._run(build_folder_cmd(self.cfg, prompt, workspace, session_id=session_id), cwd, log_file,
                          session_id, cancel_event)
 
     def resume_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
-                      cancel_event=None) -> RunResult:
+                      cancel_event=None, control=None) -> RunResult:
+        if control is not None:
+            return self._run_stream(build_stream_folder_cmd(self.cfg, workspace, resume=session_id), cwd,
+                                    log_file, prompt, session_id, cancel_event, control)
         return self._run(build_folder_cmd(self.cfg, prompt, workspace, resume=session_id), cwd, log_file,
                          session_id, cancel_event)
 
@@ -276,9 +361,22 @@ class ClaudeAdapter(ToolAdapter):
         cmd = build_chat_cmd(self.cfg, prompt, session_id=session_id, rules=IMPORT_RULES)
         return self._run(cmd, cwd, log_file, session_id, cancel_event)
 
+    def _run_stream(self, cmd: List[str], cwd: str, log_file: str, prompt: str, session_id: str,
+                    cancel_event, control) -> RunResult:
+        # Time spent waiting for a permission decision does not count
+        # toward timeout_seconds (the session pauses its clock).
+        code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
+                                 timeout=float(self.cfg.get("timeout_seconds", 3600)),
+                                 cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE))
+        return self._result(code, lines, session_id)
+
     def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None) -> RunResult:
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                     cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE))
+        return self._result(code, lines, session_id)
+
+    @staticmethod
+    def _result(code: int, lines: List[str], session_id: str) -> RunResult:
         res = parse_stream(lines)
         res.exit_code = code
         res.session_id = res.session_id or session_id
