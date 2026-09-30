@@ -73,6 +73,27 @@ class Base(unittest.TestCase):
         self.assertEqual([e["seq"] for e in events], list(range(1, len(events) + 1)), events)
 
 
+class RunningEventTest(Base):
+    def test_running_reaches_valley_while_the_tool_still_runs(self):
+        """A sequential agent (run_once, max_parallel 1) has no other loop to
+        flush the outbox: `running` must go out while the job runs, not with
+        its terminal event, so the phone sees the job running."""
+        seen = threading.Event()
+        cloud = ControlCloud([{"id": "j1", "plan_id": "p1"}])
+
+        class Waits(Adapter):
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+                deadline = time.time() + 5
+                while time.time() < deadline and not seen.is_set():
+                    if any(e["type"] == "running" for e in Base.events(cloud)):
+                        seen.set()
+                    time.sleep(.02)
+                return RunResult(exit_code=0, ok=True, output="done", session_id=session_id)
+        self.assertEqual(self.agent(cloud, Waits()).run_once(), "job j1 → awaiting_review")
+        self.assertTrue(seen.is_set(), "running was only sent after the run ended")
+        self.assertEqual([e["type"] for e in self.events(cloud)], ["running", "completed"])
+
+
 class InterruptTest(Base):
     def test_interrupt_keeps_the_worktree_writes_a_checkpoint_and_resume_continues(self):
         adapter = WaitUntilCancelled()

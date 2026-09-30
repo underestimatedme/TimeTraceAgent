@@ -992,6 +992,10 @@ class Agent:
                     running_announced = True
                     if control is not None:
                         control.started = True
+                        # Flush `running` from the wait loop below: without
+                        # another loop claiming (run_once, max_parallel 1)
+                        # it would otherwise wait for the terminal event.
+                        control.wakeup.set()
                 if control is not None:
                     future.add_done_callback(lambda _: control.wakeup.set())
                 next_renew = time.time() + self._renew_wait(reason, deadline, control)
