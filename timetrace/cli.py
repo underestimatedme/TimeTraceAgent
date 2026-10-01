@@ -305,11 +305,14 @@ def cmd_workspace_check(args: argparse.Namespace) -> int:
 def _runner_workspaces(db: Database) -> list:
     """Inventory entries. `checks` names the registered check commands of
     each workspace; the commands themselves never leave this computer."""
+    from .workspace_context import collect_workspace_context
+
     names = {}
     for row in db.list_checks():
         names.setdefault(row["workspace_id"], []).append(row["name"])
     return [{"id": row["id"], "name": row["name"], "default_branch": row["default_branch"],
-             "kind": row.get("kind") or "git", "checks": sorted(names.get(row["id"], []))}
+             "kind": row.get("kind") or "git", "checks": sorted(names.get(row["id"], [])),
+             "context": collect_workspace_context(row["path"])}
             for row in db.list_workspaces()]
 
 

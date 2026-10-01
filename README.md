@@ -296,3 +296,11 @@ failed local acknowledgment retries the whole unchanged batch; a 409 is never
 silently discarded. No schema migration is needed for existing outboxes.
 See `tests/integration/README.md` for the real Valley/PostgreSQL cancellation
 regression, including lost-response recovery and the next job claim.
+
+### Project background inventory
+
+The Runner reports whether each registered workspace is empty, populated, or
+unreadable, plus a root README snapshot (README.md, README.markdown, README,
+README.txt in that order, ignoring case). Snapshots are limited to 32 KiB of
+UTF-8 and descriptions to 500 characters. Local paths and linked files are not
+uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
