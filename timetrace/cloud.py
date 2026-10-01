@@ -121,7 +121,7 @@ class CloudClient:
     def update_inventory(self, token: str, workspaces: list, tools: list,
                          max_parallel: Optional[int] = None,
                          max_parallel_per_tool: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
-        body = {"workspaces": workspaces, "tools": tools}
+        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1}
         if max_parallel is not None:
             body["max_parallel"] = int(max_parallel)
         if max_parallel_per_tool is not None:

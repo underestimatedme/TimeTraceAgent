@@ -145,7 +145,9 @@ class KindTest(unittest.TestCase):
             db = Database(Path(d) / "timetrace.db")
             footage = Path(d) / "footage"; footage.mkdir()
             cli.add_workspace(db, str(footage), workspace_id="f1")
-            self.assertEqual(cli._runner_workspaces(db),
+            inventory=cli._runner_workspaces(db)
+            self.assertEqual(inventory[0].pop("context")["content_state"],"empty")
+            self.assertEqual(inventory,
                              [{"id": "f1", "name": "footage", "default_branch": "", "kind": "folder",
                                "checks": []}])
             self.assertEqual(cli._max_parallel({"max_parallel": 3}), 3)
@@ -164,8 +166,8 @@ class KindTest(unittest.TestCase):
         client.request = lambda method, path, body=None, token=None: sent.append(body) or {}
         client.update_inventory("t", [], [], 2)
         client.update_inventory("t", [], [])
-        self.assertEqual(sent, [{"workspaces": [], "tools": [], "max_parallel": 2},
-                                {"workspaces": [], "tools": []}])
+        self.assertEqual(sent, [{"workspaces": [], "tools": [], "max_parallel": 2, "workflow_inputs_version": 1},
+                                {"workspaces": [], "tools": [], "workflow_inputs_version": 1}])
 
 
 class OutputDirTest(unittest.TestCase):

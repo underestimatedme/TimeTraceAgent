@@ -87,3 +87,14 @@ class WorkspaceContextTests(unittest.TestCase):
         self.assertEqual(rows[0]['context']['content_state'], 'empty')
         self.assertNotIn('path', rows[0])
         self.assertEqual(rows[0]['id'], 'empty')
+
+    def test_nonregular_readme_is_unreadable_without_blocking(self):
+        import os
+        import json
+        import subprocess
+        import sys
+        os.mkfifo(str(self.root / 'README.md'))
+        result = subprocess.run([sys.executable, '-c',
+            'import json,sys;from timetrace.workspace_context import collect_workspace_context;print(json.dumps(collect_workspace_context(sys.argv[1])))',
+            str(self.root)], capture_output=True, text=True, timeout=1)
+        self.assertEqual(json.loads(result.stdout)['readme']['status'], 'unreadable')

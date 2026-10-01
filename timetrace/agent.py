@@ -585,6 +585,7 @@ class Agent:
         out_name = folder.output_name(job, plan_key) if in_folder else ""
         before = None
         checked = {}
+        workflow_input = {"head": job.get("input_head", "")}
 
         def abort_note():
             """Once the tool was spawned in a folder workspace, the change
@@ -614,8 +615,15 @@ class Agent:
                     else:
                         branch = worktree.unique_branch(job.get("branch_name"), execution_job)
                     extra = {"branch": branch} if branch else {}
-                    preparation = pool.submit(self.prepare_workspace, workspace["path"], local_id,
-                                              self.home, workspace["default_branch"], **extra)
+                    def prepare_git():
+                        from .pipeline_inputs import prepare_pipeline_inputs
+                        base = job.get("input_commit") or workspace["default_branch"]
+                        prepared = self.prepare_workspace(workspace["path"], local_id, self.home, base, **extra)
+                        if not resuming and (job.get("stage_iteration") or job.get("input_commit") or job.get("input_commits")):
+                            commits = job.get("input_commits") or ([job["input_commit"]] if job.get("input_commit") else [])
+                            workflow_input["head"] = prepare_pipeline_inputs(workspace["path"], prepared[0], commits)
+                        return prepared
+                    preparation = pool.submit(prepare_git)
                 reason = ""
                 while True:
                     try:
@@ -719,8 +727,10 @@ class Agent:
                     # Execution timestamps are captured only by the worker at
                     # the call boundaries, independently of this durable IO.
                     self.db.update_remote_claim(job_id, "running")
-                    self._report(claim, [{"seq": 1, "type": "running", "message": "started",
-                                          "observed_at": observed_start}], flush=False)
+                    running_event={"seq": 1, "type": "running", "message": "started", "observed_at": observed_start}
+                    if workflow_input["head"]:
+                        running_event["input_head"] = workflow_input["head"]
+                    self._report(claim, [running_event], flush=False)
                     running_announced = True
                 while True:
                     try:
@@ -795,6 +805,9 @@ class Agent:
             event = {"seq": 2, "type": "completed", "message": "completed",
                      "result_summary": redact(result.output or "completed")[:1000],
                      "output_tail": tail_text(log_file)}
+            if not in_folder and job.get("stage_iteration"):
+                event["input_head"] = workflow_input["head"]
+                event["output_commit"] = worktree.head(execution_path, workspace["path"])
             head = (lambda: None) if in_folder else (lambda: worktree.head(execution_path, workspace["path"]))
             try:
                 structured = results.collect(execution_path, head=head)

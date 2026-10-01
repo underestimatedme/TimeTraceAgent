@@ -2,6 +2,7 @@
 import codecs
 import hashlib
 import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,8 +49,11 @@ def collect_workspace_context(path: str, checked_at: str = None) -> dict:
         candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
         # Reject links, including an entry replaced with a link before opening.
         import os
-        fd = os.open(str(candidate), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        fd = os.open(str(candidate), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
         with os.fdopen(fd, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                readme['status'] = 'unreadable'
+                return context
             data = stream.read(MAX_BYTES + 4)
         truncated = len(data) > MAX_BYTES
         decoder = codecs.getincrementaldecoder('utf-8')('strict')
