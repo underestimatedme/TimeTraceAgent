@@ -31,3 +31,18 @@ def prepare_pipeline_inputs(repo: str, output_path: str, commits: list) -> str:
     for commit in sorted(set(commits)):
         git('merge', '--no-edit', '--no-stat', commit)
     return git('rev-parse', 'HEAD')
+
+
+def committed_pipeline_output(repo: str, output_path: str) -> str:
+    """The transferable workflow output must contain all implementation work.
+
+    Reserved result scratch is intentionally not part of the implementation.
+    Dirty work is preserved; the caller reports failure for manual recovery.
+    """
+    worktree.verify_metadata(output_path, repo)
+    status = subprocess.check_output(['git', *worktree.SAFE_GIT, '-C', output_path,
+        'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.',
+        ':(top,exclude).timetrace/out', ':(top,exclude).timetrace/out.prev-*'])
+    if status:
+        raise ValueError('任务副本还有未提交的实现，请在副本中提交后重试；修改已保留')
+    return worktree.head(output_path, repo)

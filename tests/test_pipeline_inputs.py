@@ -51,3 +51,51 @@ class PipelineInputTests(unittest.TestCase):
         Agent(db,cloud,{'codex':adapter},self.home,lambda:'test-token').run_once()
         self.assertFalse(hasattr(adapter,'args'));self.assertEqual(cloud.events[-1]['type'],'failed')
         self.assertEqual(self.git('rev-parse','HEAD'),self.base)
+
+    def _workflow_success(self, edit):
+        from tests.test_agent import FakeCloud, Adapter
+        from timetrace.agent import Agent
+        from timetrace.db import Database
+        from timetrace.models import RunResult
+        case = self
+        class Cloud(FakeCloud):
+            def claim(inner, token):
+                claim = super().claim(token)
+                claim['job'].update(stage_iteration=1, input_commit=case.base, input_commits=[case.base])
+                return claim
+        class Writer(Adapter):
+            def start(inner, prompt, cwd, session_id, log_file, cancel_event=None):
+                inner.cwd = cwd
+                name = 'common' if edit == 'tracked' else 'implemented-feature.txt'
+                (Path(cwd) / name).write_text('implementation\n')
+                if edit == 'committed':
+                    case.git('add', name, cwd=cwd); case.git('commit', '-qm', 'feature', cwd=cwd)
+                    out = Path(cwd) / '.timetrace/out'; out.mkdir(parents=True, exist_ok=True)
+                    (out / 'result.json').write_text('{"artifacts":[]}')
+                return RunResult(ok=True)
+        self.home.mkdir(exist_ok=True)
+        db = Database(self.home / 'state.sqlite'); self.addCleanup(db.close)
+        db.upsert_workspace('ws1', 'repo', str(self.repo), 'main')
+        cloud, adapter = Cloud(), Writer()
+        Agent(db, cloud, {'codex': adapter}, self.home, lambda: 'test-token').run_once()
+        return cloud.events[-1], adapter.cwd
+
+    def test_workflow_rejects_uncommitted_tracked_implementation(self):
+        event, path = self._workflow_success('tracked')
+        self.assertEqual(event['type'], 'failed')
+        self.assertIn('提交', event['message'])
+        self.assertNotIn('output_commit', event)
+        self.assertEqual((Path(path) / 'common').read_text(), 'implementation\n')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+
+    def test_workflow_rejects_untracked_implementation(self):
+        event, path = self._workflow_success('untracked')
+        self.assertEqual(event['type'], 'failed')
+        self.assertTrue((Path(path) / 'implemented-feature.txt').exists())
+        self.assertNotIn('output_commit', event)
+
+    def test_workflow_committed_output_allows_only_result_scratch(self):
+        event, path = self._workflow_success('committed')
+        self.assertEqual(event['type'], 'completed')
+        self.assertEqual(event['output_commit'], self.git('rev-parse', 'HEAD', cwd=path))
+        self.assertIn('implemented-feature.txt', self.git('ls-tree', '--name-only', event['output_commit'], cwd=path))

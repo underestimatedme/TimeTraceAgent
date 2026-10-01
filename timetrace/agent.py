@@ -800,6 +800,15 @@ class Agent:
                 self.db.update_remote_claim(job_id, "reported")
                 self.maintain(force=True)
                 return "job %s → failed" % job_id
+        if result.ok and not in_folder and job.get("stage_iteration"):
+            try:
+                from .pipeline_inputs import committed_pipeline_output
+                workflow_output = committed_pipeline_output(workspace["path"], execution_path)
+            except Exception as exc:
+                self._report(claim, [{"seq": 2, "type": "failed", "message": redact(str(exc))[:1000],
+                                      "output_tail": tail_text(log_file), "observed_at": observed_end}])
+                self.db.update_remote_claim(job_id, "reported")
+                return "job %s → failed" % job_id
         if result.ok:
             self.db.delete_checkpoint(plan_key)
             event = {"seq": 2, "type": "completed", "message": "completed",
@@ -807,7 +816,7 @@ class Agent:
                      "output_tail": tail_text(log_file)}
             if not in_folder and job.get("stage_iteration"):
                 event["input_head"] = workflow_input["head"]
-                event["output_commit"] = worktree.head(execution_path, workspace["path"])
+                event["output_commit"] = workflow_output
             head = (lambda: None) if in_folder else (lambda: worktree.head(execution_path, workspace["path"]))
             try:
                 structured = results.collect(execution_path, head=head)
