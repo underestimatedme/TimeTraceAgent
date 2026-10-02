@@ -24,6 +24,7 @@ ARTIFACTS_BYTES = 64 * 1024    # the whole `artifacts` list as Valley stores it
 REF_CHARS = 512
 ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder")
 INVALID_NOTE = "结构化结果无效"
+DROPPED_NOTE = "忽略 %d 项格式无效的产出物"
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SUBTASKS_MAX = 30
 # Keys end up in branch names (`timetrace/<stage>/<key>`), which are lowercase:
@@ -118,6 +119,9 @@ def redact_all(value: Any) -> Any:
 
 
 def _artifact(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, str):
+        # A bare path is how models most often name a file they wrote.
+        raw = {"kind": "doc", "ref": raw}
     if not isinstance(raw, dict):
         raise Invalid("artifact is not an object")
     kind, ref = raw.get("kind"), raw.get("ref")
@@ -266,10 +270,28 @@ def with_folder(folder_artifact: Dict[str, Any], artifacts: List[Dict[str, Any]]
     return merged
 
 
+def _artifacts(raw: Any):
+    """Declared artifacts are side information: each unusable entry (or a
+    non-list) is dropped on its own and counted, never voiding the result."""
+    if raw is None:
+        return [], 0
+    if not isinstance(raw, list):
+        return [], 1
+    kept = []
+    for item in raw:
+        try:
+            kept.append(_artifact(item))
+        except Invalid:
+            pass
+    return kept, len(raw) - len(kept)
+
+
 def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Optional[Dict[str, Any]]:
     """None when the run wrote no result.json; otherwise
-    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None}.
-    An invalid file yields valid=False with no artifacts and no result."""
+    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None,
+     "dropped_artifacts": int (valid only)}.
+    An invalid file yields valid=False with no artifacts and no result; bad
+    artifact entries alone only raise dropped_artifacts."""
     base = Path(root)
     try:
         for i in range(1, len(OUT_DIR) + 1):
@@ -287,12 +309,7 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
             raise Invalid("not JSON")
         if not isinstance(parsed, dict):
             raise Invalid("not an object")
-        raw_artifacts = parsed.get("artifacts", [])
-        if raw_artifacts is None:
-            raw_artifacts = []
-        if not isinstance(raw_artifacts, list):
-            raise Invalid("artifacts is not a list")
-        artifacts = [_artifact(a) for a in raw_artifacts]
+        artifacts, dropped = _artifacts(parsed.get("artifacts"))
         draft = parsed.get("pipeline_draft")
         if draft is not None and not isinstance(draft, dict):
             raise Invalid("pipeline_draft is not an object")
@@ -306,7 +323,7 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
         if subtasks is not None:
             result["subtasks"] = redact_all(subtasks)
         result = result or None
-        return {"valid": True, "artifacts": artifacts, "result": result}
+        return {"valid": True, "artifacts": artifacts, "result": result, "dropped_artifacts": dropped}
     except (Invalid, RecursionError):
         return {"valid": False, "artifacts": [], "result": None}
 

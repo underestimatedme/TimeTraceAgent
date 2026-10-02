@@ -415,6 +415,22 @@ class SubtasksTest(unittest.TestCase):
         self.assertFalse(self.collect({"subtasks": [{"key": "k" * 41, "title": "A"}]})["valid"])
         self.assertFalse(self.collect({"subtasks": [{"key": "a", "title": "A", "depends_on": ["d" * 41]}]})["valid"])
 
+    def test_bad_artifacts_never_discard_valid_subtasks(self):
+        # Real AI output: paths written as plain strings next to correct subtasks.
+        got = self.collect({"artifacts": ["docs/plan.md", {"kind": "exe", "ref": "a"}, 5],
+                            "subtasks": [{"key": "core", "title": "Core", "tool": "claude"}]})
+        self.assertTrue(got["valid"])
+        self.assertEqual([t["key"] for t in got["result"]["subtasks"]], ["core"])
+        self.assertEqual(got["artifacts"], [{"kind": "doc", "ref": "docs/plan.md"}])
+        self.assertEqual(got["dropped_artifacts"], 2)
+
+    def test_artifacts_that_are_not_a_list_are_dropped_not_fatal(self):
+        got = self.collect({"artifacts": {"kind": "doc"}, "subtasks": [{"key": "a", "title": "A"}]})
+        self.assertTrue(got["valid"])
+        self.assertEqual(got["artifacts"], [])
+        self.assertEqual(got["dropped_artifacts"], 1)
+        self.assertEqual(len(got["result"]["subtasks"]), 1)
+
     def test_invalid_subtasks_invalidate_the_result(self):
         one = {"key": "a", "title": "A"}
         for bad in ("x", [one] * 1 + [dict(one)], [dict(one, key="k%d" % i) for i in range(31)],

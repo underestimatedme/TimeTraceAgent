@@ -82,11 +82,6 @@ class CollectTest(unittest.TestCase):
             "not json": "{broken",
             "not utf-8": b"\xff\xfe{}",
             "top-level list": json.dumps([{"kind": "doc", "ref": "a"}]),
-            "artifacts not a list": json.dumps({"artifacts": {"kind": "doc"}}),
-            "unknown kind": json.dumps({"artifacts": [{"kind": "exe", "ref": "a"}]}),
-            "missing ref": json.dumps({"artifacts": [{"kind": "doc"}]}),
-            "ref too long": json.dumps({"artifacts": [{"kind": "link", "ref": "r" * 513}]}),
-            "content not text": json.dumps({"artifacts": [{"kind": "note", "ref": "n", "content": 5}]}),
             "draft not object": json.dumps({"pipeline_draft": ["a"]}),
         }
         for name, data in cases.items():
@@ -96,6 +91,35 @@ class CollectTest(unittest.TestCase):
                 self.assertFalse(got["valid"])
                 self.assertEqual(got["artifacts"], [])
                 self.assertIsNone(got["result"])
+
+    def test_each_bad_artifact_is_dropped_alone(self):
+        cases = {
+            "artifacts not a list": {"kind": "doc"},
+            "unknown kind": [{"kind": "exe", "ref": "a"}],
+            "missing ref": [{"kind": "doc"}],
+            "ref too long": [{"kind": "link", "ref": "r" * 513}],
+            "content not text": [{"kind": "note", "ref": "n", "content": 5}],
+            "bad commit sha": [{"kind": "commit", "ref": "c", "commit_sha": "zz"}],
+            "empty string": [" "],
+        }
+        for name, bad in cases.items():
+            with self.subTest(name=name):
+                self.write({"artifacts": bad, "pipeline_draft": {"title": "t"}})
+                got = self.collect()
+                self.assertTrue(got["valid"])
+                self.assertEqual(got["artifacts"], [])
+                self.assertEqual(got["dropped_artifacts"], 1)
+                self.assertEqual(got["result"], {"pipeline_draft": {"title": "t"}})
+
+    def test_a_path_string_is_read_as_a_doc_artifact(self):
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "req.md").write_text("# req\n")
+        self.write({"artifacts": ["docs/req.md", {"kind": "link", "ref": "https://example.com"}]})
+        got = self.collect()
+        self.assertTrue(got["valid"])
+        self.assertEqual(got["artifacts"], [{"kind": "doc", "ref": "docs/req.md", "content": "# req\n", "commit_sha": "abc1234"},
+                                            {"kind": "link", "ref": "https://example.com"}])
+        self.assertEqual(got["dropped_artifacts"], 0)
 
     def test_ref_at_the_limit_is_valid(self):
         self.write({"artifacts": [{"kind": "link", "ref": "r" * 512}]})
@@ -287,6 +311,15 @@ class AgentResultTest(unittest.TestCase):
         event, _ = self.run_job(json.dumps({"artifacts": [], "pad": "x" * (64 * 1024)}))
         self.assertIs(event["result_invalid"], True)
         self.assertIn("结构化结果无效", event["message"])
+
+    def test_dropped_artifacts_are_noted_without_invalidating(self):
+        event, _ = self.run_job(json.dumps({"artifacts": ["docs/req.md", {"kind": "exe", "ref": "a"}],
+                                            "pipeline_draft": {"title": "p"}}))
+        self.assertNotIn("result_invalid", event)
+        self.assertNotIn("结构化结果无效", event["message"])
+        self.assertIn("忽略 1 项格式无效的产出物", event["message"])
+        self.assertEqual([a["ref"] for a in event["artifacts"]], ["docs/req.md"])
+        self.assertEqual(event["result"], {"pipeline_draft": {"title": "p"}})
 
     def test_valid_result_is_not_flagged(self):
         event, _ = self.run_job(json.dumps({"artifacts": []}))
