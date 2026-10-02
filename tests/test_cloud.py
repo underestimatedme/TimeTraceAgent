@@ -68,6 +68,29 @@ class CloudClientTest(unittest.TestCase):
             self.assertNotIn(leak, raw)
 
 
+class InventoryProtocolTwoTest(unittest.TestCase):
+    def test_inventory_body_matches_the_protocol_doc(self):
+        seen = []
+        client = CloudClient("https://v", opener=lambda req, timeout: (seen.append(req) or Response(200, {"code": 0, "data": {}})))
+        health = {"claude_login": "ok", "codex_login": "expired", "disk_free_gb": 42.5,
+                  "workspaces": [{"id": "ws1", "exists": True, "git": True, "clean": False}],
+                  "sleep_prevention": "active", "checked_at": "2026-09-30T12:00:00Z"}
+        credits = [{"pool_id": "pool-codex-ab", "tool_profile_id": "codex-default", "status": "unknown"}]
+        client.update_inventory("t", [], [], 2, {"claude": 2, "codex": 2},
+                                extras={"protocol_version": 2, "agent_version": "0.4.0", "accepting_local": True,
+                                        "health": health, "reset_credits": credits, "ignored": 1})
+        body = json.loads(seen[0].data.decode())
+        self.assertEqual(seen[0].get_method(), "PUT")
+        self.assertTrue(seen[0].full_url.endswith("/runner/inventory"))
+        self.assertEqual(body["protocol_version"], 2)
+        self.assertEqual(body["agent_version"], "0.4.0")
+        self.assertIs(body["accepting_local"], True)
+        self.assertEqual(body["health"], health)
+        self.assertEqual(body["reset_credits"], credits)
+        self.assertNotIn("ignored", body)
+        self.assertEqual(body["max_parallel_per_tool"], {"claude": 2, "codex": 2})
+
+
 class CloudTransportHardeningTest(unittest.TestCase):
     def test_refuses_plain_http_except_loopback(self):
         # Bearer and refresh tokens travel on every call.

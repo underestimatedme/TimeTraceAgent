@@ -74,6 +74,8 @@ class SetupWizardTest(unittest.TestCase):
             ("timetrace.cli._adapters", lambda cfg: self.adapters),
             ("timetrace.cli.shutil.which", lambda name: "/usr/local/bin/" + name),
             ("timetrace.cli.time.sleep", lambda s: None),
+            ("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
+            ("timetrace.cli.Path.home", lambda: root / "user"),
         ):
             p = patch(target, new=value)
             p.start()

@@ -13,9 +13,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import Database
-from timetrace import checks, folder, quota, results, worktree
+from timetrace import approvals, audit, checks, folder, pause, quota, results, runner_state, worktree
+from timetrace.remote_control import RunControl
 from timetrace.process import tail_text
 from timetrace.redact import redact
 from timetrace.checkpoints import Checkpoint, checkpoint_problem
@@ -40,6 +42,25 @@ STOPPED = "runner_stopped"
 # How long shutdown waits for workers after cancelling them. launchd sends
 # SIGKILL ExitTimeOut (20 s) after SIGTERM; a killed tool group takes ≤ 2 s.
 SHUTDOWN_GRACE_SECONDS = 15
+# Protocol 2 (Valley docs/remote-control-protocol.md): controls, approvals,
+# self-check, local pause, reset credits.
+PROTOCOL_VERSION = 2
+# Self-check and reset-credit reads: every 10 minutes (and at start; the
+# self-check also after a failed job).
+HEALTH_INTERVAL_SECONDS = 600
+RESET_CREDITS_INTERVAL_SECONDS = 600
+# Below this much free disk on the workspace volume nothing new is claimed.
+DISK_ERROR_GB = 1.0
+# Valley's "computer version not supported" error code.
+VERSION_REJECTED_CODE = 42210
+# Claim outcomes after which the loop only does upkeep and waits.
+HOLD_OUTCOMES = ("idle", "paused", "disk_full")
+# The message of a run the user interrupted from the phone.
+INTERRUPTED_MESSAGE = "已按你的要求中断，改动保留在工作副本里"
+# The instruction a resumed (previously interrupted) job continues with.
+RESUME_PROMPT = ("The user interrupted this task and now asks you to continue it from where it stopped. "
+                 "First look at the changes already in the working directory, then carry on.")
+RESUME_NOTE = "\n\nAdditional instruction from the user:\n"
 
 
 def _safe_id(value) -> str:
@@ -145,8 +166,32 @@ class Agent:
                  inventory: Callable[[], Any] = None, quota_interval: float = 300,
                  log: Callable[[str], None] = None, on_revoked: Callable[[], None] = None,
                  upload_output_tail: bool = True, max_parallel: int = 1, workspace_wait: float = 0,
-                 max_parallel_per_tool: Dict[str, int] = None, check_env_drop=(), check_env_keep=()):
+                 max_parallel_per_tool: Dict[str, int] = None, check_env_drop=(), check_env_keep=(),
+                 report_protocol: bool = False, health_check: Callable[[], Dict[str, Any]] = None,
+                 health_interval: float = HEALTH_INTERVAL_SECONDS,
+                 reset_credits: Callable[[], list] = None,
+                 reset_credits_interval: float = RESET_CREDITS_INTERVAL_SECONDS,
+                 sleep_guard: Any = None, user_home: str = None):
         self.db, self.cloud, self.adapters = db, cloud, adapters
+        # Protocol 2: the inventory carries protocol/agent version, the local
+        # pause, the self-check and the reset credits.
+        self.report_protocol = report_protocol
+        self._health_check = health_check
+        self.health_interval = health_interval
+        self._health: Dict[str, Any] = None
+        self._last_health = None
+        self._health_due = True
+        self._reset_credits_reader = reset_credits
+        self.reset_credits_interval = reset_credits_interval
+        self._reset_credits = None
+        self._last_reset_credits = None
+        self._last_inventory_base = None
+        # Keeps the Mac awake (caffeinate) while any job runs; None: never.
+        self._sleep = sleep_guard
+        # The user's home for the local permission rules (credential dirs).
+        self.user_home = user_home
+        self._controls_lock = threading.Lock()
+        self._controls: Dict[str, RunControl] = {}
         # Jobs run at once (config `max_parallel`); each holds one of that
         # many coding slots. 1 keeps the loop strictly sequential.
         self.max_parallel = max(1, int(max_parallel or 1))
@@ -210,12 +255,26 @@ class Agent:
     def _track(self, cancel_event: threading.Event) -> None:
         with self._jobs_lock:
             self._running[id(cancel_event)] = cancel_event
+            first = len(self._running) == 1
+        if first and self._sleep is not None:
+            try:
+                self._sleep.start()
+            except Exception as exc:
+                self.log("sleep prevention failed: %s" % exc.__class__.__name__)
+            self._maintain_due = True
         if self._stop.is_set():
             cancel_event.set()
 
     def _untrack(self, cancel_event: threading.Event) -> None:
         with self._jobs_lock:
             self._running.pop(id(cancel_event), None)
+            idle = not self._running
+        if idle and self._sleep is not None:
+            try:
+                self._sleep.stop()
+            except Exception:
+                pass
+            self._maintain_due = True
 
     def _stop_reason(self) -> str:
         return STOPPED if self._stop.is_set() else ""
@@ -253,28 +312,102 @@ class Agent:
             self._maintain_due = True
             return
         now = now if now is not None else time.time()
-        if not force and now - self._last_quota < self.quota_interval:
-            return
-        self._last_quota = now
-        try:
-            counts = self.report_quota_counts(now)
-            self.log("quota: " + ", ".join("%s %d" % (p, n) for p, n in counts.items()))
-        except Exception as exc:
-            self.log("quota report failed: %s" % exc.__class__.__name__)
+        self._refresh_health(now)
+        self._refresh_reset_credits(now)
+        due = force or now - self._last_quota >= self.quota_interval
+        if due:
+            self._last_quota = now
+            try:
+                counts = self.report_quota_counts(now)
+                self.log("quota: " + ", ".join("%s %d" % (p, n) for p, n in counts.items()))
+                runner_state.record(self.home, quota_reported_at=int(now), quota_samples=sum(counts.values()))
+            except Exception as exc:
+                self.log("quota report failed: %s" % exc.__class__.__name__)
         if self._inventory is None:
             return
-        try:
-            current = self._inventory()
-        except Exception as exc:
-            self.log("inventory build failed: %s" % exc.__class__.__name__)
-            return
-        if current != self._last_inventory:
+        if due or self._last_inventory_base is None:
             try:
-                self.cloud.update_inventory(self.access_token(), *current)
-                self._last_inventory = current
+                self._last_inventory_base = self._inventory()
+            except Exception as exc:
+                self.log("inventory build failed: %s" % exc.__class__.__name__)
+                return
+        elif not self.report_protocol:
+            return
+        # Between full rounds only the protocol-2 extras (pause, self-check,
+        # sleep prevention) are compared, so a pause reaches Valley at once.
+        current = self._last_inventory_base
+        extras = self.inventory_extras() if self.report_protocol else None
+        if (current, extras) != self._last_inventory:
+            try:
+                if extras is None:
+                    self.cloud.update_inventory(self.access_token(), *current)
+                else:
+                    self.cloud.update_inventory(self.access_token(), *current, extras=extras)
+                self._last_inventory = (current, extras)
+                runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
+                                    inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
             except Exception as exc:
+                self._note_cloud_error(exc, "inventory")
                 self.log("inventory push failed: %s" % exc.__class__.__name__)
+
+    def inventory_extras(self) -> Dict[str, Any]:
+        """The protocol-2 inventory fields (docs/remote-control-protocol.md §3/§4)."""
+        extras = {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
+                  "accepting_local": not self.locally_paused()}
+        if self._health is not None:
+            health = dict(self._health)
+            health["sleep_prevention"] = self.sleep_state()
+            extras["health"] = health
+        if self._reset_credits:
+            extras["reset_credits"] = self._reset_credits
+        return extras
+
+    def sleep_state(self) -> str:
+        active = self._sleep is not None and getattr(self._sleep, "active", lambda: False)()
+        return "active" if active else "inactive"
+
+    def locally_paused(self) -> bool:
+        return pause.paused(self.home)
+
+    def disk_blocked(self) -> bool:
+        free = (self._health or {}).get("disk_free_gb")
+        return isinstance(free, (int, float)) and free < DISK_ERROR_GB
+
+    def _refresh_health(self, now: float) -> None:
+        if self._health_check is None:
+            return
+        if not self._health_due and self._last_health is not None and now - self._last_health < self.health_interval:
+            return
+        self._health_due = False
+        self._last_health = now
+        try:
+            health = self._health_check()
+        except Exception as exc:
+            self.log("self-check failed: %s" % exc.__class__.__name__)
+            return
+        if isinstance(health, dict):
+            self._health = health
+            runner_state.record(self.home, health=health, health_checked_at=int(now))
+
+    def _refresh_reset_credits(self, now: float) -> None:
+        if self._reset_credits_reader is None:
+            return
+        if self._last_reset_credits is not None and now - self._last_reset_credits < self.reset_credits_interval:
+            return
+        self._last_reset_credits = now
+        try:
+            entries = self._reset_credits_reader()
+        except Exception as exc:
+            self.log("reset credits read failed: %s" % exc.__class__.__name__)
+            return
+        if isinstance(entries, list):
+            self._reset_credits = entries
+            runner_state.record(self.home, reset_credits=entries)
+
+    def _note_cloud_error(self, exc: Exception, where: str) -> None:
+        if isinstance(exc, CloudError) and exc.code == VERSION_REJECTED_CODE:
+            audit.record(self.home, "version_rejected", where=where, message=str(exc)[:200])
 
     def run_once(self) -> str:
         claim = self._next_claim()
@@ -283,9 +416,14 @@ class Agent:
         return self.handle(claim)
 
     def _next_claim(self):
-        """A claim, or "revoked" / "unpaired" / "idle"."""
+        """A claim, or "revoked" / "unpaired" / "idle" / "paused" (local
+        pause, running jobs continue) / "disk_full" (self-check error)."""
         try:
             self.flush_outbox()
+            if self.locally_paused():
+                return "paused"
+            if self.disk_blocked():
+                return "disk_full"
             token = self.access_token()
             claim = self.cloud.claim(token)
         except CloudError as exc:
@@ -486,8 +624,9 @@ class Agent:
             return "dispatch_unavailable"
         return ""
 
-    def _renew(self, claim, adapter, deadline, gate=None):
-        """`gate(deadline)` → block reason; default: the AI job gate."""
+    def _renew(self, claim, adapter, deadline, gate=None, control=None):
+        """`gate(deadline)` → block reason; default: the AI job gate. A
+        protocol-2 response's controls[] / approvals[] go to `control`."""
         gate = gate or (lambda at: self._gate(adapter, claim["job"], at))
         # Once a lease expires the old owner cannot regain execution authority.
         reason = gate(deadline)
@@ -498,8 +637,8 @@ class Agent:
         def request():
             try:
                 answer.append(self.cloud.renew(self.access_token(), claim["attempt_id"], claim["lease_epoch"]))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_cloud_error(exc, "renew")
             finally:
                 done.set()
         # A blocked HTTP/credential call must not hold the writer past expiry.
@@ -513,6 +652,8 @@ class Agent:
             return deadline, "lease renewal failed"
         if lease.get("desired_action") == "cancel":
             claim["job"]["desired_action"] = "cancel"
+        if control is not None:
+            control.apply_lease(lease)
         renewed = self._deadline(lease)
         # Include time spent in the renewal request: a late response cannot
         # bridge an interval in which this owner no longer held a lease.
@@ -565,16 +706,44 @@ class Agent:
         if reason:
             return self._blocked(claim, plan_key, reason, checkpoint)
         cancel_event = threading.Event()
+        # Protocol 2: interrupt / append / approvals for this task run.
+        control = RunControl(job_id, self.home, cancel_event, user_home=self.user_home, log=self.log)
+        control.started = False
         self._track(cancel_event)
+        with self._controls_lock:
+            self._controls[claim["attempt_id"]] = control
         try:
             return self._execute_tracked(claim, workspace, adapter, checkpoint, plan_key, log_file,
                                          deadline, ws_lock, cancel_event, resuming, session_id,
-                                         execution_job, local_id)
+                                         execution_job, local_id, control)
         finally:
+            control.close()
+            with self._controls_lock:
+                self._controls.pop(claim["attempt_id"], None)
             self._untrack(cancel_event)
 
+    def _renew_wait(self, reason, deadline, control=None):
+        """Seconds until the next lease renewal (Valley's renew_after_seconds
+        while a protocol-2 job runs)."""
+        if reason:
+            return self.heartbeat_interval
+        wait = min(self.heartbeat_interval, max(.001, (deadline - time.time()) / 2))
+        if control is not None and control.renew_after:
+            wait = min(wait, control.renew_after)
+        return wait
+
+    @staticmethod
+    def _run_prompt(job, resuming):
+        """A job that continues an interrupted one (`resume_of_job_id`)
+        resumes the session with the user's note instead of the task again."""
+        if resuming and job.get("resume_of_job_id"):
+            note = job.get("resume_note")
+            note = note.strip() if isinstance(note, str) else ""
+            return RESUME_PROMPT + (RESUME_NOTE + note if note else "")
+        return job["prompt"]
+
     def _execute_tracked(self, claim, workspace, adapter, checkpoint, plan_key, log_file, deadline,
-                         ws_lock, cancel_event, resuming, session_id, execution_job, local_id):
+                         ws_lock, cancel_event, resuming, session_id, execution_job, local_id, control=None):
         job = claim["job"]
         job_id = job["id"]
         running_announced = False
@@ -586,6 +755,10 @@ class Agent:
         before = None
         checked = {}
         workflow_input = {"head": job.get("input_head", "")}
+        execution_path = None
+        prepared_branch = ""
+        branch = None
+        interactive = control is not None and getattr(adapter, "interactive_runs", False) is True
 
         def abort_note():
             """Once the tool was spawned in a folder workspace, the change
@@ -598,6 +771,65 @@ class Agent:
                 except Exception as exc:
                     checked["note"] = "文件夹改动检查失败：%s" % exc.__class__.__name__
             return checked["note"]
+
+        def user_interrupted():
+            """The phone's interrupt took effect (not a cancel or a stop)."""
+            return (control is not None and control.interrupted and not reason and not self._stop.is_set()
+                    and job.get("desired_action") != "cancel" and job.get("status") != "cancelled")
+
+        def interrupted(result):
+            """Report `interrupted_by_user`: the process group is gone, the
+            worktree / branch stay, and a checkpoint lets a resume job
+            continue the same session."""
+            terminal_seq = 2 if running_announced else 1
+            note = abort_note()
+            if note:
+                # A folder run that wrote outside its output directory is a
+                # failure whatever stopped it, and never resumable.
+                self.db.delete_checkpoint(plan_key)
+                self._report(claim, [{"seq": terminal_seq, "type": "failed", "message": note,
+                                      "observed_at": observed_end or self._observed_now()}])
+                self.db.update_remote_claim(job_id, "reported")
+                return "job %s → failed" % job_id
+            sid = getattr(result, "session_id", None) or ""
+            if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid)):
+                sid = ""
+            if spawned and execution_path:
+                try:
+                    if in_folder:
+                        head, dirty_digest = FOLDER_HEAD, folder.digest(execution_path)
+                    else:
+                        # Git runs here unsandboxed in a directory the model could write.
+                        worktree.verify_metadata(execution_path, workspace["path"])
+                        head, dirty_digest = worktree.snapshot(execution_path)
+                    self.db.save_checkpoint(Checkpoint(
+                        plan_id=plan_key, job_id=execution_job, attempt_id=claim["attempt_id"],
+                        tool_profile_id=job["tool_profile_id"], provider=job["provider"],
+                        provider_session_id=sid, canonical_workspace=workspace["path"],
+                        execution_path=execution_path, git_head=head, dirty_paths_digest=dirty_digest,
+                        output_path=str(Path(log_file).resolve()), last_output_offset=Path(log_file).stat().st_size,
+                        completed_criteria=[], side_effect_summary="", reason="interrupted_by_user",
+                        branch="" if in_folder else (branch or ""),
+                    ))
+                except Exception as exc:
+                    # Still an interrupt; a resume then stops for manual recovery.
+                    self.db.delete_checkpoint(plan_key)
+                    self.log("job %s: checkpoint after interrupt failed: %s" % (job_id, exc.__class__.__name__))
+            elif checkpoint is not None and checkpoint.plan_id == plan_key:
+                checkpoint.reason = "interrupted_by_user"
+                self.db.save_checkpoint(checkpoint)
+            event = {"seq": terminal_seq, "type": "interrupted_by_user", "message": INTERRUPTED_MESSAGE,
+                     "observed_at": observed_end or self._observed_now()}
+            if not in_folder and prepared_branch:
+                event["branch"] = prepared_branch
+            if sid:
+                event["provider_session_id"] = sid
+            self._report(claim, [event])
+            self.db.update_remote_claim(job_id, "reported")
+            if getattr(result, "samples", None):
+                self._post_samples(job["provider"], adapter, result.samples)
+            self.maintain(force=True)
+            return "job %s → interrupted" % job_id
 
         try:
             with _job_pool(cancel_event) as pool:
@@ -632,12 +864,15 @@ class Agent:
                         break
                     except TimeoutError:
                         if not reason:
-                            deadline, reason = self._renew(claim, adapter, deadline)
+                            deadline, reason = self._renew(claim, adapter, deadline, None, control)
                         # Preparation may still be using git. Keep locks until it
                         # stops; a failed renewal never authorises a later spawn.
                 if reason:
                     return self._blocked(claim, plan_key, reason, checkpoint)
                 execution_path = str(Path(execution_path).resolve())
+                if control is not None:
+                    # Permission prompts are judged against this directory.
+                    control.root = execution_path
                 if resuming:
                     reason = checkpoint_problem(checkpoint, job["provider"], job["tool_profile_id"],
                                                 workspace["path"], adapter_capabilities(adapter).get("can_resume") is True)
@@ -675,7 +910,7 @@ class Agent:
                     ws_lock.release()
                 self.db.update_remote_claim(job_id, "launching")
                 # Renew before execution; transport wait is not AI activity.
-                deadline, reason = self._renew(claim, adapter, deadline)
+                deadline, reason = self._renew(claim, adapter, deadline, None, control)
                 if not reason and resuming and adapter_capabilities(adapter).get("can_resume") is not True:
                     reason = "checkpoint resume capability changed"
                 if reason:
@@ -684,12 +919,20 @@ class Agent:
                 Path(log_file).touch(exist_ok=True)
                 # A fresh run never inherits an earlier run's result.json.
                 results.prepare_out_dir(execution_path, fresh=not resuming)
+                extra_kw = {"control": control} if interactive else {}
                 if in_folder:
                     folder_run = adapter.resume_folder if resuming else adapter.start_folder
                     def run(prompt, cwd, session, log, cancel):
-                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel)
+                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
+                    def followup_run(prompt, cwd, session, log, cancel):
+                        return adapter.resume_folder(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
                 else:
-                    run = adapter.resume if resuming else adapter.start
+                    first = adapter.resume if resuming else adapter.start
+                    def run(prompt, cwd, session, log, cancel):
+                        return first(prompt, cwd, session, log, cancel, **extra_kw)
+                    def followup_run(prompt, cwd, session, log, cancel):
+                        return adapter.resume(prompt, cwd, session, log, cancel, **extra_kw)
+                prompt = self._run_prompt(job, resuming)
                 observed_start = None
                 adapter_entered = threading.Event()
                 def authority():
@@ -699,6 +942,29 @@ class Agent:
                     if not boundary_reason and resuming and adapter_capabilities(adapter).get("can_resume") is not True:
                         boundary_reason = "checkpoint resume capability changed"
                     return boundary_reason
+                def with_followups(result):
+                    """Instructions appended while the tool could not take
+                    them run as resumed turns in this job, with the same
+                    sandbox / read-only parameters and the same gates."""
+                    while control is not None:
+                        followup = control.next_followup(ok=bool(getattr(result, "ok", False)))
+                        if followup is None:
+                            return result
+                        control_id, text = followup
+                        refusal = self._stop_reason() or self._gate(adapter, job, deadline)
+                        if not refusal and adapter_capabilities(adapter).get("can_resume") is not True:
+                            refusal = "resume unsupported"
+                        session = getattr(result, "session_id", None) or session_id
+                        if not refusal and not (isinstance(session, str) and SESSION_ID.fullmatch(session)):
+                            refusal = "no session to resume"
+                        if refusal:
+                            control.followup_refused(control_id, "未执行：%s" % refusal)
+                            return result
+                        control.followup_started(control_id)
+                        following = followup_run(text, execution_path, session, log_file, cancel_event)
+                        following.samples = list(getattr(result, "samples", None) or []) + list(following.samples or [])
+                        result = following
+                    return result
                 def invoke():
                     nonlocal reason, spawned, observed_start, observed_end
                     # Executor scheduling is also a delay: fence inside the
@@ -716,8 +982,10 @@ class Agent:
                         observed_start = self._observed_now()
                         adapter_entered.set()
                         try:
-                            return run(job["prompt"], execution_path, session_id, log_file, cancel_event)
+                            return with_followups(run(prompt, execution_path, session_id, log_file, cancel_event))
                         finally:
+                            if control is not None:
+                                control.next_followup(ok=False)  # the run is over either way
                             observed_end = self._observed_now()
                 future = pool.submit(invoke)
                 future.add_done_callback(lambda _: adapter_entered.set())
@@ -732,17 +1000,38 @@ class Agent:
                         running_event["input_head"] = workflow_input["head"]
                     self._report(claim, [running_event], flush=False)
                     running_announced = True
+                    if control is not None:
+                        control.started = True
+                        # Flush `running` from the wait loop below: without
+                        # another loop claiming (run_once, max_parallel 1)
+                        # it would otherwise wait for the terminal event.
+                        control.wakeup.set()
+                if control is not None:
+                    future.add_done_callback(lambda _: control.wakeup.set())
+                next_renew = time.time() + self._renew_wait(reason, deadline, control)
                 while True:
                     try:
-                        wait = self.heartbeat_interval if reason else min(self.heartbeat_interval, max(.001, (deadline - time.time()) / 2))
-                        result = future.result(timeout=wait)
+                        if control is None:
+                            result = future.result(timeout=max(.001, next_renew - time.time()))
+                        else:
+                            # Wake for approval requests / acknowledgements too.
+                            control.wakeup.wait(max(.001, min(next_renew - time.time(), 1.0)))
+                            if control.started and control.wakeup.is_set() and not future.done():
+                                self._report(claim, [])
+                            result = future.result(timeout=0)
                         break
                     except TimeoutError:
-                        if not reason:
-                            deadline, reason = self._renew(claim, adapter, deadline)
-                            if reason:
-                                cancel_event.set()
-                reason = reason or self._cancel_reason(cancel_event) or self._gate(adapter, job, deadline)
+                        if time.time() >= next_renew:
+                            if not reason:
+                                deadline, reason = self._renew(claim, adapter, deadline, None, control)
+                                if reason:
+                                    cancel_event.set()
+                            next_renew = time.time() + self._renew_wait(reason, deadline, control)
+                if user_interrupted() and not getattr(result, "ok", False):
+                    return interrupted(result)
+                # An interrupt that lost the race to completion is not a cancel.
+                cancelled_by = "" if user_interrupted() else self._cancel_reason(cancel_event)
+                reason = reason or cancelled_by or self._gate(adapter, job, deadline)
                 if reason:
                     if not spawned or reason in ("cancelled", STOPPED):
                         return self._blocked(claim, plan_key, reason, checkpoint,
@@ -751,6 +1040,8 @@ class Agent:
                     return self._fenced(job_id, plan_key, reason, abort_note())
         except Exception as exc:
             terminal_seq = 2 if running_announced else 1
+            if user_interrupted():
+                return interrupted(None)
             note = abort_note()
             # Cancellation dominates an adapter's shutdown exception. Lease
             # fencing also must not turn into a resumable recovery failure.
@@ -1384,7 +1675,7 @@ class Agent:
                         self._stop.wait(60)
                         continue
                     self._note_outcome(outcome, log, manual_diagnostics)
-                    if outcome == "idle":
+                    if outcome in HOLD_OUTCOMES:
                         # No work: periodic quota refresh keeps parked plans
                         # recovering and the phone's cards fresh.
                         self.maintain()
@@ -1407,7 +1698,7 @@ class Agent:
             if diagnostic not in manual_diagnostics:
                 log(diagnostic)
                 manual_diagnostics.add(diagnostic)
-        elif outcome != "idle" and "deferred (" not in outcome:
+        elif outcome not in HOLD_OUTCOMES and "deferred (" not in outcome:
             manual_diagnostics.clear()
 
     def _run_parallel(self, interval, log) -> None:
@@ -1447,7 +1738,7 @@ class Agent:
                 if claim in ("revoked", "unpaired"):
                     self._stop.wait(60)
                     continue
-                if claim == "idle":
+                if claim in HOLD_OUTCOMES:
                     self.maintain()
                     self._stop.wait(interval)
                     continue
@@ -1470,12 +1761,30 @@ class Agent:
         return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _report(self, claim: Dict[str, Any], events: list, flush=True) -> None:
+        job_id, attempt_id = claim["job"]["id"], claim["attempt_id"]
+        with self._controls_lock:
+            control = self._controls.get(attempt_id)
+        if control is not None and getattr(control, "started", False):
+            # Control acknowledgements and approval requests come first:
+            # they happened before whatever this call reports.
+            events = control.take_events() + list(events)
+        # A job with a control has side events (protocol 2) between
+        # `running` and its terminal event: each event takes the next
+        # sequence number. Other jobs keep their fixed numbers (a replayed
+        # event with the same seq is ignored by the outbox).
+        last = self.db.last_remote_seq(job_id, attempt_id) if events and control is not None else None
         for event in events:
+            event = dict(event)
+            if last is not None:
+                last = max(int(event.get("seq") or 0), last + 1)
+                event["seq"] = last
+            if event.get("type") == "failed":
+                self._health_due = True  # re-check the computer after a failure
             # Stamp the phase when observed, before durable enqueue. flush_outbox
             # replays this payload unchanged even after restart/network delay.
             event = self._outbound(event)
             event.setdefault("observed_at", self._observed_now())
-            self.db.queue_remote_event(claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"], event)
+            self.db.queue_remote_event(job_id, attempt_id, claim["lease_epoch"], event)
         if not flush:
             return
         try:
@@ -1491,9 +1800,13 @@ class Agent:
         event = dict(event)
         if not self.upload_output_tail:
             event.pop("output_tail", None)
-        for key in ("message", "result_summary", "output_tail"):
+        for key in ("message", "result_summary", "output_tail", "summary"):
             if isinstance(event.get(key), str):
                 event[key] = redact(event[key])
+        if isinstance(event.get("summary"), str):
+            event["summary"] = event["summary"][:approvals.SUMMARY_CHARS]
+        if "input" in event:
+            event["input"] = approvals.safe_input(event["input"])
         if isinstance(event.get("reply"), str):
             event["reply"] = safe_reply(event["reply"])
         for key in ("artifacts", "result", "reasons"):

@@ -31,6 +31,8 @@ DEFAULTS: Dict[str, Any] = {
     # `check_env_drop` names more to remove, `check_env_keep` secret-named
     # ones a check needs (never an AI tool's).
     "check_env_drop": [],
+    # Keep the Mac from idle-sleeping (`caffeinate -i`) while a job runs.
+    "prevent_sleep": True,
     "check_env_keep": [],
     "claude": {
         "bin": "claude",
@@ -112,6 +114,22 @@ PER_TOOL_TOOLS = ("claude", "codex")
 PER_TOOL_MAX = 8
 
 
+# `timetrace config set claude.bin /path/to/claude`: the tool binary the Runner starts.
+TOOL_BIN_KEYS = ("claude.bin", "codex.bin")
+# Marks a `<tool>.bin` that setup / agent install / doctor found on their own;
+# such a value is re-resolved later, one the user set is never overwritten.
+BIN_SOURCE_AUTO = "auto"
+
+
+def _tool_bin_value(key: str, raw: str) -> str:
+    text = os.path.expanduser(str(raw).strip())
+    if not text:
+        raise ValueError("%s expects the path of the %s executable" % (key, key.split(".")[0]))
+    if os.path.isabs(text) and not (os.path.isfile(text) and os.access(text, os.X_OK)):
+        raise ValueError("%s: %s is not an executable file" % (key, text))
+    return text
+
+
 def _per_tool_value(key: str, raw: str) -> int:
     tool = key.split(".", 1)[1]
     if tool not in PER_TOOL_TOOLS:
@@ -128,6 +146,8 @@ def _per_tool_value(key: str, raw: str) -> int:
 def parse_value(key: str, raw: str) -> Any:
     if key.startswith(PER_TOOL_KEY + "."):
         return _per_tool_value(key, raw)
+    if key in TOOL_BIN_KEYS:
+        return _tool_bin_value(key, raw)
     keys = scalar_keys()
     if key not in keys:
         raise ValueError("unknown or non-scalar key: %s (settable: %s)" % (key, ", ".join(sorted(keys))))
@@ -159,23 +179,21 @@ def format_value(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def set_value(home_dir: Path, key: str, raw: str) -> Any:
-    """Validate and write one top-level key into config.json (atomic, 0600)."""
-    value = parse_value(key, raw)
+def load_user(home_dir: Path) -> Dict[str, Any]:
+    """config.json exactly as the user wrote it (no defaults merged in)."""
     path = Path(home_dir) / "config.json"
-    doc: Dict[str, Any] = {}
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as fh:
-            doc = json.load(fh)
-        if not isinstance(doc, dict):
-            raise ValueError("config.json must contain a JSON object")
-    if key.startswith(PER_TOOL_KEY + "."):
-        nested = doc.get(PER_TOOL_KEY)
-        nested = dict(nested) if isinstance(nested, dict) else {}
-        nested[key.split(".", 1)[1]] = value
-        doc[PER_TOOL_KEY] = nested
-    else:
-        doc[key] = value
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError("config.json must contain a JSON object")
+    return doc
+
+
+def _write_user(home_dir: Path, doc: Dict[str, Any]) -> None:
+    """Atomic write of config.json with mode 0600."""
+    path = Path(home_dir) / "config.json"
     Path(home_dir).mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(".config.json.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -184,4 +202,43 @@ def set_value(home_dir: Path, key: str, raw: str) -> Any:
         fh.write("\n")
     os.chmod(str(tmp), 0o600)
     os.replace(str(tmp), str(path))
+
+
+def explicit_tool_bin(home_dir: Path, tool: str) -> str:
+    """The `<tool>.bin` the user chose, "" when unset, the bare default name
+    or a value timetrace recorded on its own."""
+    section = load_user(home_dir).get(tool)
+    if not isinstance(section, dict) or section.get("bin_source") == BIN_SOURCE_AUTO:
+        return ""
+    value = section.get("bin")
+    return value if isinstance(value, str) and value and value != tool else ""
+
+
+def store_tool_bin(home_dir: Path, tool: str, path: str) -> None:
+    """Record a discovered absolute tool path, marked as found automatically."""
+    doc = load_user(home_dir)
+    section = dict(doc.get(tool)) if isinstance(doc.get(tool), dict) else {}
+    if section.get("bin") == path and section.get("bin_source") == BIN_SOURCE_AUTO:
+        return
+    section["bin"] = path
+    section["bin_source"] = BIN_SOURCE_AUTO
+    doc[tool] = section
+    _write_user(home_dir, doc)
+
+
+def set_value(home_dir: Path, key: str, raw: str) -> Any:
+    """Validate and write one key into config.json (atomic, 0600)."""
+    value = parse_value(key, raw)
+    doc = load_user(home_dir)
+    if key.startswith(PER_TOOL_KEY + ".") or key in TOOL_BIN_KEYS:
+        section, sub = key.split(".", 1)
+        nested = doc.get(section)
+        nested = dict(nested) if isinstance(nested, dict) else {}
+        nested[sub] = value
+        if key in TOOL_BIN_KEYS:
+            nested.pop("bin_source", None)  # the user's choice from now on
+        doc[section] = nested
+    else:
+        doc[key] = value
+    _write_user(home_dir, doc)
     return value

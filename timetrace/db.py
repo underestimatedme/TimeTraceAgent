@@ -220,6 +220,12 @@ class Database:
              json.dumps(event, ensure_ascii=False, sort_keys=True), now or _now()),
         )
 
+    def last_remote_seq(self, job_id: str, attempt_id: str) -> int:
+        """The highest event seq queued for this attempt (0 when none)."""
+        row = self.conn.execute("SELECT MAX(seq) FROM remote_outbox WHERE job_id=? AND attempt_id=?",
+                                (job_id, attempt_id)).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def pending_remote_events(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM remote_outbox WHERE sent_at IS NULL ORDER BY id"
@@ -416,6 +422,11 @@ class Database:
             (bucket_id, at or _now(), float(sample.used_pct), sample.reset_at, sample.source),
         )
         return int(cur.lastrowid)
+
+    def latest_sample_at(self, source: str) -> Optional[int]:
+        """Time of the newest sample from `source` (e.g. "statusline")."""
+        row = self.conn.execute("SELECT MAX(at) FROM sample WHERE source=?", (source,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
 
     def latest_samples(self) -> List[Dict[str, Any]]:
         """One row per bucket: the newest sample joined with bucket metadata."""
