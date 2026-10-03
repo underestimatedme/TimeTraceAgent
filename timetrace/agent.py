@@ -1094,7 +1094,7 @@ class Agent:
         if result.ok and not in_folder and job.get("stage_iteration"):
             try:
                 from .pipeline_inputs import committed_pipeline_output
-                workflow_output = committed_pipeline_output(workspace["path"], execution_path)
+                workflow_output, left_out = committed_pipeline_output(workspace["path"], execution_path)
             except Exception as exc:
                 self._report(claim, [{"seq": 2, "type": "failed", "message": redact(str(exc))[:1000],
                                       "output_tail": tail_text(log_file), "observed_at": observed_end}])
@@ -1108,6 +1108,9 @@ class Agent:
             if not in_folder and job.get("stage_iteration"):
                 event["input_head"] = workflow_input["head"]
                 event["output_commit"] = workflow_output
+                if left_out:
+                    shown = "、".join(left_out[:5]) + ("等 %d 个" % len(left_out) if len(left_out) > 5 else "")
+                    event["message"] += "; 副本里未提交的新文件未纳入产出：" + redact(shown)[:300]
             head = (lambda: None) if in_folder else (lambda: worktree.head(execution_path, workspace["path"]))
             try:
                 structured = results.collect(execution_path, head=head)

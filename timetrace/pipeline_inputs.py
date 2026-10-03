@@ -33,16 +33,23 @@ def prepare_pipeline_inputs(repo: str, output_path: str, commits: list) -> str:
     return git('rev-parse', 'HEAD')
 
 
-def committed_pipeline_output(repo: str, output_path: str) -> str:
-    """The transferable workflow output must contain all implementation work.
+def committed_pipeline_output(repo: str, output_path: str):
+    """The transferable workflow output: (HEAD, untracked paths left out).
 
-    Reserved result scratch is intentionally not part of the implementation.
-    Dirty work is preserved; the caller reports failure for manual recovery.
+    Changed tracked files are uncommitted implementation: that fails, and the
+    work is preserved for manual recovery. Untracked files alone (often scratch
+    the model could not remove) do not; the caller names them to the user.
+    Reserved result scratch is never part of the implementation.
     """
     worktree.verify_metadata(output_path, repo)
     status = subprocess.check_output(['git', *worktree.SAFE_GIT, '-C', output_path,
         'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.',
         ':(top,exclude).timetrace/out', ':(top,exclude).timetrace/out.prev-*'])
-    if status:
-        raise ValueError('任务副本还有未提交的实现，请在副本中提交后重试；修改已保留')
-    return worktree.head(output_path, repo)
+    untracked = []
+    for entry in status.split(b'\0'):
+        if not entry:
+            continue
+        if not entry.startswith(b'?? '):
+            raise ValueError('任务副本还有未提交的实现，请在副本中提交后重试；修改已保留')
+        untracked.append(entry[3:].decode('utf-8', errors='replace'))
+    return worktree.head(output_path, repo), untracked

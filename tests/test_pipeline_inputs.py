@@ -88,11 +88,15 @@ class PipelineInputTests(unittest.TestCase):
         self.assertEqual((Path(path) / 'common').read_text(), 'implementation\n')
         self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
 
-    def test_workflow_rejects_untracked_implementation(self):
+    def test_workflow_untracked_files_are_named_not_fatal(self):
+        # Leftover scratch the model could not delete (a denied `rm`) must not
+        # fail a step whose work is committed; the user sees what was left out.
         event, path = self._workflow_success('untracked')
-        self.assertEqual(event['type'], 'failed')
+        self.assertEqual(event['type'], 'completed')
+        self.assertEqual(event['output_commit'], self.base)
+        self.assertIn('implemented-feature.txt', event['message'])
+        self.assertIn('未纳入产出', event['message'])
         self.assertTrue((Path(path) / 'implemented-feature.txt').exists())
-        self.assertNotIn('output_commit', event)
 
     def test_workflow_committed_output_allows_only_result_scratch(self):
         event, path = self._workflow_success('committed')
