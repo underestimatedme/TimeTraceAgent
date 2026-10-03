@@ -801,6 +801,45 @@ class RecoveryFenceTest(unittest.TestCase):
             self.assertEqual(self.agent.run_once(), "job j2 → awaiting_review")
         self.assertEqual([call[0] for call in self.calls], ["start", "resume"])
 
+    def start_failing(self):
+        self.claim["job"]["plan_id"] = "plan-1"
+        self.adapter.start = lambda prompt, cwd, session_id, log_file, cancel_event=None: (
+            self.calls.append("start"), RunResult(exit_code=1, error="boom"))[1]
+
+    def retry(self):
+        # The user retries the failed step: Valley sends a new job for the same Plan.
+        self.claim = {**self.claim, "attempt_id": "a2", "job": dict(self.claim["job"], id="j2")}
+        self.adapter.start = lambda prompt, cwd, session_id, log_file, cancel_event=None: (
+            self.calls.append("start"), RunResult(exit_code=0, ok=True, session_id=session_id))[1]
+        return self.agent.run_once()
+
+    def test_retry_after_a_delivered_failure_starts_fresh(self):
+        self.start_failing()
+        self.assertEqual(self.agent.run_once(), "job j1 → failed")
+        self.assertEqual(self.retry(), "job j2 → awaiting_review")
+        self.assertEqual(self.calls, ["start", "start"])
+
+    def test_failure_unlocks_a_fresh_start_only_once_valley_has_it(self):
+        self.start_failing()
+        deliver = self.cloud.append_events
+        def offline(*args):
+            raise OSError("network down")
+        self.cloud.append_events = offline
+        try:
+            self.agent.run_once()
+        except OSError:
+            pass
+        self.assertTrue(self.db.plan_started("plan-1"))
+        self.cloud.append_events = deliver
+        self.agent.flush_outbox()
+        self.assertFalse(self.db.plan_started("plan-1"))
+
+    def test_an_undelivered_running_event_never_unlocks(self):
+        self.db.mark_plan_started("plan-1", "j1", "a1")
+        self.db.queue_remote_event("j1", "a1", 1, {"seq": 1, "type": "running"})
+        self.agent.flush_outbox()
+        self.assertTrue(self.db.plan_started("plan-1"))
+
     def test_started_history_created_before_lock_acquisition_is_reloaded(self):
         from timetrace.dispatch import coding_slot_lock
         self.claim["job"]["plan_id"] = "plan-1"
