@@ -1124,8 +1124,11 @@ class Agent:
                 if not structured["valid"]:
                     event["message"] += "; " + results.INVALID_NOTE
                     event["result_invalid"] = True
-                elif structured.get("dropped_artifacts"):
-                    event["message"] += "; " + results.DROPPED_NOTE % structured["dropped_artifacts"]
+                else:
+                    if structured.get("dropped_artifacts"):
+                        event["message"] += "; " + results.DROPPED_NOTE % structured["dropped_artifacts"]
+                    if structured.get("dropped_draft"):
+                        event["message"] += "; " + results.DROPPED_DRAFT_NOTE
             if not in_folder and prepared_branch:
                 # The branch review and check jobs name (`branch_name`).
                 event["branch"] = prepared_branch

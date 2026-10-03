@@ -82,7 +82,6 @@ class CollectTest(unittest.TestCase):
             "not json": "{broken",
             "not utf-8": b"\xff\xfe{}",
             "top-level list": json.dumps([{"kind": "doc", "ref": "a"}]),
-            "draft not object": json.dumps({"pipeline_draft": ["a"]}),
         }
         for name, data in cases.items():
             with self.subTest(name=name):
@@ -110,6 +109,15 @@ class CollectTest(unittest.TestCase):
                 self.assertEqual(got["artifacts"], [])
                 self.assertEqual(got["dropped_artifacts"], 1)
                 self.assertEqual(got["result"], {"pipeline_draft": {"title": "t"}})
+
+    def test_a_draft_that_is_not_an_object_is_dropped_not_fatal(self):
+        # Real breakdown output: a one-line "draft" string next to valid sub-tasks.
+        self.write({"pipeline_draft": "a ∥ b → c", "subtasks": [{"key": "a", "title": "A"}]})
+        got = self.collect()
+        self.assertTrue(got["valid"])
+        self.assertEqual(set(got["result"]), {"subtasks"})
+        self.assertEqual(got["dropped_artifacts"], 0)
+        self.assertEqual(got["dropped_draft"], True)
 
     def test_a_path_string_is_read_as_a_doc_artifact(self):
         (self.root / "docs").mkdir()
@@ -320,6 +328,11 @@ class AgentResultTest(unittest.TestCase):
         self.assertIn("忽略 1 项格式无效的产出物", event["message"])
         self.assertEqual([a["ref"] for a in event["artifacts"]], ["docs/req.md"])
         self.assertEqual(event["result"], {"pipeline_draft": {"title": "p"}})
+
+    def test_dropped_draft_is_noted_without_invalidating(self):
+        event, _ = self.run_job(json.dumps({"pipeline_draft": "a → b"}))
+        self.assertNotIn("result_invalid", event)
+        self.assertIn("忽略格式无效的 pipeline_draft", event["message"])
 
     def test_valid_result_is_not_flagged(self):
         event, _ = self.run_job(json.dumps({"artifacts": []}))

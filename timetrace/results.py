@@ -25,6 +25,7 @@ REF_CHARS = 512
 ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder")
 INVALID_NOTE = "结构化结果无效"
 DROPPED_NOTE = "忽略 %d 项格式无效的产出物"
+DROPPED_DRAFT_NOTE = "忽略格式无效的 pipeline_draft"
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SUBTASKS_MAX = 30
 # Keys end up in branch names (`timetrace/<stage>/<key>`), which are lowercase:
@@ -289,7 +290,7 @@ def _artifacts(raw: Any):
 def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Optional[Dict[str, Any]]:
     """None when the run wrote no result.json; otherwise
     {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None,
-     "dropped_artifacts": int (valid only)}.
+     "dropped_artifacts": int, "dropped_draft": bool (valid only)}.
     An invalid file yields valid=False with no artifacts and no result; bad
     artifact entries alone only raise dropped_artifacts."""
     base = Path(root)
@@ -311,8 +312,11 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
             raise Invalid("not an object")
         artifacts, dropped = _artifacts(parsed.get("artifacts"))
         draft = parsed.get("pipeline_draft")
-        if draft is not None and not isinstance(draft, dict):
-            raise Invalid("pipeline_draft is not an object")
+        dropped_draft = draft is not None and not isinstance(draft, dict)
+        if dropped_draft:
+            # Only a generate step needs a draft, and Valley asks for a retry
+            # when it is missing; a stray non-object never voids sub-tasks.
+            draft = None
         subtasks = _subtasks(parsed["subtasks"]) if parsed.get("subtasks") is not None else None
         _attach_docs(base, artifacts, head)
         artifacts = redact_all(artifacts)
@@ -323,7 +327,8 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
         if subtasks is not None:
             result["subtasks"] = redact_all(subtasks)
         result = result or None
-        return {"valid": True, "artifacts": artifacts, "result": result, "dropped_artifacts": dropped}
+        return {"valid": True, "artifacts": artifacts, "result": result, "dropped_artifacts": dropped,
+                "dropped_draft": dropped_draft}
     except (Invalid, RecursionError):
         return {"valid": False, "artifacts": [], "result": None}
 

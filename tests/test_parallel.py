@@ -431,6 +431,16 @@ class SubtasksTest(unittest.TestCase):
         self.assertEqual(got["dropped_artifacts"], 1)
         self.assertEqual(len(got["result"]["subtasks"]), 1)
 
+    def test_real_breakdown_output_keeps_its_subtasks(self):
+        got = self.collect({"subtasks": [{"key": "convert", "title": "换算", "depends_on": []},
+                                         {"key": "cli", "title": "入口", "depends_on": ["convert"]}],
+                            "artifacts": [{"kind": "doc", "ref": "docs/plan.md", "commit": "0232a01"},
+                                          {"kind": "code", "ref": "tempconv.py"}],
+                            "pipeline_draft": "convert → cli"})
+        self.assertTrue(got["valid"])
+        self.assertEqual([t["key"] for t in got["result"]["subtasks"]], ["convert", "cli"])
+        self.assertNotIn("pipeline_draft", got["result"])
+
     def test_invalid_subtasks_invalidate_the_result(self):
         one = {"key": "a", "title": "A"}
         for bad in ("x", [one] * 1 + [dict(one)], [dict(one, key="k%d" % i) for i in range(31)],
