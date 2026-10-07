@@ -14,7 +14,7 @@ class PhonePairingTest(unittest.TestCase):
         seen=[]
         class Cloud:
             def poll_device_authorization(self, code):
-                return {"status":"waiting_phone", "expires_at":"2026-10-08T01:10:00Z", "server_now":"2026-10-08T01:05:00Z", "attempts_remaining":3}
+                return {"status":"waiting_phone", "expires_at":"2026-10-08T01:10:00.123456789Z", "server_now":"2026-10-08T01:05:00.123456789Z", "attempts_remaining":3}
             def activate_phone(self, code, digits):
                 seen.append(digits)
                 if len(seen)==1: raise CloudError("request failed",status=503)

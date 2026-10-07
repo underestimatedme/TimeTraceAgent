@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import plistlib
 import shlex
 import shutil
@@ -131,6 +132,13 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
     return 1
 
 
+def _pair_server_time(value):
+    # Python 3.9 only accepts 3/6 fractional digits; Go emits RFC3339Nano 1..9.
+    normalized = re.sub(r"\.(\d{1,9})(?=Z$|[+-])",
+                        lambda match: "." + match.group(1)[:6].ljust(6, "0"), value)
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
 def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) -> Optional[int]:
     """Poll one authorization. Returns 0 once bound, None when it expired.
     `tick(remaining_seconds)` is called every second between polls."""
@@ -143,8 +151,8 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
         status = approval.get("status")
         if status in ("waiting_phone", "activated") and auth.get("pairing_version") == 2:
             if not phone_window and approval.get("server_now") and approval.get("expires_at"):
-                start = datetime.fromisoformat(approval["server_now"].replace("Z", "+00:00"))
-                end = datetime.fromisoformat(approval["expires_at"].replace("Z", "+00:00"))
+                start = _pair_server_time(approval["server_now"])
+                end = _pair_server_time(approval["expires_at"])
                 deadline = time.time() + max(0, (end - start).total_seconds())
                 phone_window = True
             if digits is None:
