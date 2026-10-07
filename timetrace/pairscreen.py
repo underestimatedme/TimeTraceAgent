@@ -16,6 +16,7 @@ the code.
 import os
 import sys
 import unicodedata
+from urllib.parse import parse_qs, urlsplit
 from typing import List, Mapping, Optional
 
 from timetrace import qr
@@ -116,6 +117,7 @@ class PairScreen:
         return self._row(countdown_text(self.total, remaining_seconds))
 
     def lines(self, remaining_seconds: Optional[float] = None) -> List[str]:
+        phone_pair = parse_qs(urlsplit(self.link).query).get('v') == ['2']
         remaining = self.total if remaining_seconds is None else remaining_seconds
         header = [
             "╭" + "─" * (self.inner + 2) + "╮",
@@ -126,10 +128,10 @@ class PairScreen:
         ]
         footer = [
             "",
-            "配对链接（扫不了码时复制到 iPhone 打开）：",
+            "配对链接（用于刻迹 App 内扫码）：" if phone_pair else "配对链接（扫不了码时复制到 iPhone 打开）：",
             self.link,
             "或在 App 中手动输入授权码：%s" % self.user_code,
-            HINT,
+            "打开 刻迹 → AI → 绑定电脑" if phone_pair else HINT,
         ]
         return header + self.qr + footer
 

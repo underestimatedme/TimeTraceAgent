@@ -10,6 +10,12 @@ from timetrace import cli
 from timetrace.cloud import CloudClient, CloudError
 
 class PhonePairingTest(unittest.TestCase):
+    def test_v2_guidance_matches_native_ai_entry_and_does_not_promise_url_open(self):
+        from timetrace.pairscreen import PairScreen
+        lines=PairScreen('timetrace://pair?code=ABCD1234&v=2','样例电脑','ABCD1234',300).lines()
+        self.assertEqual(lines[-1], '打开 刻迹 → AI → 绑定电脑')
+        self.assertEqual(lines[-4], '配对链接（用于刻迹 App 内扫码）：')
+
     def test_phone_digits_are_entered_on_computer_and_retried_unchanged(self):
         seen=[]
         class Cloud:
