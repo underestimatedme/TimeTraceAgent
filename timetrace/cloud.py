@@ -113,6 +113,23 @@ class CloudClient:
             "device_code": device_code, "activation_code": activation_code,
         })
 
+    def create_phone_authorization(self, name: str, platform: str, version: str,
+                                   previous_device_code: str = "") -> Dict[str, Any]:
+        value = self.request("POST", "/iphone/device-authorizations", {
+            "device_name": name, "platform": platform, "client_version": version,
+            "previous_device_code": previous_device_code,
+        })
+        value["pairing_version"] = 2
+        return value
+
+    def activate_phone(self, device_code: str, phone_code: str) -> Dict[str, Any]:
+        return self.request("POST", "/iphone/device-authorizations/activate", {
+            "device_code": device_code, "phone_code": phone_code,
+        })
+
+    def revoke_phone(self, refresh_token: str) -> Dict[str, Any]:
+        return self.request("POST", "/iphone/runner/revoke", {"refresh_token": refresh_token})
+
     def refresh(self, refresh_token: str, idempotency_key: str) -> Dict[str, Any]:
         return self.request("POST", "/runner-auth/refresh", {
             "refresh_token": refresh_token, "idempotency_key": idempotency_key,

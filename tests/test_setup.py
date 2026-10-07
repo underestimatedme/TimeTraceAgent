@@ -38,11 +38,11 @@ class FakeValley:
 
     def request(self, client, method, path, body=None, token=None):
         self.calls.append(path)
-        if path == "/device-authorizations":
-            return {"user_code": "WXYZ5678", "device_code": "dev-secret", "expires_in": 600, "interval": 1}
+        if path == "/iphone/device-authorizations":
+            return {"user_code": "WXYZ5678", "device_code": "dev-secret", "expires_in": 600, "interval": 1, "verification_uri": "timetrace://pair?code=WXYZ5678&platform=darwin&v=2"}
         if path == "/device-authorizations/token":
-            return {"status": "approved", "activation_code": "act"} if self.approve else {"status": "expired"}
-        if path == "/device-authorizations/activate":
+            return {"status": "waiting_phone"} if self.approve else {"status": "expired"}
+        if path == "/iphone/device-authorizations/activate":
             return {"access_token": "at", "refresh_token": "rt", "expires_in": 900,
                     "runner": {"id": "r1", "name": "Test Mac"}}
         return {}
@@ -103,7 +103,7 @@ class SetupWizardTest(unittest.TestCase):
         return Database(self.home / "timetrace.db").list_workspaces()
 
     def test_interactive_happy_path(self):
-        code, out, asked = self.wizard([], [str(self.repo), "", "y", "y"])
+        code, out, asked = self.wizard([], [str(self.repo), "", "y", "0000", "y"])
         self.assertEqual(code, 0, out)
         # tool check reuses the doctor verdicts
         self.assertIn("claude", out)
@@ -129,10 +129,11 @@ class SetupWizardTest(unittest.TestCase):
         self.assertEqual(self.installed, [])
         self.assertEqual(self.valley.calls, [])
 
-    def test_non_interactive_flags_never_prompt(self):
-        code, out, asked = self.wizard(["--repo", str(self.repo), "--yes"])
+    def test_yes_skips_choices_but_phone_code_is_still_required(self):
+        code, out, asked = self.wizard(["--repo", str(self.repo), "--yes"], ["0000"])
         self.assertEqual(code, 0, out)
-        self.assertEqual(asked, [])
+        self.assertEqual(len(asked), 1)
+        self.assertIn("4 位", asked[0])
         self.assertEqual(len(self.workspaces()), 1)
         self.assertEqual(self.saved.get("refresh_token"), "rt")
         self.assertEqual(self.installed, [True])

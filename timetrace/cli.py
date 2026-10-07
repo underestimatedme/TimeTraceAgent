@@ -14,13 +14,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qsl, urlencode
 
 from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
                        render, runner_state, scheduler, statusline_hook, toolpath, worktree)
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
-from timetrace.cloud import CloudClient
+from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager
 from timetrace.db import Database
 from timetrace.dispatch import adapter_capabilities, lock_diagnostics
@@ -81,15 +81,28 @@ def _live_countdown(screen: "pairscreen.PairScreen") -> bool:
     return shutil.get_terminal_size((80, 24)).lines > screen.rows_below_countdown() + 2
 
 
-def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_rounds: int = 5) -> int:
+def _phone_pair_link(link):
+    """Keep the authoritative v2 link; omit display hints if too dense for terminal QR."""
+    try:
+        qr.encode(link, levels=("M",))
+        return link
+    except ValueError:
+        uri = urlparse(link)
+        values = [(key, value) for key, value in parse_qsl(uri.query) if key != "name"]
+        return uri._replace(query=urlencode(values, quote_via=quote)).geturl()
+
+
+def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_rounds: int = 5, input_fn=None) -> int:
     """Device-code pairing with the phone (QR code or typed code). Stores the
     runner credentials in the Keychain and reports inventory and quota. An
     expired code is replaced by a fresh one, up to `max_rounds` times."""
     cloud = _cloud(cfg)
     name = platform.node() or "Mac"
     colour = out is print and pairscreen.color_supported()
+    previous = ""
     for round_no in range(max_rounds):
-        auth = cloud.create_device_authorization(name, "darwin", __version__)
+        auth = cloud.create_phone_authorization(name, "darwin", __version__, previous)
+        previous = auth["device_code"]
         if round_no:
             out()
             out("上一个二维码已过期，已生成新的二维码：")
@@ -97,18 +110,18 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
         expires_in = int(auth["expires_in"])
         # Black on white whatever the terminal theme, so the phone sees dark
         # modules on a light background.
-        screen = pairscreen.PairScreen(_pair_link(auth["user_code"], name, int(time.time()) + expires_in),
+        screen = pairscreen.PairScreen(_phone_pair_link(auth["verification_uri"]),
                                        name, auth["user_code"], expires_in, ansi=colour,
                                        colours=pairscreen.black_on_white())
         for line in screen.lines():
             out(line)
-        out("正在等待手机确认…")
+        out("手机核对电脑后会显示 4 位数字，请回到这里输入。")
         tick = None
         if out is print and _live_countdown(screen):
             def tick(remaining, screen=screen):
                 sys.stdout.write(screen.update_sequence(remaining, extra_below=1))
                 sys.stdout.flush()
-        result = _await_pairing(cloud, auth, cfg, db, home, out, tick=tick)
+        result = _await_pairing(cloud, auth, cfg, db, home, out, tick=tick, input_fn=input_fn)
         if result is not None:
             return result
     if out is print:
@@ -118,33 +131,67 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
     return 1
 
 
-def _await_pairing(cloud, auth, cfg, db, home, out, tick=None) -> Optional[int]:
+def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) -> Optional[int]:
     """Poll one authorization. Returns 0 once bound, None when it expired.
     `tick(remaining_seconds)` is called every second between polls."""
     deadline = time.time() + int(auth["expires_in"])
     interval = max(1, int(auth.get("interval") or 5))
+    digits = None
+    phone_window = False
     while time.time() < deadline:
         approval = cloud.poll_device_authorization(auth["device_code"])
-        if approval.get("status") == "approved":
-            credentials = cloud.activate(auth["device_code"], approval["activation_code"])
-            credentials["expires_at"] = int(time.time()) + int(credentials.get("expires_in") or 900)
-            CredentialStore().save(credentials)
-            out("已绑定：%s" % credentials["runner"]["name"])
-            # Report right away so the phone shows tools and quota within
-            # seconds of approving, instead of after the next agent start.
+        status = approval.get("status")
+        if status in ("waiting_phone", "activated") and auth.get("pairing_version") == 2:
+            if not phone_window and approval.get("server_now") and approval.get("expires_at"):
+                start = datetime.fromisoformat(approval["server_now"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(approval["expires_at"].replace("Z", "+00:00"))
+                deadline = time.time() + max(0, (end - start).total_seconds())
+                phone_window = True
+            if digits is None:
+                try:
+                    answer = (input_fn or input)("输入手机上显示的 4 位数字（5 分钟内有效，最多错 3 次）：")
+                    if answer is None:
+                        out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                        return 1
+                    digits = answer.strip()
+                except (EOFError, KeyboardInterrupt):
+                    out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                    return 1
             try:
-                adapters = _adapters(cfg)
-                token = credentials["access_token"]
-                workspaces, tools = _runner_workspaces(db), _runner_tools(cfg, adapters)
-                cloud.update_inventory(token, workspaces, tools, _max_parallel(cfg), _max_parallel_per_tool(cfg))
-                runner_state.record(home, inventory_pushed_at=int(time.time()), inventory_workspaces=len(workspaces),
-                                    inventory_tools=len(tools))
-                Agent(db, cloud, adapters, home, lambda: token).report_quota()
-                out("已上报工具清单与额度，手机上几秒内可见")
-            except Exception as exc:
-                out("绑定成功，但首次上报失败：%s（Runner 启动后会重试）" % exc.__class__.__name__)
-            return 0
-        if approval.get("status") == "expired":
+                credentials = cloud.activate_phone(auth["device_code"], digits)
+                return _finish_pairing(cloud, credentials, cfg, db, home, out)
+            except CloudError as exc:
+                if exc.status == 401:
+                    digits = None
+                    current = cloud.poll_device_authorization(auth["device_code"])
+                    out("数字不正确，剩余 %s 次。" % current.get("attempts_remaining", "未知"))
+                    if current.get("status") == "locked":
+                        out("已错 3 次，本次绑定已锁定；请重新运行绑定。")
+                        return 1
+                    if current.get("status") in ("expired", "cancelled"):
+                        out("本次绑定已过期或取消。")
+                        return 1
+                elif exc.status == 410:
+                    return None
+                elif exc.status == 409:
+                    out("本次绑定已锁定或取消；请重新开始。")
+                    return 1
+                elif exc.status and exc.status < 500:
+                    raise
+                else:
+                    out("结果尚未确认，正在重试同一笔电脑确认…")
+            except OSError:
+                out("网络中断，正在重试同一笔电脑确认…")
+        elif status == "approved":
+            if auth.get("pairing_version") == 2:
+                out("服务端配对协议不匹配，未完成绑定。")
+                return 1
+            credentials = cloud.activate(auth["device_code"], approval["activation_code"])
+            return _finish_pairing(cloud, credentials, cfg, db, home, out)
+        if status in ("locked", "cancelled"):
+            out("本次绑定已锁定或取消；请重新开始。")
+            return 1
+        if status == "expired":
             return None
         if tick is None:
             time.sleep(interval)
@@ -153,6 +200,26 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None) -> Optional[int]:
             tick(max(0.0, deadline - time.time()))
             time.sleep(1)
     return None
+
+
+def _finish_pairing(cloud, credentials, cfg, db, home, out):
+    credentials["expires_at"] = int(time.time()) + int(credentials.get("expires_in") or 900)
+    CredentialStore().save(credentials)
+    out("已绑定：%s" % credentials["runner"]["name"])
+    # Report right away so the phone shows tools and quota within
+    # seconds of approving, instead of after the next agent start.
+    try:
+        adapters = _adapters(cfg)
+        token = credentials["access_token"]
+        workspaces, tools = _runner_workspaces(db), _runner_tools(cfg, adapters)
+        cloud.update_inventory(token, workspaces, tools, _max_parallel(cfg), _max_parallel_per_tool(cfg))
+        runner_state.record(home, inventory_pushed_at=int(time.time()), inventory_workspaces=len(workspaces),
+                            inventory_tools=len(tools))
+        Agent(db, cloud, adapters, home, lambda: token).report_quota()
+        out("已上报工具清单与额度，手机上几秒内可见")
+    except Exception as exc:
+        out("绑定成功，但首次上报失败：%s（Runner 启动后会重试）" % exc.__class__.__name__)
+    return 0
 
 
 def cmd_cloud_login(args: argparse.Namespace) -> int:
@@ -173,13 +240,17 @@ def cmd_cloud_status(args: argparse.Namespace) -> int:
 def cmd_cloud_logout(args: argparse.Namespace) -> int:
     _, cfg, _ = _open(args)
     store = CredentialStore()
-    if store.load():
+    credentials = store.load()
+    if credentials:
         cloud = _cloud(cfg)
         try:
-            cloud.request("POST", "/runner/revoke", None, SessionManager(store, cloud).token())
-            print("已在刻迹账号中解绑这台电脑")
+            result = cloud.revoke_phone(credentials.get("refresh_token", ""))
+            if not result or result.get("revoked") is not True:
+                raise CloudError("revocation not acknowledged")
         except Exception as exc:
-            print("服务端解绑失败（%s），请在手机「设备与授权」里再解绑一次" % exc.__class__.__name__)
+            print("尚未确认服务端解绑（%s）；保留本机凭据，请重试或在手机解绑。" % exc.__class__.__name__)
+            return 1
+        print("已在刻迹账号中解绑这台电脑")
     store.delete()
     print("本机 Runner 凭据已从 Keychain 删除")
     return 0
@@ -857,7 +928,7 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
         do_pair = confirm("  现在用手机扫码绑定？", args.no_pair)
     if do_pair:
         try:
-            code = pair_computer(cfg, db, home, out=out)
+            code = pair_computer(cfg, db, home, out=out, input_fn=ask)
         except Exception as exc:
             out("  绑定失败：%s" % exc.__class__.__name__)
             code = 1

@@ -89,11 +89,11 @@ class CliTest(unittest.TestCase):
 
         def request(client, method, path, body=None, token=None):
             calls.append((method, path, token))
-            if path == "/device-authorizations":
-                return {"user_code": "ABCD1234", "device_code": "dev", "expires_in": 600, "interval": 1}
+            if path == "/iphone/device-authorizations":
+                return {"user_code": "ABCD1234", "device_code": "dev", "expires_in": 600, "interval": 1, "verification_uri": "timetrace://pair?code=ABCD1234&name=Alex%20%E7%9A%84%20Mac&exp=1790000600&platform=darwin&v=2"}
             if path == "/device-authorizations/token":
-                return {"status": "approved", "activation_code": "act"}
-            if path == "/device-authorizations/activate":
+                return {"status": "waiting_phone"}
+            if path == "/iphone/device-authorizations/activate":
                 return {"access_token": "fresh-token", "refresh_token": "r", "expires_in": 900, "runner": {"id": "r1", "name": "Mac"}}
             return {}
 
@@ -115,8 +115,8 @@ class CliTest(unittest.TestCase):
         from tests.test_qr import decode
 
         def request(client, method, path, body=None, token=None):
-            if path == "/device-authorizations":
-                return {"user_code": "ABCD1234", "device_code": "secret-device-code", "expires_in": 600, "interval": 1}
+            if path == "/iphone/device-authorizations":
+                return {"user_code": "ABCD1234", "device_code": "secret-device-code", "expires_in": 600, "interval": 1, "verification_uri": "timetrace://pair?code=ABCD1234&name=Alex%20%E7%9A%84%20Mac&exp=1790000600&platform=darwin&v=2"}
             return {"status": "expired"}
 
         with patch("timetrace.cloud.CloudClient.request", new=request), \
@@ -149,19 +149,19 @@ class CliTest(unittest.TestCase):
         size = len(rows)
         matrix = [row[left:left + size] for row in rows]
         text, _, _ = decode(matrix)
-        self.assertEqual(text, "timetrace://pair?code=ABCD1234&name=Alex%20%E7%9A%84%20Mac&exp=1790000600&platform=darwin&v=1")
+        self.assertEqual(text, "timetrace://pair?code=ABCD1234&name=Alex%20%E7%9A%84%20Mac&exp=1790000600&platform=darwin&v=2")
 
     def test_expired_code_is_replaced_automatically_until_approved(self):
         issued = []
 
         def request(client, method, path, body=None, token=None):
-            if path == "/device-authorizations":
+            if path == "/iphone/device-authorizations":
                 code = "CODE%04d" % (len(issued) + 1)
                 issued.append(code)
-                return {"user_code": code, "device_code": "dev-%d" % len(issued), "expires_in": 120, "interval": 1}
+                return {"user_code": code, "device_code": "dev-%d" % len(issued), "expires_in": 120, "interval": 1, "verification_uri": "timetrace://pair?code=" + code + "&platform=darwin&v=2"}
             if path == "/device-authorizations/token":
-                return {"status": "approved", "activation_code": "act"} if body["device_code"] == "dev-2" else {"status": "expired"}
-            if path == "/device-authorizations/activate":
+                return {"status": "waiting_phone"} if body["device_code"] == "dev-2" else {"status": "expired"}
+            if path == "/iphone/device-authorizations/activate":
                 return {"access_token": "t", "refresh_token": "r", "expires_in": 900, "runner": {"id": "r1", "name": "Mac"}}
             return {}
 
@@ -279,7 +279,7 @@ class CliTest(unittest.TestCase):
 
         def request(client, method, path, body=None, token=None):
             calls.append((method, path, token))
-            return {}
+            return {"revoked": True}
 
         with patch("timetrace.cli.CredentialStore.load", return_value={"refresh_token": "r", "runner": {"id": "r1"}}), \
              patch("timetrace.cli.CredentialStore.delete", new=lambda self: deleted.append(True)), \
@@ -287,7 +287,7 @@ class CliTest(unittest.TestCase):
              patch("timetrace.cloud.CloudClient.request", new=request):
             code, out, err = self.run_cli("cloud", "logout")
         self.assertEqual(code, 0, err)
-        self.assertIn(("POST", "/runner/revoke", "live-token"), calls)
+        self.assertIn(("POST", "/iphone/runner/revoke", None), calls)
         self.assertEqual(deleted, [True])
 
     def setUp(self):
@@ -309,7 +309,8 @@ class CliTest(unittest.TestCase):
         user_home = root / "user"
         user_home.mkdir()
         for target, value in (("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
-                              ("timetrace.cli.Path.home", lambda: user_home)):
+                              ("timetrace.cli.Path.home", lambda: user_home),
+                              ("builtins.input", lambda prompt: "0000")):
             p = patch(target, new=value)
             p.start()
             self.addCleanup(p.stop)

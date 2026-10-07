@@ -4,6 +4,15 @@
 
 命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+
+## iPhone重做联调分支：反向确认（尚未发布）
+
+此分支新增v2三段绑定：安装/启动电脑端→电脑展示二维码或8位码→手机核对并显示4位随机数字→在电脑终端输入数字，服务端成功后才绑定。手机数字保留前导零，有效期5分钟，最多错3次；取消/重新取码使旧数字失效，第三次错误锁定，必须重新开始。新CLI调用`/iphone/device-authorizations`及`/iphone/device-authorizations/activate`；旧v1端点保留给旧客户端，但不能批准或激活v2授权。
+
+以下旧版Homebrew/tag安装说明不代表已经发布这个补丁。源码联调使用本分支并把cloud_base_url明确设为隔离QA服务，再执行`python3 -m timetrace cloud login`；不会安装后台Runner或迁移生产数据。`setup --yes`只省略安装选择，绑定时仍需要输入手机数字；脚本只安装可用`--no-pair`，不绕过确认。
+
+电脑`cloud logout`现在使用Keychain持久化的refresh凭据在服务端撤销，可重复或在丢回执后重试；未确认成功时返回失败并保留凭据，只有收到明确撤销回执才删本机Keychain。手机解绑仍使用原Runner身份，旧access/refresh随之失效。授权撤销不代表实际AI进程已收到停止回执，真实执行控制留下一项。
+
 ## 快速开始
 
 ```sh
