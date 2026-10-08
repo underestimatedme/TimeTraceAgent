@@ -37,6 +37,9 @@ def parse_rate_limits(response: Dict[str, Any], tool: str = CODEX) -> List[Sampl
         single = response.get("rateLimits") or {}
         by_id = {single.get("limitId") or "codex": single}
     samples: List[Sample] = []
+    permission = response.get("ordinaryUsageAllowed")
+    if type(permission) is not bool or tool != CODEX:
+        permission = None
     for limit_id, snap in by_id.items():
         if not isinstance(snap, dict):
             continue
@@ -50,6 +53,8 @@ def parse_rate_limits(response: Dict[str, Any], tool: str = CODEX) -> List[Sampl
                 window_mins=_int_or_none(w.get("windowDurationMins")),
                 is_representative=(limit_id == "codex" and win_name == "primary"),
                 source="live",
+                codex_ordinary_usage_allowed=permission if (limit_id == "codex" or
+                    (limit_id == "base_model_inference" and snap.get("limitName") == "gpt-reserve")) else None,
             ))
     return samples
 

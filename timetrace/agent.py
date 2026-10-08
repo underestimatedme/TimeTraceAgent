@@ -1862,6 +1862,7 @@ class Agent:
                     s.bucket_key, s.tool, s.used_pct, s.reset_at, s.window_mins,
                     pool_id, profile_id, now, source=getattr(s, "source", "runner"),
                     pool_authoritative=authoritative,
+                    codex_ordinary_usage_allowed=getattr(s, "codex_ordinary_usage_allowed", None),
                 ))
             except ValueError:
                 continue

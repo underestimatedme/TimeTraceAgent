@@ -136,6 +136,21 @@ class AgentOccurrenceTest(unittest.TestCase):
 
 
 class AgentTest(unittest.TestCase):
+    def test_live_codex_permission_reaches_quota_wire_without_clearing_usage(self):
+        from timetrace.adapters.codex import parse_rate_limits
+        samples = parse_rate_limits({"ordinaryUsageAllowed": True, "rateLimitsByLimitId": {
+            "codex": {"primary": {"usedPercent": 33, "windowDurationMins": 300}},
+            "base_model_inference": {"limitName": "gpt-reserve", "primary": {"usedPercent": 100, "windowDurationMins": 10080}}}})
+        with tempfile.TemporaryDirectory() as d:
+            cloud = FakeCloud()
+            agent = Agent(Database(Path(d) / "timetrace.db"), cloud, {}, Path(d), lambda: "token",
+                          pool_binding=lambda provider: ("pool", "codex-default", True))
+            self.assertEqual(agent._post_samples("codex", Adapter(), samples, now=1000), 2)
+            payloads = cloud.quota_posts[0][1]
+            self.assertEqual([p.get("codex_ordinary_usage_allowed") for p in payloads], [True, True])
+            self.assertEqual([p["used_percent"] for p in payloads], [33, 100])
+            self.assertEqual(payloads[0]["observed_at"], payloads[1]["observed_at"])
+
     def test_pool_authority_must_be_explicit_not_inferred_from_callback(self):
         for binding, expected in ((lambda provider: ("pool", "custom-profile"), False),
                                   (lambda provider: ("pool", "custom-profile", True), True)):
