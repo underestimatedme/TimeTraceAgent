@@ -77,13 +77,13 @@ class InventoryProtocolTwoTest(unittest.TestCase):
                   "sleep_prevention": "active", "checked_at": "2026-09-30T12:00:00Z"}
         credits = [{"pool_id": "pool-codex-ab", "tool_profile_id": "codex-default", "status": "unknown"}]
         client.update_inventory("t", [], [], 2, {"claude": 2, "codex": 2},
-                                extras={"protocol_version": 2, "agent_version": "0.4.0", "accepting_local": True,
+                                extras={"protocol_version": 2, "agent_version": "0.5.0", "accepting_local": True,
                                         "health": health, "reset_credits": credits, "ignored": 1})
         body = json.loads(seen[0].data.decode())
         self.assertEqual(seen[0].get_method(), "PUT")
         self.assertTrue(seen[0].full_url.endswith("/runner/inventory"))
         self.assertEqual(body["protocol_version"], 2)
-        self.assertEqual(body["agent_version"], "0.4.0")
+        self.assertEqual(body["agent_version"], "0.5.0")
         self.assertIs(body["accepting_local"], True)
         self.assertEqual(body["health"], health)
         self.assertEqual(body["reset_credits"], credits)

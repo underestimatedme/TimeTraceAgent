@@ -5,13 +5,13 @@
 命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
 
-## iPhone重做联调分支：反向确认（尚未发布）
+## 0.5.0 起：手机数字确认绑定
 
-此分支新增v2三段绑定：安装/启动电脑端→电脑展示二维码或8位码→手机核对并显示4位随机数字→在电脑终端输入数字，服务端成功后才绑定。手机数字保留前导零，有效期5分钟，最多错3次；取消/重新取码使旧数字失效，第三次错误锁定，必须重新开始。新CLI调用`/iphone/device-authorizations`及`/iphone/device-authorizations/activate`；旧v1端点保留给旧客户端，但不能批准或激活v2授权。
+配合刻迹 iPhone 新版（0.3.0 起）。绑定分三步：电脑展示二维码或 8 位码 → 手机核对这台电脑并显示 4 位随机数字 → 在电脑终端输入这组数字，服务端确认后才绑定。数字保留前导零，5 分钟内有效，最多错 3 次；取消或重新取码会让旧数字失效，第三次输错后锁定，需要重新开始。`setup --yes` 只省略安装选择，绑定时仍要输入手机数字。
 
-以下旧版Homebrew/tag安装说明不代表已经发布这个补丁。源码联调使用本分支并把cloud_base_url明确设为隔离QA服务，再执行`python3 -m timetrace cloud login`；不会安装后台Runner或迁移生产数据。`setup --yes`只省略安装选择，绑定时仍需要输入手机数字；脚本只安装可用`--no-pair`，不绕过确认。
+新版刻迹 App 只接受这种绑定；旧版（0.2.x）App 绑定新电脑需要 0.4.0 及更早版本的电脑端。已经绑定的电脑升级后保持绑定。
 
-电脑`cloud logout`现在使用Keychain持久化的refresh凭据在服务端撤销，可重复或在丢回执后重试；未确认成功时返回失败并保留凭据，只有收到明确撤销回执才删本机Keychain。手机解绑仍使用原Runner身份，旧access/refresh随之失效。授权撤销不代表实际AI进程已收到停止回执，真实执行控制留下一项。
+`cloud logout` 用 Keychain 里的 refresh 凭据在服务端撤销，可以重复执行或在丢回执后重试；没确认成功时返回失败并保留凭据，收到明确的撤销回执才删本机 Keychain。手机端解绑会让这台电脑的凭据随之失效。
 
 ## 快速开始
 
@@ -88,7 +88,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.4.0"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.0"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent

@@ -202,7 +202,7 @@ class AgentL2Test(unittest.TestCase):
         extras = cloud.inventories[-1]
         self.assertEqual(extras["protocol_version"], PROTOCOL_VERSION)
         self.assertEqual(extras["agent_version"], __version__)
-        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(__version__, "0.5.0")
         self.assertIs(extras["accepting_local"], True)
         self.assertEqual(extras["health"]["sleep_prevention"], "inactive")
         self.assertEqual(extras["health"]["disk_free_gb"], 42.0)

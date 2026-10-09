@@ -9,7 +9,7 @@ from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from timetrace import cli
+from timetrace import __version__, cli
 
 
 def git(*args, cwd):
@@ -227,7 +227,7 @@ class CliTest(unittest.TestCase):
             _, doctor, _ = self.run_cli("agent", "doctor")
         self.assertIn("已在电脑上暂停", doctor)
         self.assertIn("协议 2", doctor)
-        self.assertIn("0.4.0", doctor)
+        self.assertIn(__version__, doctor)
         self.run_cli("agent", "resume")
         self.assertFalse(pause.paused(home))
         self.assertEqual([e["event"] for e in audit.read(home)], ["pause", "resume"])
