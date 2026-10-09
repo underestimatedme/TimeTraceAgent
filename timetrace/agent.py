@@ -1145,6 +1145,9 @@ class Agent:
                         event["message"] += "; " + results.DROPPED_NOTE % structured["dropped_artifacts"]
                     if structured.get("dropped_draft"):
                         event["message"] += "; " + results.DROPPED_DRAFT_NOTE
+                    event["artifacts"], failed = self._upload_files(job["id"], execution_path, event["artifacts"])
+                    if failed:
+                        event["message"] += "; " + results.FILE_DROPPED_NOTE % failed
             if not in_folder and prepared_branch:
                 # The branch review and check jobs name (`branch_name`).
                 event["branch"] = prepared_branch
@@ -1374,6 +1377,35 @@ class Agent:
         return "job %s → %s" % (job_id, outcome)
 
     # ---- acceptance: review_turn and check jobs ---------------------------
+    def _upload_files(self, job_id, root, artifacts):
+        """Uploads each declared `file` artifact (at most results.FILES_MAX) and
+        replaces its path with Valley's file id. A file that cannot be read
+        safely or uploaded is dropped and counted; other artifacts pass through."""
+        kept, failed, sent = [], 0, 0
+        for art in artifacts or []:
+            if art.get("kind") != "file":
+                kept.append(art)
+                continue
+            data = results.read_file_artifact(root, art["ref"]) if sent < results.FILES_MAX else None
+            if data is None:
+                failed += 1
+                continue
+            try:
+                stored = self.cloud.upload_job_file(self.access_token(), job_id,
+                                                    Path(art["ref"]).name, data)
+                file_id = (stored or {}).get("id")
+            except Exception:
+                file_id = None
+            if not isinstance(file_id, str) or not file_id:
+                failed += 1
+                continue
+            sent += 1
+            uploaded = {"kind": "file", "ref": file_id}
+            if art.get("content"):
+                uploaded["content"] = art["content"]
+            kept.append(uploaded)
+        return kept, failed
+
     def _fail(self, claim, message, outcome):
         self._report(claim, [{"seq": 1, "type": "failed", "message": message}])
         self.db.update_remote_claim(claim["job"]["id"], "reported")

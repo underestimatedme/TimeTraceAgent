@@ -361,3 +361,77 @@ class AgentResultTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "wt"
+        (self.root / "dist").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_only_a_bounded_regular_file_inside_the_worktree_is_read(self):
+        (self.root / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04data")
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/pkg.zip"), b"PK\x03\x04data")
+        outside = Path(self.tmp.name) / "secret.txt"
+        outside.write_text("secret")
+        os.symlink(outside, self.root / "dist" / "link.zip")
+        self.assertIsNone(results.read_file_artifact(str(self.root), "dist/link.zip"))
+        self.assertIsNone(results.read_file_artifact(str(self.root), "../secret.txt"))
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("x")
+        self.assertIsNone(results.read_file_artifact(str(self.root), ".git/config"))
+        self.assertIsNone(results.read_file_artifact(str(self.root), "dist/missing.zip"))
+        from unittest import mock
+        with mock.patch.object(results, "FILE_BYTES", 4):
+            self.assertIsNone(results.read_file_artifact(str(self.root), "dist/pkg.zip"))
+
+
+class UploadCloud(TaskCloud):
+    def __init__(self, fail=False):
+        super().__init__()
+        self.uploads, self.fail = [], fail
+
+    def upload_job_file(self, token, job_id, name, data):
+        if self.fail:
+            raise RuntimeError("offline")
+        self.uploads.append((token, job_id, name, data))
+        return {"id": "file%d" % len(self.uploads)}
+
+
+class FileWritingAdapter(WritingAdapter):
+    def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+        (Path(cwd) / "dist").mkdir(exist_ok=True)
+        (Path(cwd) / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04zip")
+        return super().start(prompt, cwd, session_id, log_file, cancel_event)
+
+
+class AgentFileUploadTest(unittest.TestCase):
+    def run_job(self, cloud, payload):
+        with tempfile.TemporaryDirectory() as d:
+            db = Database(Path(d) / "timetrace.db")
+            repo = Path(d) / "repo"; init_repo(repo)
+            db.upsert_workspace("ws1", "repo", str(repo.resolve()), "main")
+            agent = Agent(db, cloud, {"codex": FileWritingAdapter(payload)}, Path(d), lambda: "token")
+            agent.run_once()
+            return cloud.events[-1]
+
+    def test_a_declared_file_is_uploaded_and_sent_by_its_id(self):
+        cloud = UploadCloud()
+        event = self.run_job(cloud, json.dumps({"artifacts": [
+            {"kind": "file", "ref": "dist/pkg.zip", "content": "四个文件"},
+            {"kind": "file", "ref": "dist/missing.zip"},
+            {"kind": "doc", "ref": "docs/req.md"}]}))
+        self.assertEqual(cloud.uploads, [("token", "j1", "pkg.zip", b"PK\x03\x04zip")])
+        self.assertEqual(event["artifacts"][0], {"kind": "file", "ref": "file1", "content": "四个文件"})
+        self.assertEqual([a["kind"] for a in event["artifacts"]], ["file", "doc"])
+        self.assertIn("1 个文件未能上传", event["message"])
+
+    def test_an_upload_failure_drops_the_file_but_keeps_the_completion(self):
+        event = self.run_job(UploadCloud(fail=True), json.dumps({"artifacts": [
+            {"kind": "file", "ref": "dist/pkg.zip"}]}))
+        self.assertEqual(event["type"], "completed")
+        self.assertEqual(event["artifacts"], [])
+        self.assertIn("1 个文件未能上传", event["message"])

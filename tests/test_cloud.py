@@ -169,3 +169,25 @@ class CloudTransportHardeningTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadJobFileTest(unittest.TestCase):
+    def test_multipart_upload_to_the_job_files_endpoint(self):
+        seen = []
+
+        def opener(request, timeout):
+            seen.append((request, timeout))
+            return Response(200, {"code": 0, "data": {"id": "f1", "name": "pkg.zip"}})
+
+        client = CloudClient("https://v/timetrace/api/v1", opener=opener)
+        stored = client.upload_job_file("secret", "j 1", 'pk"g.zip', b"PK\x03\x04")
+        request, timeout = seen[0]
+        self.assertEqual(stored["id"], "f1")
+        self.assertTrue(request.full_url.endswith("/runner/jobs/j%201/files"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        content_type = request.get_header("Content-type")
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary=timetrace-"))
+        body = request.data
+        self.assertIn(b'name="file"; filename="pkg.zip"', body)
+        self.assertIn(b"\r\n\r\nPK\x03\x04\r\n--", body)
+        self.assertGreaterEqual(timeout, 120)

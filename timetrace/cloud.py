@@ -6,6 +6,7 @@ servers), certificate verification by the default SSL context, no redirects
 timeout on every call and a bounded response size."""
 import ipaddress
 import json
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -68,18 +69,19 @@ class CloudClient:
         self.timeout = timeout
 
     def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
-                token: Optional[str] = None) -> Any:
-        payload = None if body is None else json.dumps(body).encode("utf-8")
+                token: Optional[str] = None, raw: Optional[bytes] = None,
+                content_type: str = "application/json", timeout: Optional[int] = None) -> Any:
+        payload = raw if raw is not None else (None if body is None else json.dumps(body).encode("utf-8"))
         request = urllib.request.Request(self.base_url + path, data=payload, method=method)
         request.add_header("Accept", "application/json")
         if payload is not None:
-            request.add_header("Content-Type", "application/json")
+            request.add_header("Content-Type", content_type)
         if token:
             # Never replayed by urllib to a redirect target.
             request.add_unredirected_header("Authorization", "Bearer " + token)
         try:
             try:
-                with self.opener(request, timeout=self.timeout) as response:
+                with self.opener(request, timeout=timeout or self.timeout) as response:
                     status, raw = response.status, read_bounded(response)
             except urllib.error.HTTPError as exc:
                 status, raw = exc.code, read_bounded(exc)
@@ -99,6 +101,18 @@ class CloudClient:
             raise CloudError(str(envelope.get("message") or "Valley request failed")[:300], status,
                              _int(envelope.get("code")))
         return envelope.get("data")
+
+    def upload_job_file(self, token: str, job_id: str, name: str, data: bytes) -> Dict[str, Any]:
+        """Uploads one file a run produced (multipart field `file`); Valley keeps
+        it privately for the job's work item and answers with its id."""
+        boundary = "timetrace-" + uuid.uuid4().hex
+        filename = "".join(ch for ch in name if ch not in '"\\\r\n') or "file"
+        head = ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n" % (boundary, filename)).encode("utf-8")
+        tail = ("\r\n--%s--\r\n" % boundary).encode("ascii")
+        return self.request("POST", "/runner/jobs/%s/files" % _segment(job_id), token=token,
+                            raw=head + data + tail, content_type="multipart/form-data; boundary=" + boundary,
+                            timeout=max(self.timeout, 120))
 
     def create_device_authorization(self, name: str, platform: str, version: str) -> Dict[str, Any]:
         return self.request("POST", "/device-authorizations", {

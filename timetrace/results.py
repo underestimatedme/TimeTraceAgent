@@ -22,7 +22,10 @@ RESULT_BYTES = 64 * 1024       # result.json itself
 CONTENT_BYTES = 64 * 1024      # one doc snapshot
 ARTIFACTS_BYTES = 64 * 1024    # the whole `artifacts` list as Valley stores it
 REF_CHARS = 512
-ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder")
+ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder", "file")
+FILE_BYTES = 20 * 1024 * 1024  # one uploaded file (Valley's limit)
+FILES_MAX = 5                  # uploaded files per run
+FILE_DROPPED_NOTE = "%d 个文件未能上传"
 INVALID_NOTE = "结构化结果无效"
 DROPPED_NOTE = "忽略 %d 项格式无效的产出物"
 DROPPED_DRAFT_NOTE = "忽略格式无效的 pipeline_draft"
@@ -198,6 +201,19 @@ def _doc_file(root: Path, ref: str) -> Optional[Path]:
     if not rel.parts or ".git" in rel.parts or not target.is_file():
         return None
     return target
+
+
+def read_file_artifact(root: str, ref: str) -> Optional[bytes]:
+    """Bytes of a declared `file` artifact: a regular, non-symlinked file inside
+    the worktree (never git metadata), at most FILE_BYTES; otherwise None."""
+    target = _doc_file(Path(root), ref)
+    if target is None:
+        return None
+    try:
+        data = _read_bounded(target, FILE_BYTES)
+    except Invalid:
+        return None
+    return data or None
 
 
 def _attach_docs(root: Path, artifacts: List[Dict[str, Any]], head: Callable[[], Optional[str]]) -> None:
