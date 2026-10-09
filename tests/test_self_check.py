@@ -217,6 +217,32 @@ class AgentL2Test(unittest.TestCase):
         agent.maintain(now=1700.0)
         self.assertEqual(self.checks, 2)
 
+    def test_zero_spend_change_refreshes_the_self_check_with_the_inventory(self):
+        # Login health and the tools' zero-spend flag come from the same
+        # verdict; when the flag changes, the pushed health must not stay
+        # up to ten minutes old (it kept Valley refusing dispatch).
+        cloud = InventoryCloud()
+        logins = ["missing"]
+        tools = [[{"id": "claude-default", "provider": "claude", "can_enforce_zero_spend": False}]]
+
+        def check():
+            self.checks += 1
+            return {"claude_login": logins[0], "workspaces": []}
+        agent = Agent(self.db, cloud, {}, self.home, lambda: "t",
+                      inventory=lambda: ([], tools[0]), report_protocol=True, health_check=check,
+                      quota_interval=300)
+        agent.report_quota_counts = lambda now: {}
+        agent.maintain(now=1000.0, force=True)
+        self.assertEqual(cloud.inventories[-1]["health"]["claude_login"], "missing")
+        logins[0] = "ok"
+        tools[0] = [{"id": "claude-default", "provider": "claude", "can_enforce_zero_spend": True}]
+        agent.maintain(now=1300.0)  # next full inventory round, health not yet due
+        self.assertEqual(self.checks, 2)
+        self.assertEqual(cloud.inventories[-1]["health"]["claude_login"], "ok")
+        # An unchanged flag keeps the ten-minute cadence.
+        agent.maintain(now=1600.0)
+        self.assertEqual(self.checks, 2)
+
     def test_local_pause_stops_claiming_but_not_upkeep(self):
         cloud = InventoryCloud([{"id": "j1", "plan_id": "p1"}])
         agent = self.agent(cloud)

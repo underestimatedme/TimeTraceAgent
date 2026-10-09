@@ -157,6 +157,15 @@ def _capability_zero_spend(adapter: Any, job: Dict[str, Any]) -> bool:
     return adapter_zero_spend_verified(adapter)
 
 
+
+def _zero_spend(inventory: Any) -> Dict[str, Any]:
+    """Each tool's zero-spend flag in an (workspaces, tools, ...) inventory."""
+    try:
+        tools = inventory[1]
+    except (IndexError, TypeError):
+        return {}
+    return {t.get("id"): t.get("can_enforce_zero_spend") for t in tools or [] if isinstance(t, dict)}
+
 class Agent:
     def __init__(self, db: Database, cloud: Any, adapters: Dict[str, Any], home: Path,
                  access_token: Callable[[], str], prepare_workspace: Callable = worktree.ensure,
@@ -326,11 +335,18 @@ class Agent:
         if self._inventory is None:
             return
         if due or self._last_inventory_base is None:
+            previous = self._last_inventory_base
             try:
                 self._last_inventory_base = self._inventory()
             except Exception as exc:
                 self.log("inventory build failed: %s" % exc.__class__.__name__)
                 return
+            # Login health is derived from the same zero-spend verdict as the
+            # tools' flag; re-check it now so both reach Valley together
+            # instead of the health snapshot lagging up to health_interval.
+            if previous is not None and _zero_spend(previous) != _zero_spend(self._last_inventory_base):
+                self._health_due = True
+                self._refresh_health(now)
         elif not self.report_protocol:
             return
         # Between full rounds only the protocol-2 extras (pause, self-check,
