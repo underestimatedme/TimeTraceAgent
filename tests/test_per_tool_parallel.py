@@ -64,7 +64,7 @@ class ConfigTest(unittest.TestCase):
         client = CloudClient("https://example.invalid")
         client.request = lambda method, path, body=None, token=None: sent.append(body) or {}
         client.update_inventory("t", [], [], 4, {"claude": 2, "codex": 2})
-        self.assertEqual(sent, [{"workspaces": [], "tools": [], "max_parallel": 4,
+        self.assertEqual(sent, [{"workspaces": [], "tools": [], "workflow_inputs_version": 1, "max_parallel": 4,
                                  "max_parallel_per_tool": {"claude": 2, "codex": 2}}])
 
 

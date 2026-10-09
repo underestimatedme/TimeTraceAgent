@@ -220,7 +220,7 @@ def ensure(repo: str, task_id: int, home: Path, base: str = "HEAD", branch: str 
             # SAFE_GIT: `worktree add` runs the repository's post-checkout hook.
             _git(*SAFE_GIT, "-C", repo, "worktree", "add", str(path), branch)
         else:
-            if base != "HEAD" and not _branch_exists(repo, base):
+            if base != "HEAD" and not _branch_exists(repo, base) and not re.fullmatch(r"[a-f0-9]{40}", base):
                 raise ValueError("registered base branch no longer exists: %s" % base)
             conflict = branch_conflict(repo, branch)
             if conflict:

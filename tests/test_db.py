@@ -7,6 +7,31 @@ from timetrace.db import Database
 from timetrace.models import PENDING, RUNNABLE, Sample
 
 
+class PlanTombstoneTest(unittest.TestCase):
+    def open(self, path):
+        db = Database(path); self.addCleanup(db.close)
+        return db
+
+    def test_reopening_releases_plans_whose_failure_was_already_delivered(self):
+        # Failures delivered by an older agent left the tombstone behind.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.sqlite"
+            db = Database(path)
+            db.mark_plan_started("failed-plan", "j1", "a1")
+            db.queue_remote_event("j1", "a1", 1, {"seq": 2, "type": "failed"})
+            db.conn.execute("UPDATE remote_outbox SET sent_at=1 WHERE job_id='j1'")
+            db.mark_plan_started("undelivered-plan", "j2", "a2")
+            db.queue_remote_event("j2", "a2", 1, {"seq": 2, "type": "failed"})
+            db.mark_plan_started("running-plan", "j3", "a3")
+            db.queue_remote_event("j3", "a3", 1, {"seq": 1, "type": "running"})
+            db.conn.execute("UPDATE remote_outbox SET sent_at=1 WHERE job_id='j3'")
+            db.close()
+            db = self.open(path)
+            self.assertFalse(db.plan_started("failed-plan"))
+            self.assertTrue(db.plan_started("undelivered-plan"))
+            self.assertTrue(db.plan_started("running-plan"))
+
+
 class DatabaseTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

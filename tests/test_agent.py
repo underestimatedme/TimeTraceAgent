@@ -136,6 +136,21 @@ class AgentOccurrenceTest(unittest.TestCase):
 
 
 class AgentTest(unittest.TestCase):
+    def test_live_codex_permission_reaches_quota_wire_without_clearing_usage(self):
+        from timetrace.adapters.codex import parse_rate_limits
+        samples = parse_rate_limits({"ordinaryUsageAllowed": True, "rateLimitsByLimitId": {
+            "codex": {"primary": {"usedPercent": 33, "windowDurationMins": 300}},
+            "base_model_inference": {"limitName": "gpt-reserve", "primary": {"usedPercent": 100, "windowDurationMins": 10080}}}})
+        with tempfile.TemporaryDirectory() as d:
+            cloud = FakeCloud()
+            agent = Agent(Database(Path(d) / "timetrace.db"), cloud, {}, Path(d), lambda: "token",
+                          pool_binding=lambda provider: ("pool", "codex-default", True))
+            self.assertEqual(agent._post_samples("codex", Adapter(), samples, now=1000), 2)
+            payloads = cloud.quota_posts[0][1]
+            self.assertEqual([p.get("codex_ordinary_usage_allowed") for p in payloads], [True, True])
+            self.assertEqual([p["used_percent"] for p in payloads], [33, 100])
+            self.assertEqual(payloads[0]["observed_at"], payloads[1]["observed_at"])
+
     def test_pool_authority_must_be_explicit_not_inferred_from_callback(self):
         for binding, expected in ((lambda provider: ("pool", "custom-profile"), False),
                                   (lambda provider: ("pool", "custom-profile", True), True)):
@@ -800,6 +815,45 @@ class RecoveryFenceTest(unittest.TestCase):
         with patch("timetrace.agent.coding_slot_lock", acquire_after_other):
             self.assertEqual(self.agent.run_once(), "job j2 → awaiting_review")
         self.assertEqual([call[0] for call in self.calls], ["start", "resume"])
+
+    def start_failing(self):
+        self.claim["job"]["plan_id"] = "plan-1"
+        self.adapter.start = lambda prompt, cwd, session_id, log_file, cancel_event=None: (
+            self.calls.append("start"), RunResult(exit_code=1, error="boom"))[1]
+
+    def retry(self):
+        # The user retries the failed step: Valley sends a new job for the same Plan.
+        self.claim = {**self.claim, "attempt_id": "a2", "job": dict(self.claim["job"], id="j2")}
+        self.adapter.start = lambda prompt, cwd, session_id, log_file, cancel_event=None: (
+            self.calls.append("start"), RunResult(exit_code=0, ok=True, session_id=session_id))[1]
+        return self.agent.run_once()
+
+    def test_retry_after_a_delivered_failure_starts_fresh(self):
+        self.start_failing()
+        self.assertEqual(self.agent.run_once(), "job j1 → failed")
+        self.assertEqual(self.retry(), "job j2 → awaiting_review")
+        self.assertEqual(self.calls, ["start", "start"])
+
+    def test_failure_unlocks_a_fresh_start_only_once_valley_has_it(self):
+        self.start_failing()
+        deliver = self.cloud.append_events
+        def offline(*args):
+            raise OSError("network down")
+        self.cloud.append_events = offline
+        try:
+            self.agent.run_once()
+        except OSError:
+            pass
+        self.assertTrue(self.db.plan_started("plan-1"))
+        self.cloud.append_events = deliver
+        self.agent.flush_outbox()
+        self.assertFalse(self.db.plan_started("plan-1"))
+
+    def test_an_undelivered_running_event_never_unlocks(self):
+        self.db.mark_plan_started("plan-1", "j1", "a1")
+        self.db.queue_remote_event("j1", "a1", 1, {"seq": 1, "type": "running"})
+        self.agent.flush_outbox()
+        self.assertTrue(self.db.plan_started("plan-1"))
 
     def test_started_history_created_before_lock_acquisition_is_reloaded(self):
         from timetrace.dispatch import coding_slot_lock

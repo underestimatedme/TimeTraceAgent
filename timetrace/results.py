@@ -22,8 +22,13 @@ RESULT_BYTES = 64 * 1024       # result.json itself
 CONTENT_BYTES = 64 * 1024      # one doc snapshot
 ARTIFACTS_BYTES = 64 * 1024    # the whole `artifacts` list as Valley stores it
 REF_CHARS = 512
-ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder")
+ARTIFACT_KINDS = ("doc", "commit", "link", "note", "folder", "file")
+FILE_BYTES = 20 * 1024 * 1024  # one uploaded file (Valley's limit)
+FILES_MAX = 5                  # uploaded files per run
+FILE_DROPPED_NOTE = "%d 个文件未能上传"
 INVALID_NOTE = "结构化结果无效"
+DROPPED_NOTE = "忽略 %d 项格式无效的产出物"
+DROPPED_DRAFT_NOTE = "忽略格式无效的 pipeline_draft"
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SUBTASKS_MAX = 30
 # Keys end up in branch names (`timetrace/<stage>/<key>`), which are lowercase:
@@ -118,6 +123,9 @@ def redact_all(value: Any) -> Any:
 
 
 def _artifact(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, str):
+        # A bare path is how models most often name a file they wrote.
+        raw = {"kind": "doc", "ref": raw}
     if not isinstance(raw, dict):
         raise Invalid("artifact is not an object")
     kind, ref = raw.get("kind"), raw.get("ref")
@@ -195,6 +203,19 @@ def _doc_file(root: Path, ref: str) -> Optional[Path]:
     return target
 
 
+def read_file_artifact(root: str, ref: str) -> Optional[bytes]:
+    """Bytes of a declared `file` artifact: a regular, non-symlinked file inside
+    the worktree (never git metadata), at most FILE_BYTES; otherwise None."""
+    target = _doc_file(Path(root), ref)
+    if target is None:
+        return None
+    try:
+        data = _read_bounded(target, FILE_BYTES)
+    except Invalid:
+        return None
+    return data or None
+
+
 def _attach_docs(root: Path, artifacts: List[Dict[str, Any]], head: Callable[[], Optional[str]]) -> None:
     sha = None
     for art in artifacts:
@@ -266,10 +287,28 @@ def with_folder(folder_artifact: Dict[str, Any], artifacts: List[Dict[str, Any]]
     return merged
 
 
+def _artifacts(raw: Any):
+    """Declared artifacts are side information: each unusable entry (or a
+    non-list) is dropped on its own and counted, never voiding the result."""
+    if raw is None:
+        return [], 0
+    if not isinstance(raw, list):
+        return [], 1
+    kept = []
+    for item in raw:
+        try:
+            kept.append(_artifact(item))
+        except Invalid:
+            pass
+    return kept, len(raw) - len(kept)
+
+
 def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Optional[Dict[str, Any]]:
     """None when the run wrote no result.json; otherwise
-    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None}.
-    An invalid file yields valid=False with no artifacts and no result."""
+    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None,
+     "dropped_artifacts": int, "dropped_draft": bool (valid only)}.
+    An invalid file yields valid=False with no artifacts and no result; bad
+    artifact entries alone only raise dropped_artifacts."""
     base = Path(root)
     try:
         for i in range(1, len(OUT_DIR) + 1):
@@ -287,15 +326,13 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
             raise Invalid("not JSON")
         if not isinstance(parsed, dict):
             raise Invalid("not an object")
-        raw_artifacts = parsed.get("artifacts", [])
-        if raw_artifacts is None:
-            raw_artifacts = []
-        if not isinstance(raw_artifacts, list):
-            raise Invalid("artifacts is not a list")
-        artifacts = [_artifact(a) for a in raw_artifacts]
+        artifacts, dropped = _artifacts(parsed.get("artifacts"))
         draft = parsed.get("pipeline_draft")
-        if draft is not None and not isinstance(draft, dict):
-            raise Invalid("pipeline_draft is not an object")
+        dropped_draft = draft is not None and not isinstance(draft, dict)
+        if dropped_draft:
+            # Only a generate step needs a draft, and Valley asks for a retry
+            # when it is missing; a stray non-object never voids sub-tasks.
+            draft = None
         subtasks = _subtasks(parsed["subtasks"]) if parsed.get("subtasks") is not None else None
         _attach_docs(base, artifacts, head)
         artifacts = redact_all(artifacts)
@@ -306,7 +343,8 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
         if subtasks is not None:
             result["subtasks"] = redact_all(subtasks)
         result = result or None
-        return {"valid": True, "artifacts": artifacts, "result": result}
+        return {"valid": True, "artifacts": artifacts, "result": result, "dropped_artifacts": dropped,
+                "dropped_draft": dropped_draft}
     except (Invalid, RecursionError):
         return {"valid": False, "artifacts": [], "result": None}
 

@@ -82,12 +82,6 @@ class CollectTest(unittest.TestCase):
             "not json": "{broken",
             "not utf-8": b"\xff\xfe{}",
             "top-level list": json.dumps([{"kind": "doc", "ref": "a"}]),
-            "artifacts not a list": json.dumps({"artifacts": {"kind": "doc"}}),
-            "unknown kind": json.dumps({"artifacts": [{"kind": "exe", "ref": "a"}]}),
-            "missing ref": json.dumps({"artifacts": [{"kind": "doc"}]}),
-            "ref too long": json.dumps({"artifacts": [{"kind": "link", "ref": "r" * 513}]}),
-            "content not text": json.dumps({"artifacts": [{"kind": "note", "ref": "n", "content": 5}]}),
-            "draft not object": json.dumps({"pipeline_draft": ["a"]}),
         }
         for name, data in cases.items():
             with self.subTest(name=name):
@@ -96,6 +90,44 @@ class CollectTest(unittest.TestCase):
                 self.assertFalse(got["valid"])
                 self.assertEqual(got["artifacts"], [])
                 self.assertIsNone(got["result"])
+
+    def test_each_bad_artifact_is_dropped_alone(self):
+        cases = {
+            "artifacts not a list": {"kind": "doc"},
+            "unknown kind": [{"kind": "exe", "ref": "a"}],
+            "missing ref": [{"kind": "doc"}],
+            "ref too long": [{"kind": "link", "ref": "r" * 513}],
+            "content not text": [{"kind": "note", "ref": "n", "content": 5}],
+            "bad commit sha": [{"kind": "commit", "ref": "c", "commit_sha": "zz"}],
+            "empty string": [" "],
+        }
+        for name, bad in cases.items():
+            with self.subTest(name=name):
+                self.write({"artifacts": bad, "pipeline_draft": {"title": "t"}})
+                got = self.collect()
+                self.assertTrue(got["valid"])
+                self.assertEqual(got["artifacts"], [])
+                self.assertEqual(got["dropped_artifacts"], 1)
+                self.assertEqual(got["result"], {"pipeline_draft": {"title": "t"}})
+
+    def test_a_draft_that_is_not_an_object_is_dropped_not_fatal(self):
+        # Real breakdown output: a one-line "draft" string next to valid sub-tasks.
+        self.write({"pipeline_draft": "a ∥ b → c", "subtasks": [{"key": "a", "title": "A"}]})
+        got = self.collect()
+        self.assertTrue(got["valid"])
+        self.assertEqual(set(got["result"]), {"subtasks"})
+        self.assertEqual(got["dropped_artifacts"], 0)
+        self.assertEqual(got["dropped_draft"], True)
+
+    def test_a_path_string_is_read_as_a_doc_artifact(self):
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "req.md").write_text("# req\n")
+        self.write({"artifacts": ["docs/req.md", {"kind": "link", "ref": "https://example.com"}]})
+        got = self.collect()
+        self.assertTrue(got["valid"])
+        self.assertEqual(got["artifacts"], [{"kind": "doc", "ref": "docs/req.md", "content": "# req\n", "commit_sha": "abc1234"},
+                                            {"kind": "link", "ref": "https://example.com"}])
+        self.assertEqual(got["dropped_artifacts"], 0)
 
     def test_ref_at_the_limit_is_valid(self):
         self.write({"artifacts": [{"kind": "link", "ref": "r" * 512}]})
@@ -288,6 +320,20 @@ class AgentResultTest(unittest.TestCase):
         self.assertIs(event["result_invalid"], True)
         self.assertIn("结构化结果无效", event["message"])
 
+    def test_dropped_artifacts_are_noted_without_invalidating(self):
+        event, _ = self.run_job(json.dumps({"artifacts": ["docs/req.md", {"kind": "exe", "ref": "a"}],
+                                            "pipeline_draft": {"title": "p"}}))
+        self.assertNotIn("result_invalid", event)
+        self.assertNotIn("结构化结果无效", event["message"])
+        self.assertIn("忽略 1 项格式无效的产出物", event["message"])
+        self.assertEqual([a["ref"] for a in event["artifacts"]], ["docs/req.md"])
+        self.assertEqual(event["result"], {"pipeline_draft": {"title": "p"}})
+
+    def test_dropped_draft_is_noted_without_invalidating(self):
+        event, _ = self.run_job(json.dumps({"pipeline_draft": "a → b"}))
+        self.assertNotIn("result_invalid", event)
+        self.assertIn("忽略格式无效的 pipeline_draft", event["message"])
+
     def test_valid_result_is_not_flagged(self):
         event, _ = self.run_job(json.dumps({"artifacts": []}))
         self.assertNotIn("result_invalid", event)
@@ -315,3 +361,77 @@ class AgentResultTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "wt"
+        (self.root / "dist").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_only_a_bounded_regular_file_inside_the_worktree_is_read(self):
+        (self.root / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04data")
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/pkg.zip"), b"PK\x03\x04data")
+        outside = Path(self.tmp.name) / "secret.txt"
+        outside.write_text("secret")
+        os.symlink(outside, self.root / "dist" / "link.zip")
+        self.assertIsNone(results.read_file_artifact(str(self.root), "dist/link.zip"))
+        self.assertIsNone(results.read_file_artifact(str(self.root), "../secret.txt"))
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("x")
+        self.assertIsNone(results.read_file_artifact(str(self.root), ".git/config"))
+        self.assertIsNone(results.read_file_artifact(str(self.root), "dist/missing.zip"))
+        from unittest import mock
+        with mock.patch.object(results, "FILE_BYTES", 4):
+            self.assertIsNone(results.read_file_artifact(str(self.root), "dist/pkg.zip"))
+
+
+class UploadCloud(TaskCloud):
+    def __init__(self, fail=False):
+        super().__init__()
+        self.uploads, self.fail = [], fail
+
+    def upload_job_file(self, token, job_id, name, data):
+        if self.fail:
+            raise RuntimeError("offline")
+        self.uploads.append((token, job_id, name, data))
+        return {"id": "file%d" % len(self.uploads)}
+
+
+class FileWritingAdapter(WritingAdapter):
+    def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+        (Path(cwd) / "dist").mkdir(exist_ok=True)
+        (Path(cwd) / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04zip")
+        return super().start(prompt, cwd, session_id, log_file, cancel_event)
+
+
+class AgentFileUploadTest(unittest.TestCase):
+    def run_job(self, cloud, payload):
+        with tempfile.TemporaryDirectory() as d:
+            db = Database(Path(d) / "timetrace.db")
+            repo = Path(d) / "repo"; init_repo(repo)
+            db.upsert_workspace("ws1", "repo", str(repo.resolve()), "main")
+            agent = Agent(db, cloud, {"codex": FileWritingAdapter(payload)}, Path(d), lambda: "token")
+            agent.run_once()
+            return cloud.events[-1]
+
+    def test_a_declared_file_is_uploaded_and_sent_by_its_id(self):
+        cloud = UploadCloud()
+        event = self.run_job(cloud, json.dumps({"artifacts": [
+            {"kind": "file", "ref": "dist/pkg.zip", "content": "四个文件"},
+            {"kind": "file", "ref": "dist/missing.zip"},
+            {"kind": "doc", "ref": "docs/req.md"}]}))
+        self.assertEqual(cloud.uploads, [("token", "j1", "pkg.zip", b"PK\x03\x04zip")])
+        self.assertEqual(event["artifacts"][0], {"kind": "file", "ref": "file1", "content": "四个文件"})
+        self.assertEqual([a["kind"] for a in event["artifacts"]], ["file", "doc"])
+        self.assertIn("1 个文件未能上传", event["message"])
+
+    def test_an_upload_failure_drops_the_file_but_keeps_the_completion(self):
+        event = self.run_job(UploadCloud(fail=True), json.dumps({"artifacts": [
+            {"kind": "file", "ref": "dist/pkg.zip"}]}))
+        self.assertEqual(event["type"], "completed")
+        self.assertEqual(event["artifacts"], [])
+        self.assertIn("1 个文件未能上传", event["message"])

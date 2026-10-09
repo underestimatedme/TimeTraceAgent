@@ -223,6 +223,21 @@ class QrEncodeTest(unittest.TestCase):
         self.assertTrue(all(len(line) == 25 for line in bordered))
         self.assertEqual(bordered[0], "█" * 25)
 
+    def test_dark_rendering_is_the_inverse_and_the_default_quiet_zone_is_four(self):
+        m = [[True, False], [False, True], [True, True]]
+        # dark modules drawn; the padding row below an odd height stays light
+        self.assertEqual(qr.render_half_blocks(m, border=0, dark=True), ["▀▄", "▀▀"])
+        lines = qr.render_half_blocks(qr.encode("timetrace"), dark=True)
+        self.assertEqual(len(lines), (21 + 8 + 1) // 2)
+        self.assertTrue(all(len(line) == 29 for line in lines))
+        self.assertEqual(lines[:2], [" " * 29] * 2)
+        self.assertEqual(lines[-1], " " * 29)
+
+    def test_levels_can_be_restricted_to_m(self):
+        with self.assertRaises(ValueError):
+            qr.encode("a" * 120, levels=("M",))
+        self.assertEqual(decode(qr.encode("a" * 106, levels=("M",)))[1:], (6, "M"))
+
 
 if __name__ == "__main__":
     unittest.main()

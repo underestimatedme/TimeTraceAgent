@@ -11,12 +11,15 @@ Facts this relies on (verified 2026-09-02 on Codex CLI 0.151.0):
 - `codex exec resume <thread_id> --json <prompt>` continues a thread.
 """
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import os
 import subprocess
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
+from timetrace import __version__
 from timetrace.adapters.base import CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
 from timetrace.models import CODEX, RunResult, Sample
@@ -34,6 +37,9 @@ def parse_rate_limits(response: Dict[str, Any], tool: str = CODEX) -> List[Sampl
         single = response.get("rateLimits") or {}
         by_id = {single.get("limitId") or "codex": single}
     samples: List[Sample] = []
+    permission = response.get("ordinaryUsageAllowed")
+    if type(permission) is not bool or tool != CODEX:
+        permission = None
     for limit_id, snap in by_id.items():
         if not isinstance(snap, dict):
             continue
@@ -47,13 +53,29 @@ def parse_rate_limits(response: Dict[str, Any], tool: str = CODEX) -> List[Sampl
                 window_mins=_int_or_none(w.get("windowDurationMins")),
                 is_representative=(limit_id == "codex" and win_name == "primary"),
                 source="live",
+                codex_ordinary_usage_allowed=permission if (limit_id == "codex" or
+                    (limit_id == "base_model_inference" and snap.get("limitName") == "gpt-reserve")) else None,
             ))
     return samples
+
+
+# Methods timetrace never sends. Using a reset credit is the user's own
+# decision in the official client (spec §10b); the runner only reads them.
+FORBIDDEN_METHODS = ("account/rateLimitResetCredit/consume",)
+RESET_CREDITS_TIMEOUT = 20.0
+RESET_CREDIT_STATUSES = ("available", "redeeming", "redeemed", "unknown")
+MAX_RESET_CREDITS = 50
+
+
+def _forbidden(method: str) -> bool:
+    return method in FORBIDDEN_METHODS or method.startswith("account/rateLimitResetCredit/")
 
 
 def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
                        timeout: float = 15.0) -> Dict[str, Any]:
     """Minimal JSON-RPC client: initialize, initialized, one request, then kill."""
+    if _forbidden(method):
+        raise ValueError("timetrace never calls %s" % method)
     env = sanitized_env(CODEX, os.environ)
     env.pop("RUST_LOG", None)
     proc = subprocess.Popen(
@@ -80,7 +102,7 @@ def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
     try:
         for m in (
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"clientInfo": {"name": "timetrace", "title": "timetrace", "version": "0.3.0"}}},
+             "params": {"clientInfo": {"name": "timetrace", "title": "timetrace", "version": __version__}}},
             {"jsonrpc": "2.0", "method": "initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": method, "params": params or {}},
         ):
@@ -91,9 +113,56 @@ def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
     finally:
         proc.kill()
         proc.wait()
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
     if "error" in answer:
         raise RuntimeError("app-server error: %s" % json.dumps(answer["error"]))
     return answer.get("result") or {}
+
+
+def _iso(epoch: Any) -> Optional[str]:
+    try:
+        value = int(epoch)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_reset_credits(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """`rateLimitResetCredits` of an account/rateLimits/read response as
+    {available_count, credits[]}; None when absent or malformed."""
+    summary = response.get("rateLimitResetCredits") if isinstance(response, dict) else None
+    if not isinstance(summary, dict):
+        return None
+    count = summary.get("availableCount")
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 1000:
+        return None
+    credits = []
+    for raw in summary.get("credits") or []:
+        if not isinstance(raw, dict):
+            continue
+        credit_id = str(raw.get("id") or "").strip()
+        if not credit_id or len(credit_id) > 128:
+            continue
+        status = raw.get("status") if raw.get("status") in RESET_CREDIT_STATUSES else "unknown"
+        credit = {"id": credit_id, "reset_type": str(raw.get("resetType") or "unknown")[:64], "status": status}
+        granted, expires = _iso(raw.get("grantedAt")), _iso(raw.get("expiresAt"))
+        if granted:
+            credit["granted_at"] = granted
+        if expires:
+            credit["expires_at"] = expires
+        description = raw.get("description") or raw.get("title")
+        if isinstance(description, str) and description.strip():
+            credit["description"] = description.strip()[:200]
+        credits.append(credit)
+        if len(credits) >= MAX_RESET_CREDITS:
+            break
+    return {"available_count": count, "credits": credits}
 
 
 # ---- exec -----------------------------------------------------------------------
@@ -238,6 +307,25 @@ class CodexAdapter(ToolAdapter):
     def read_limits(self) -> Optional[List[Sample]]:
         resp = app_server_request(self.cfg.get("bin", "codex"), "account/rateLimits/read")
         return parse_rate_limits(resp)
+
+    def reset_credits_entry(self, timeout: float = RESET_CREDITS_TIMEOUT) -> Optional[Dict[str, Any]]:
+        """This login's reset credits for inventory `reset_credits` (read
+        only, a short-lived app-server). Any failure is status "unknown",
+        never a count of 0. None when there is no Codex login to name."""
+        key = self.account_key()
+        if not key:
+            return None
+        entry = {"pool_id": "pool-codex-" + key, "tool_profile_id": "codex-default"}
+        try:
+            parsed = parse_reset_credits(app_server_request(self.cfg.get("bin", "codex"), "account/rateLimits/read",
+                                                            timeout=timeout))
+        except Exception:
+            parsed = None
+        if parsed is None:
+            entry["status"] = "unknown"
+            return entry
+        entry.update({"status": "ok", "read_at": _iso(time.time())}, **parsed)
+        return entry
 
     def _auth_path(self) -> Path:
         return Path(self.cfg.get("auth_path") or Path.home() / ".codex" / "auth.json")

@@ -94,7 +94,10 @@ class ConfigCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         for key in ("upload_output_tail", "cloud_base_url", "interval_sec"):
             self.assertIn(key, out)
-        self.assertNotIn("claude", out.split())
+        # the nested tool sections are not scalar keys; only their .bin is settable
+        self.assertFalse(any(line.startswith("claude =") for line in out.splitlines()))
+        self.assertIn("claude.bin = claude", out)
+        self.assertIn("codex.bin = codex", out)
 
     def test_bad_key_exits_nonzero_with_a_message(self):
         code, _, err = self.run_cli("config", "set", "claude", "x")

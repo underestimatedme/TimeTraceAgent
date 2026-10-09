@@ -6,6 +6,7 @@ servers), certificate verification by the default SSL context, no redirects
 timeout on every call and a bounded response size."""
 import ipaddress
 import json
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -68,18 +69,19 @@ class CloudClient:
         self.timeout = timeout
 
     def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
-                token: Optional[str] = None) -> Any:
-        payload = None if body is None else json.dumps(body).encode("utf-8")
+                token: Optional[str] = None, raw: Optional[bytes] = None,
+                content_type: str = "application/json", timeout: Optional[int] = None) -> Any:
+        payload = raw if raw is not None else (None if body is None else json.dumps(body).encode("utf-8"))
         request = urllib.request.Request(self.base_url + path, data=payload, method=method)
         request.add_header("Accept", "application/json")
         if payload is not None:
-            request.add_header("Content-Type", "application/json")
+            request.add_header("Content-Type", content_type)
         if token:
             # Never replayed by urllib to a redirect target.
             request.add_unredirected_header("Authorization", "Bearer " + token)
         try:
             try:
-                with self.opener(request, timeout=self.timeout) as response:
+                with self.opener(request, timeout=timeout or self.timeout) as response:
                     status, raw = response.status, read_bounded(response)
             except urllib.error.HTTPError as exc:
                 status, raw = exc.code, read_bounded(exc)
@@ -100,6 +102,18 @@ class CloudClient:
                              _int(envelope.get("code")))
         return envelope.get("data")
 
+    def upload_job_file(self, token: str, job_id: str, name: str, data: bytes) -> Dict[str, Any]:
+        """Uploads one file a run produced (multipart field `file`); Valley keeps
+        it privately for the job's work item and answers with its id."""
+        boundary = "timetrace-" + uuid.uuid4().hex
+        filename = "".join(ch for ch in name if ch not in '"\\\r\n') or "file"
+        head = ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n" % (boundary, filename)).encode("utf-8")
+        tail = ("\r\n--%s--\r\n" % boundary).encode("ascii")
+        return self.request("POST", "/runner/jobs/%s/files" % _segment(job_id), token=token,
+                            raw=head + data + tail, content_type="multipart/form-data; boundary=" + boundary,
+                            timeout=max(self.timeout, 120))
+
     def create_device_authorization(self, name: str, platform: str, version: str) -> Dict[str, Any]:
         return self.request("POST", "/device-authorizations", {
             "device_name": name, "platform": platform, "client_version": version,
@@ -113,6 +127,23 @@ class CloudClient:
             "device_code": device_code, "activation_code": activation_code,
         })
 
+    def create_phone_authorization(self, name: str, platform: str, version: str,
+                                   previous_device_code: str = "") -> Dict[str, Any]:
+        value = self.request("POST", "/iphone/device-authorizations", {
+            "device_name": name, "platform": platform, "client_version": version,
+            "previous_device_code": previous_device_code,
+        })
+        value["pairing_version"] = 2
+        return value
+
+    def activate_phone(self, device_code: str, phone_code: str) -> Dict[str, Any]:
+        return self.request("POST", "/iphone/device-authorizations/activate", {
+            "device_code": device_code, "phone_code": phone_code,
+        })
+
+    def revoke_phone(self, refresh_token: str) -> Dict[str, Any]:
+        return self.request("POST", "/iphone/runner/revoke", {"refresh_token": refresh_token})
+
     def refresh(self, refresh_token: str, idempotency_key: str) -> Dict[str, Any]:
         return self.request("POST", "/runner-auth/refresh", {
             "refresh_token": refresh_token, "idempotency_key": idempotency_key,
@@ -120,8 +151,14 @@ class CloudClient:
 
     def update_inventory(self, token: str, workspaces: list, tools: list,
                          max_parallel: Optional[int] = None,
-                         max_parallel_per_tool: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
-        body = {"workspaces": workspaces, "tools": tools}
+                         max_parallel_per_tool: Optional[Dict[str, int]] = None,
+                         extras: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """`extras`: the protocol-2 fields (protocol_version, agent_version,
+        accepting_local, health, reset_credits)."""
+        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1}
+        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits"):
+            if extras and key in extras:
+                body[key] = extras[key]
         if max_parallel is not None:
             body["max_parallel"] = int(max_parallel)
         if max_parallel_per_tool is not None:

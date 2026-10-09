@@ -14,6 +14,23 @@ def load_lines(name):
 
 
 class ParseRateLimitsTest(unittest.TestCase):
+    def test_ordinary_permission_preserved_only_for_known_reserve_and_codex(self):
+        for permission in (True, False, None, "true"):
+            resp = {"ordinaryUsageAllowed": permission, "rateLimitsByLimitId": {
+                "codex": {"primary": {"usedPercent": 33, "windowDurationMins": 300}},
+                "base_model_inference": {"limitName": "gpt-reserve", "primary": {"usedPercent": 100, "windowDurationMins": 10080}},
+                "other": {"primary": {"usedPercent": 100, "windowDurationMins": 300}}}}
+            samples = codex.parse_rate_limits(resp)
+            values = {s.bucket_key: getattr(s, "codex_ordinary_usage_allowed", None) for s in samples}
+            expected = permission if type(permission) is bool else None
+            self.assertEqual(values["codex:codex:primary"], expected)
+            self.assertEqual(values["codex:base_model_inference:primary"], expected)
+            self.assertIsNone(values["codex:other:primary"])
+            self.assertEqual(samples[1].used_pct, 100)
+        resp["rateLimitsByLimitId"]["base_model_inference"]["limitName"] = "unknown"
+        resp["ordinaryUsageAllowed"] = True
+        self.assertIsNone(getattr(codex.parse_rate_limits(resp)[1], "codex_ordinary_usage_allowed", None))
+
     def test_multi_bucket_response(self):
         resp = json.loads((FIXTURES / "codex_ratelimits.json").read_text())
         samples = codex.parse_rate_limits(resp)

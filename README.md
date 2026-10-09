@@ -4,6 +4,17 @@
 
 命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+
+## 0.5.0 起：手机数字确认绑定
+
+配合刻迹 iPhone 新版（0.3.0 起）。绑定分三步：电脑展示二维码或 8 位码 → 手机核对这台电脑并显示 4 位随机数字 → 在电脑终端输入这组数字，服务端确认后才绑定。数字保留前导零，5 分钟内有效，最多错 3 次；取消或重新取码会让旧数字失效，第三次输错后锁定，需要重新开始。`setup --yes` 只省略安装选择，绑定时仍要输入手机数字。
+
+新版刻迹 App 只接受这种绑定；旧版（0.2.x）App 绑定新电脑需要 0.4.0 及更早版本的电脑端。已经绑定的电脑升级后保持绑定。
+
+AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里声明 `{"kind": "file", "ref": "dist/xxx.zip"}`，电脑端只读取工作区内的普通文件（不跟随符号链接、不读 `.git`），单个不超过 20MB、每次最多 5 个，上传后手机上可以下载核对；读不到或上传失败的文件会被跳过并在完成说明里注明。
+
+`cloud logout` 用 Keychain 里的 refresh 凭据在服务端撤销，可以重复执行或在丢回执后重试；没确认成功时返回失败并保留凭据，收到明确的撤销回执才删本机 Keychain。手机端解绑会让这台电脑的凭据随之失效。
+
 ## 快速开始
 
 ```sh
@@ -16,16 +27,30 @@ tta setup                          # 检查工具 → 登记仓库 → 扫码绑
 Claude/Codex 的登录凭据不会上传：iPhone 只把任务发给 Valley，本机 `timetrace agent` 通过出站 HTTPS 领取任务，再调用当前 macOS 用户已经登录的 CLI。
 
 ```sh
-timetrace cloud login                    # 终端显示二维码，用 iPhone「你的 AI → 扫码绑定」扫描后确认
+timetrace cloud login                    # 终端显示二维码，在刻迹「我的电脑 → 绑定新电脑」扫描后确认
 timetrace workspace add ~/code/TimeTrace # 只显式开放这个仓库
 timetrace agent doctor                   # 检查配对、CLI 和工作区
 timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
 
-`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，二维码下方的 8 位码照旧可以在「你的 AI → 绑定新电脑」里手动输入。二维码按白底黑码输出，终端窗口太窄时把窗口拉宽一些再扫。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
+`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
+
+二维码用半块字符绘制（两行模块占一行文字，约 49×25 字符，80 列终端放得下），四周留 4 个模块的静区。彩色终端里强制白底黑码，与终端主题无关；设置了 `NO_COLOR`、`TERM=dumb` 或输出不是终端时改为不带颜色的反相字符（适合深色背景的终端）。上方框内的「2 分钟内有效（剩余 1:45）」每秒原地刷新，不会重印二维码；过期后自动换新码，最多 5 轮。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
 
 Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.timetrace.runner`）；access token 15 分钟轮换。每个远程任务仍进入独立 worktree，且 push 被禁用。电脑关机、休眠或未登录时，Valley 只保留排队任务，不会在云端接管本地代码或账号。
+
+## 远程控制、审批与电脑状态（协议 2，0.4.0 起）
+
+- **中断**：手机上点「中断」后，电脑结束该任务的进程组，保留 worktree 和分支并写 checkpoint；手机点「继续」（可带补充指令）时在同一会话里接着做。
+- **追加指令**：Claude 任务运行中直接写入会话（stream-json 输入）；Codex 在本轮结束后以 `codex exec resume` 在同一个作业里执行，沙箱参数不变，零付费核验照常。
+- **审批**：Claude 需要权限时先按本机规则判断——工作副本内的读写和只读命令（`git status/diff/log`、`ls`、`cat` 等）自动允许；`git push`、改远端或其他分支、写工作副本以外、读凭据目录一律拒绝（手机批准也不能放行）；其余推到手机，10 分钟没人处理即拒绝。「本任务内同类都允许」只在本作业有效。等待审批不计入任务超时，租约照常续期。
+- **暂停接活**：`timetrace agent pause` / `timetrace agent resume`。本机暂停优先，手机无法解除；正在运行的任务不受影响。
+- **防休眠**：有任务运行时启动 `caffeinate -i -w <pid>`（只阻止空闲睡眠，合盖仍会睡），没有任务时结束；配置 `prevent_sleep: false` 关闭。
+- **自检**：启动时、每 10 分钟、任务失败后检查 Claude / Codex 登录、工作区所在磁盘剩余空间（不足 1 GB 时不接新任务）、各工作区状态，随工具清单上报，手机据此显示「为什么不接活」。
+- **Codex 重置机会**：每 10 分钟短时启动 `codex app-server` 读取 `account/rateLimits/read` 里的 `rateLimitResetCredits`（只读，读不到时上报「未知」而不是 0 次）。刻迹从不使用重置（不调用 `account/rateLimitResetCredit/consume`），请在官方客户端里自己操作。
+- **审计日志**：`~/.timetrace/audit.log`（权限 0600，只追加的 JSON 行）记录暂停 / 恢复 / 中断 / 追加 / 审批决定 / 版本拒绝。
+- `timetrace agent doctor` 显示电脑端版本与协议版本、暂停状态、自检结果和 Codex 重置机会。
 
 ## 远程任务的产出在哪里
 
@@ -65,7 +90,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.3.0"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.0"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
@@ -86,13 +111,13 @@ tta --version
 1. 检查 `claude` / `codex` 是否安装、是否通过零付费核验（同 `timetrace agent doctor`）；
 2. 登记允许远程任务使用的 Git 仓库（同 `timetrace workspace add`，可登记多个，回车结束）；
 3. 与手机绑定：终端显示二维码，用 App「你的 AI → 扫码绑定」扫描（同 `timetrace cloud login`）；
-4. 安装并启动后台 Runner LaunchAgent（同 `timetrace agent install`）。
+4. 安装并启动后台 Runner LaunchAgent（同 `timetrace agent install`），找到 `claude` 时再问一次是否安装 Claude Code 状态栏钩子（默认是）。
 
 脚本化安装可以用参数代替提问：
 
 ```sh
 timetrace setup --repo ~/code/TimeTrace --yes            # 登记仓库、绑定、安装 LaunchAgent，全部取默认
-timetrace setup --repo ~/code/a --repo ~/code/b --no-pair --no-agent --yes
+timetrace setup --repo ~/code/a --repo ~/code/b --no-pair --no-agent --no-statusline --yes
 ```
 
 已绑定的电脑不会被 `--yes` 重新绑定；输入结束（EOF）视为跳过。
@@ -141,6 +166,39 @@ launchctl kickstart -k gui/$(id -u)/com.atlaspaces.timetrace.agent   # 改配置
 
 `launchd/com.atlaspaces.timetrace.agent.plist` 是同样内容的模板，手工安装时把 `__TIMETRACE_BIN__`、`__HOME__` 换成实际路径。
 
+## 故障排查
+
+### 手机上看不到 claude / codex（「工具未检测到」）
+
+launchd 启动 Runner 时不读你的 shell 配置，PATH 是固定的。通过 npm/nvm、Volta、bun、pnpm、mise、asdf 安装的
+`claude` / `codex`（以及它们依赖的 `node`）在终端里能用，后台 Runner 却找不到。
+
+`timetrace setup`、`timetrace agent install` 和 `timetrace agent doctor` 会自动处理：
+
+1. 用登录 shell 查找（`$SHELL -lic 'command -v claude'`，8 秒超时），找不到再扫描常见位置：
+   `~/.local/bin`、`~/.claude/local`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.volta/bin`、`~/.bun/bin`、
+   `~/.npm-global/bin`、`$(npm config get prefix)/bin`、`~/Library/pnpm`、`~/.local/share/pnpm`、
+   `~/.local/share/mise/installs/*/*/bin`（含 `latest`）、`~/.local/share/mise/shims`、`~/.asdf/installs/*/*/bin`、
+   `~/.asdf/shims`、`~/.nvm/versions/node/*/bin`（新版本优先）、`/Applications/Codex.app/Contents/{Resources,MacOS}`；
+2. 找到的绝对路径记为 `claude.bin` / `codex.bin`（标记为自动发现，之后会随 node 升级重新解析；你用
+   `timetrace config set` 显式设置的值永远不会被覆盖）；
+3. `agent install` 生成的 LaunchAgent PATH 在原有缺省目录之外，加入每个工具所在目录，以及 `node` 所在目录
+   （npm 装的 CLI 是 `#!/usr/bin/env node` 脚本，node 也必须在 PATH 上；优先用和工具装在一起的那个 node）。
+
+`timetrace agent doctor` 对每个工具分别列出：终端（登录 shell）里找到的路径、后台 Runner（LaunchAgent 的 PATH）
+能否找到、版本、零付费核验结论和原因；两者不一致时给出修复命令。它还会显示 LaunchAgent 是否已安装/正在运行，
+以及 Runner 上次上报工具清单和额度的时间。仍然找不到时：
+
+```sh
+timetrace config set claude.bin /path/to/claude
+timetrace agent install
+```
+
+### 工作区为 0
+
+没有登记仓库时手机无法派发远程任务（`timetrace workspace add <path>` 登记），但工具清单和额度照常上报，
+手机上仍能看到这台电脑的工具和剩余额度。
+
 ## 配置 `~/.timetrace/config.json`（都是可选项，下面是缺省值）
 
 ```json
@@ -158,6 +216,7 @@ launchctl kickstart -k gui/$(id -u)/com.atlaspaces.timetrace.agent   # 改配置
   "max_parallel": 0,
   "check_env_drop": [],
   "check_env_keep": [],
+  "prevent_sleep": true,
   "claude": {"bin": "claude", "permission_mode": "acceptEdits",
              "allowed_tools": ["Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)",
                                "Bash(git diff:*)", "Bash(git log:*)"],
@@ -176,7 +235,8 @@ timetrace config set upload_output_tail false       # 布尔：true/false、on/o
 timetrace config set interval_sec 60
 ```
 
-嵌套项（`claude`、`codex`）和列表（`allowed_repos`）请直接编辑 `config.json`。改完后重启 Runner 才会生效。
+工具路径也可以用命令设置：`timetrace config set claude.bin /path/to/claude`（`codex.bin` 同理），之后运行 `timetrace agent install`。
+其余嵌套项（`claude`、`codex` 的其他字段）和列表（`allowed_repos`）请直接编辑 `config.json`。改完后重启 Runner 才会生效。
 
 | 项 | 缺省 | 说明 |
 | --- | --- | --- |
@@ -211,7 +271,7 @@ timetrace cloud login     # 重新绑定到新的服务端
 - 每个任务在独立的 git worktree（`~/.timetrace/worktrees/<id>`，分支 `timetrace/<id>`）里运行，从不碰主工作区。
 - worktree 内所有远端的 pushurl 被改成 `no_push://blocked`，`git push` 立即失败；Claude 另加 `--disallowedTools "Bash(git push*)"`，Codex 沙箱内无网络；两个工具的提示词都写明禁止 push、禁止改远端分支和 CI 配置（提示词只是提醒，真正的约束是权限模式和沙箱）。
 - Runner 在 worktree 里执行自己的 git 命令之前，会核对 `.git` 指针、`commondir` 和 `config.worktree` 仍是它创建时的样子，被改动就停下等人处理；这些 git 调用还会关闭 fsmonitor、hooks 和外部 diff。
-- 手机发来的提示词始终作为位置参数传给 Claude（以 `-` 开头也不会被当成选项）；Claude 只加载用户级设置，不加载 worktree 里的 `.claude/settings.json`。
+- 远程任务的提示词和追加指令通过 stream-json 标准输入交给 Claude，不进入命令行参数；本机任务和只读对话仍作为位置参数传入（以 `-` 开头也不会被当成选项）。Claude 的权限请求先过本机规则，被规则拒绝的操作手机也无法批准；Claude 只加载用户级设置，不加载 worktree 里的 `.claude/settings.json`。
 - 启动工具进程时，名字里含 TOKEN / SECRET / PASSWORD / API_KEY / ACCESS_KEY / CREDENTIAL 的环境变量一律剔除。
 - 熔断：默认 5 小时内 3 次失败就停止派工，直到窗口过去或你 `timetrace retry`。
 - v0.3 的 on_success 钩子只产出一份声明式 JSON 到 `~/.timetrace/inbox/`，由守护进程下一轮校验后入库；钩子生成的任务不能再生成任务。
@@ -245,11 +305,19 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | 终端（timetrace 无头运行） | `codex exec` 结束后立刻 `account/rateLimits/read` | 每次 `claude -p` 的 `rate_limit_event` |
 | 软件（你自己在 Codex 应用 / Claude Code 里用） | 同一接口，服务端真值，天然包含应用内消耗 | **`timetrace statusline`**：挂进 Claude Code 状态栏，每次刷新把 `rate_limits` 写进库 |
 
-装 Claude Code 状态栏钩子（会往 `~/.claude/settings.json` 写 `statusLine`，已有别的状态栏脚本时不覆盖）：
+`timetrace setup`（会问一次「让刻迹读取 Claude 额度（安装状态栏钩子）？」，默认是）和 `timetrace agent install`（加 `--no-statusline` 跳过）
+在找到 `claude` 时会自动安装 Claude Code 状态栏钩子：往 `~/.claude/settings.json` 写入
+`statusLine = "<timetrace 的绝对路径> statusline"`。也可以手动：
 
 ```sh
-timetrace statusline --install
+timetrace statusline --install     # 重复运行不会重复包装
+timetrace statusline --uninstall   # 移除；原来有自己的状态栏时原样还原
 ```
+
+已经有自己的状态栏命令时不会覆盖，而是串联：生成 `~/.timetrace/statusline-chain.sh`，把同一份 stdin JSON 先交给
+`timetrace statusline`（记录额度，输出丢弃，失败也不影响）再交给你原来的命令，状态栏显示的仍是你原来的输出。
+原来的 `statusLine` 记在 `~/.timetrace/statusline-original.json`，`settings.json` 首次修改前备份为
+`settings.json.timetrace-backup`。`timetrace agent doctor` 会显示钩子是否已安装、上次收到额度样本的时间。
 
 之后 Claude Code 的状态栏会显示 `timetrace · 5h 86% · 7d 97% · codex 35% · ⏳ 3h12m`，同时你交互会话里撞到的限流（100%）会让守护进程停止往 Claude 派工，直到 `resets_at` 过去或有新样本。
 
@@ -296,3 +364,11 @@ failed local acknowledgment retries the whole unchanged batch; a 409 is never
 silently discarded. No schema migration is needed for existing outboxes.
 See `tests/integration/README.md` for the real Valley/PostgreSQL cancellation
 regression, including lost-response recovery and the next job claim.
+
+### Project background inventory
+
+The Runner reports whether each registered workspace is empty, populated, or
+unreadable, plus a root README snapshot (README.md, README.markdown, README,
+README.txt in that order, ignoring case). Snapshots are limited to 32 KiB of
+UTF-8 and descriptions to 500 characters. Local paths and linked files are not
+uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.

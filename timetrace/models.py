@@ -40,6 +40,8 @@ class Sample:
     window_mins: Optional[int] = None
     is_representative: bool = False
     source: str = "run"
+    # Vendor permission, not inferred from percentages; legacy adapters omit it.
+    codex_ordinary_usage_allowed: Optional[bool] = None
 
 
 @dataclass

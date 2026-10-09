@@ -17,6 +17,18 @@ MAX_LOG_BYTES = 10 * 1024 * 1024
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL)")
 
 
+def child_env(drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = None) -> dict:
+    """The AI tool's environment: this process's, minus `CLAUDE*`, the
+    billing keys in `drop_env` and every secret-named variable (M-2)."""
+    run_env = dict(os.environ)
+    for key in list(run_env):
+        if key.startswith("CLAUDE") or key in set(drop_env or ()) or SECRET_ENV_NAME.search(key):
+            run_env.pop(key, None)
+    if env:
+        run_env.update(env)
+    return run_env
+
+
 def run_streaming(
     cmd: Sequence[str], cwd: str, log_file: str, env: Optional[dict] = None,
     timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
@@ -25,12 +37,7 @@ def run_streaming(
     """`drop_env` names variables the child must not inherit (billing keys and
     endpoints that could switch a subscription tool to metered API usage)."""
     lines: List[str] = []
-    run_env = dict(os.environ)
-    for key in list(run_env):
-        if key.startswith("CLAUDE") or key in set(drop_env or ()) or SECRET_ENV_NAME.search(key):
-            run_env.pop(key, None)
-    if env:
-        run_env.update(env)
+    run_env = child_env(drop_env, env)
     with open(log_file, "a", encoding="utf-8") as log, open(os.devnull, "rb") as devnull:
         log.write("$ " + " ".join(_shell_quote(part) for part in cmd) + "\n")
         log.flush()

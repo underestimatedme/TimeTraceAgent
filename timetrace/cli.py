@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import plistlib
 import shlex
 import shutil
@@ -14,11 +15,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qsl, urlencode
 
-from timetrace import __version__, checks, config, folder, limits, qr, quota, render, scheduler, worktree
-from timetrace.agent import Agent, install_stop_handlers, restore_handlers
-from timetrace.cloud import CloudClient
+from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
+                       render, runner_state, scheduler, statusline_hook, toolpath, worktree)
+from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
+from timetrace.sleepguard import SleepGuard
+from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager
 from timetrace.db import Database
 from timetrace.dispatch import adapter_capabilities, lock_diagnostics
@@ -65,40 +68,61 @@ def _pair_link(user_code: str, name: str, expires_at: Optional[int] = None) -> s
     tail = ("&exp=%d" % expires_at if expires_at else "") + "&platform=darwin&v=1"
     with_name = "%s&name=%s%s" % (base, quote(name, safe=""), tail)
     try:
-        qr.encode(with_name)
+        qr.encode(with_name, levels=("M",))
         return with_name
     except ValueError:
         return base + tail
 
 
-def _print_pair_qr(link: str, out=print) -> None:
-    lines = qr.render_half_blocks(qr.encode(link))
-    colour = out is print and sys.stdout.isatty()
-    for line in lines:
-        # White on black whatever the terminal theme, so the phone sees dark
-        # modules on a light background.
-        out("\x1b[97;40m%s\x1b[0m" % line if colour else line)
+def _live_countdown(screen: "pairscreen.PairScreen") -> bool:
+    """Rewrite the countdown in place only on a real terminal tall enough to
+    still show the countdown line (cursor-up stops at the top of the screen)."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "") == "dumb":
+        return False
+    return shutil.get_terminal_size((80, 24)).lines > screen.rows_below_countdown() + 2
 
 
-def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_rounds: int = 5) -> int:
+def _phone_pair_link(link):
+    """Keep the authoritative v2 link; omit display hints if too dense for terminal QR."""
+    try:
+        qr.encode(link, levels=("M",))
+        return link
+    except ValueError:
+        uri = urlparse(link)
+        values = [(key, value) for key, value in parse_qsl(uri.query) if key != "name"]
+        return uri._replace(query=urlencode(values, quote_via=quote)).geturl()
+
+
+def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_rounds: int = 5, input_fn=None) -> int:
     """Device-code pairing with the phone (QR code or typed code). Stores the
-    runner credentials in the Keychain and reports inventory and quota."""
+    runner credentials in the Keychain and reports inventory and quota. An
+    expired code is replaced by a fresh one, up to `max_rounds` times."""
     cloud = _cloud(cfg)
     name = platform.node() or "Mac"
+    colour = out is print and pairscreen.color_supported()
+    previous = ""
     for round_no in range(max_rounds):
-        auth = cloud.create_device_authorization(name, "darwin", __version__)
+        auth = cloud.create_phone_authorization(name, "darwin", __version__, previous)
+        previous = auth["device_code"]
         if round_no:
             out()
             out("上一个二维码已过期，已生成新的二维码：")
-        else:
-            out("用刻迹 iPhone App 的「你的 AI → 扫码绑定」扫描下方二维码（或用相机扫描）：")
         out()
         expires_in = int(auth["expires_in"])
-        _print_pair_qr(_pair_link(auth["user_code"], name, int(time.time()) + expires_in), out)
-        out()
-        out("扫不了码时，在「你的 AI → 绑定电脑」中输入：%s" % auth["user_code"])
-        out("授权码 %d 分钟内有效，正在等待确认…" % max(1, expires_in // 60))
-        result = _await_pairing(cloud, auth, cfg, db, home, out)
+        # Black on white whatever the terminal theme, so the phone sees dark
+        # modules on a light background.
+        screen = pairscreen.PairScreen(_phone_pair_link(auth["verification_uri"]),
+                                       name, auth["user_code"], expires_in, ansi=colour,
+                                       colours=pairscreen.black_on_white())
+        for line in screen.lines():
+            out(line)
+        out("手机核对电脑后会显示 4 位数字，请回到这里输入。")
+        tick = None
+        if out is print and _live_countdown(screen):
+            def tick(remaining, screen=screen):
+                sys.stdout.write(screen.update_sequence(remaining, extra_below=1))
+                sys.stdout.flush()
+        result = _await_pairing(cloud, auth, cfg, db, home, out, tick=tick, input_fn=input_fn)
         if result is not None:
             return result
     if out is print:
@@ -108,32 +132,102 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
     return 1
 
 
-def _await_pairing(cloud, auth, cfg, db, home, out) -> Optional[int]:
-    """Poll one authorization. Returns 0 once bound, None when it expired."""
+def _pair_server_time(value):
+    # Python 3.9 only accepts 3/6 fractional digits; Go emits RFC3339Nano 1..9.
+    normalized = re.sub(r"\.(\d{1,9})(?=Z$|[+-])",
+                        lambda match: "." + match.group(1)[:6].ljust(6, "0"), value)
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
+def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) -> Optional[int]:
+    """Poll one authorization. Returns 0 once bound, None when it expired.
+    `tick(remaining_seconds)` is called every second between polls."""
     deadline = time.time() + int(auth["expires_in"])
+    interval = max(1, int(auth.get("interval") or 5))
+    digits = None
+    phone_window = False
     while time.time() < deadline:
         approval = cloud.poll_device_authorization(auth["device_code"])
-        if approval.get("status") == "approved":
-            credentials = cloud.activate(auth["device_code"], approval["activation_code"])
-            credentials["expires_at"] = int(time.time()) + int(credentials.get("expires_in") or 900)
-            CredentialStore().save(credentials)
-            out("已绑定：%s" % credentials["runner"]["name"])
-            # Report right away so the phone shows tools and quota within
-            # seconds of approving, instead of after the next agent start.
+        status = approval.get("status")
+        if status in ("waiting_phone", "activated") and auth.get("pairing_version") == 2:
+            if not phone_window and approval.get("server_now") and approval.get("expires_at"):
+                start = _pair_server_time(approval["server_now"])
+                end = _pair_server_time(approval["expires_at"])
+                deadline = time.time() + max(0, (end - start).total_seconds())
+                phone_window = True
+            if digits is None:
+                try:
+                    answer = (input_fn or input)("输入手机上显示的 4 位数字（5 分钟内有效，最多错 3 次）：")
+                    if answer is None:
+                        out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                        return 1
+                    digits = answer.strip()
+                except (EOFError, KeyboardInterrupt):
+                    out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                    return 1
             try:
-                adapters = _adapters(cfg)
-                token = credentials["access_token"]
-                cloud.update_inventory(token, _runner_workspaces(db), _runner_tools(cfg, adapters), _max_parallel(cfg),
-                                       _max_parallel_per_tool(cfg))
-                Agent(db, cloud, adapters, home, lambda: token).report_quota()
-                out("已上报工具清单与额度，手机上几秒内可见")
-            except Exception as exc:
-                out("绑定成功，但首次上报失败：%s（Runner 启动后会重试）" % exc.__class__.__name__)
-            return 0
-        if approval.get("status") == "expired":
+                credentials = cloud.activate_phone(auth["device_code"], digits)
+                return _finish_pairing(cloud, credentials, cfg, db, home, out)
+            except CloudError as exc:
+                if exc.status == 401:
+                    digits = None
+                    current = cloud.poll_device_authorization(auth["device_code"])
+                    out("数字不正确，剩余 %s 次。" % current.get("attempts_remaining", "未知"))
+                    if current.get("status") == "locked":
+                        out("已错 3 次，本次绑定已锁定；请重新运行绑定。")
+                        return 1
+                    if current.get("status") in ("expired", "cancelled"):
+                        out("本次绑定已过期或取消。")
+                        return 1
+                elif exc.status == 410:
+                    return None
+                elif exc.status == 409:
+                    out("本次绑定已锁定或取消；请重新开始。")
+                    return 1
+                elif exc.status and exc.status < 500:
+                    raise
+                else:
+                    out("结果尚未确认，正在重试同一笔电脑确认…")
+            except OSError:
+                out("网络中断，正在重试同一笔电脑确认…")
+        elif status == "approved":
+            if auth.get("pairing_version") == 2:
+                out("服务端配对协议不匹配，未完成绑定。")
+                return 1
+            credentials = cloud.activate(auth["device_code"], approval["activation_code"])
+            return _finish_pairing(cloud, credentials, cfg, db, home, out)
+        if status in ("locked", "cancelled"):
+            out("本次绑定已锁定或取消；请重新开始。")
+            return 1
+        if status == "expired":
             return None
-        time.sleep(max(1, int(auth.get("interval") or 5)))
+        if tick is None:
+            time.sleep(interval)
+            continue
+        for _ in range(interval):
+            tick(max(0.0, deadline - time.time()))
+            time.sleep(1)
     return None
+
+
+def _finish_pairing(cloud, credentials, cfg, db, home, out):
+    credentials["expires_at"] = int(time.time()) + int(credentials.get("expires_in") or 900)
+    CredentialStore().save(credentials)
+    out("已绑定：%s" % credentials["runner"]["name"])
+    # Report right away so the phone shows tools and quota within
+    # seconds of approving, instead of after the next agent start.
+    try:
+        adapters = _adapters(cfg)
+        token = credentials["access_token"]
+        workspaces, tools = _runner_workspaces(db), _runner_tools(cfg, adapters)
+        cloud.update_inventory(token, workspaces, tools, _max_parallel(cfg), _max_parallel_per_tool(cfg))
+        runner_state.record(home, inventory_pushed_at=int(time.time()), inventory_workspaces=len(workspaces),
+                            inventory_tools=len(tools))
+        Agent(db, cloud, adapters, home, lambda: token).report_quota()
+        out("已上报工具清单与额度，手机上几秒内可见")
+    except Exception as exc:
+        out("绑定成功，但首次上报失败：%s（Runner 启动后会重试）" % exc.__class__.__name__)
+    return 0
 
 
 def cmd_cloud_login(args: argparse.Namespace) -> int:
@@ -154,13 +248,17 @@ def cmd_cloud_status(args: argparse.Namespace) -> int:
 def cmd_cloud_logout(args: argparse.Namespace) -> int:
     _, cfg, _ = _open(args)
     store = CredentialStore()
-    if store.load():
+    credentials = store.load()
+    if credentials:
         cloud = _cloud(cfg)
         try:
-            cloud.request("POST", "/runner/revoke", None, SessionManager(store, cloud).token())
-            print("已在刻迹账号中解绑这台电脑")
+            result = cloud.revoke_phone(credentials.get("refresh_token", ""))
+            if not result or result.get("revoked") is not True:
+                raise CloudError("revocation not acknowledged")
         except Exception as exc:
-            print("服务端解绑失败（%s），请在手机「设备与授权」里再解绑一次" % exc.__class__.__name__)
+            print("尚未确认服务端解绑（%s）；保留本机凭据，请重试或在手机解绑。" % exc.__class__.__name__)
+            return 1
+        print("已在刻迹账号中解绑这台电脑")
     store.delete()
     print("本机 Runner 凭据已从 Keychain 删除")
     return 0
@@ -305,11 +403,14 @@ def cmd_workspace_check(args: argparse.Namespace) -> int:
 def _runner_workspaces(db: Database) -> list:
     """Inventory entries. `checks` names the registered check commands of
     each workspace; the commands themselves never leave this computer."""
+    from .workspace_context import collect_workspace_context
+
     names = {}
     for row in db.list_checks():
         names.setdefault(row["workspace_id"], []).append(row["name"])
     return [{"id": row["id"], "name": row["name"], "default_branch": row["default_branch"],
-             "kind": row.get("kind") or "git", "checks": sorted(names.get(row["id"], []))}
+             "kind": row.get("kind") or "git", "checks": sorted(names.get(row["id"], [])),
+             "context": collect_workspace_context(row["path"])}
             for row in db.list_workspaces()]
 
 
@@ -378,6 +479,9 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return 1
     cloud = _cloud(cfg)
     state = {"sessions": SessionManager(CredentialStore(), cloud)}
+    # Absolute `<tool>.bin` paths (and the node next to them) reach PATH even
+    # when the LaunchAgent was installed before the tool was.
+    toolpath.extend_runtime_path(str((cfg.get(name) or {}).get("bin") or "") for name in TOOLS)
     adapters = _adapters(cfg)
 
     def token() -> str:
@@ -399,7 +503,12 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
                   max_parallel=_max_parallel(cfg), max_parallel_per_tool=_max_parallel_per_tool(cfg),
                   workspace_wait=WORKSPACE_WAIT_SECONDS,
                   check_env_drop=_str_list(cfg.get("check_env_drop")),
-                  check_env_keep=_str_list(cfg.get("check_env_keep")))
+                  check_env_keep=_str_list(cfg.get("check_env_keep")),
+                  report_protocol=True,
+                  health_check=lambda: health.check(adapters, db.list_workspaces(), home),
+                  reset_credits=lambda: _reset_credits(adapters),
+                  sleep_guard=SleepGuard() if cfg.get("prevent_sleep", True) else None,
+                  user_home=str(Path.home()))
     # Startup upkeep pushes the inventory once and reports quota right away.
     agent.maintain(force=True)
     if args.once:
@@ -415,6 +524,68 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reset_credits(adapters: Dict[str, Any]) -> list:
+    """Inventory `reset_credits`: one entry per Codex login (read only)."""
+    reader = getattr(adapters.get(CODEX), "reset_credits_entry", None)
+    entry = reader() if callable(reader) else None
+    return [entry] if entry else []
+
+
+def cmd_agent_pause(args: argparse.Namespace) -> int:
+    home, _, _ = _open(args)
+    value = args.agent_cmd == "pause"
+    pause.set_paused(home, value)
+    audit.record(home, "pause" if value else "resume", source="local")
+    if value:
+        print("已暂停接活：这台电脑不再领取新任务，正在运行的任务继续。手机无法解除本地暂停；运行 timetrace agent resume 恢复。")
+    else:
+        print("已恢复接活。")
+    return 0
+
+
+_LOGIN_LABEL = {"ok": "正常", "expired": "已过期 → 在这台 Mac 上重新登录", "missing": "未登录"}
+
+
+def _health_lines(report: Dict[str, Any]) -> List[str]:
+    lines = []
+    for tool in ("claude", "codex"):
+        state = report.get(tool + "_login")
+        if state:
+            lines.append("  %s 登录: %s" % (tool, _LOGIN_LABEL.get(state, state)))
+    free = report.get("disk_free_gb")
+    if free is not None:
+        level = "（不足 1 GB：不接新任务）" if free < 1 else ("（偏少，建议留出 5 GB）" if free < 5 else "")
+        lines.append("  磁盘剩余: %.1f GB%s" % (free, level))
+    for ws in report.get("workspaces") or []:
+        if not ws.get("exists"):
+            state = "目录不存在"
+        elif not ws.get("git"):
+            state = "文件夹（非 Git）"
+        else:
+            state = {True: "Git，干净", False: "Git，有未提交的改动"}.get(ws.get("clean"), "Git")
+        lines.append("  工作区 %s: %s" % (ws.get("id"), state))
+    return lines
+
+
+def _reset_credit_lines(adapters: Dict[str, Any]) -> List[str]:
+    reader = getattr(adapters.get(CODEX), "reset_credits_entry", None)
+    if not callable(reader):
+        return []
+    try:
+        entry = reader()
+    except Exception as exc:
+        return ["  Codex 重置机会: 暂时读不到（%s）" % exc.__class__.__name__]
+    if not entry:
+        return ["  Codex 重置机会: 没有 Codex 登录"]
+    if entry.get("status") != "ok":
+        return ["  Codex 重置机会: 暂时读不到"]
+    lines = ["  Codex 重置机会: 可用 %d 次（只读；在官方客户端里使用）" % entry["available_count"]]
+    for credit in entry.get("credits") or []:
+        lines.append("    %s %s%s" % (credit.get("status"), credit.get("description") or credit.get("id"),
+                                     "，%s 过期" % credit["expires_at"] if credit.get("expires_at") else ""))
+    return lines
+
+
 def _iso_local(epoch) -> str:
     try:
         return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M:%S")
@@ -422,29 +593,79 @@ def _iso_local(epoch) -> str:
         return "未知时间"
 
 
-def cmd_agent_doctor(args: argparse.Namespace) -> int:
-    home, cfg, db = _open(args)
-    paired = CredentialStore().load() is not None
-    print("Valley: %s" % cfg["cloud_base_url"])
-    print("配对: %s" % ("已完成" if paired else "未完成"))
-    print("工作区: %d" % len(db.list_workspaces()))
-    adapters = _adapters(cfg)
+_SOURCE_LABEL = {"login_shell": "登录 shell 找到", "scan": "在常见安装位置找到", "config": "来自配置"}
+_VISIBILITY_REASON = {
+    "binary_missing": "配置的路径不存在或不可执行",
+    "not_on_path": "LaunchAgent 的 PATH 里没有它所在的目录",
+    "node_not_on_path": "它是 node 脚本，但 LaunchAgent 的 PATH 里没有 node",
+}
+
+
+def _discover_tools(home: Path, user_home: Optional[Path] = None):
+    """Resolve claude / codex (and node) the way the login shell does and record
+    each absolute path found as `<tool>.bin`, unless the user set one. Returns
+    (the reloaded config, {tool: toolpath.Resolution})."""
+    user_home = Path(user_home or Path.home())
+    resolutions: Dict[str, toolpath.Resolution] = {}
+    npm_bin = None
     for name in TOOLS:
-        lines, _ = _tool_check(name, cfg, adapters)
-        for line in lines:
-            print(line)
-        if name in adapters:
-            _print_tool_quota(adapters[name])
-    diagnostics = lock_diagnostics(home)
-    for message in diagnostics:
-        print("Execution lock: %s" % message)
-    return 0 if paired and db.list_workspaces() and not diagnostics else 1
+        explicit = config.explicit_tool_bin(home, name)
+        res = toolpath.resolve_tool(name, user_home, configured=explicit or None)
+        if not res.path and not explicit:
+            # Last resort, it costs one more shell: the npm global prefix.
+            npm_bin = npm_bin or toolpath.npm_global_bin(user_home) or ""
+            if npm_bin:
+                res = toolpath.resolve_tool(name, user_home, npm_bin=npm_bin)
+        if res.path and not explicit:
+            config.store_tool_bin(home, name, res.path)
+        resolutions[name] = res
+    return config.load(home), resolutions
 
 
-def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any]):
-    """Binary location and zero-spend verdict of one tool: (lines, verified)."""
+def _tool_version(binary: str, node: Optional[str] = None, run=subprocess.run) -> str:
+    """`<tool> --version`, first line; never starts a model run."""
+    env = dict(os.environ)
+    if node:
+        env["PATH"] = toolpath.join_path([os.path.dirname(node)] + env.get("PATH", "").split(":"))
+    try:
+        proc = run([binary, "--version"], capture_output=True, text=True, timeout=15,
+                   stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return "未知（%s）" % exc.__class__.__name__
+    text = ((proc.stdout or "").strip() or (proc.stderr or "").strip()).splitlines()
+    if proc.returncode != 0 or not text:
+        return "未知（exit %d）" % proc.returncode
+    return text[0].strip()[:80]
+
+
+def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolution=None,
+                runner_path: Optional[str] = None, show_version: bool = False):
+    """Location, Runner visibility, version and zero-spend verdict of one tool:
+    (lines, verified). `runner_path` is the LaunchAgent PATH (None: not
+    installed, visibility not checked)."""
     binary = str(cfg.get(name, {}).get("bin", name))
-    lines = ["%s: %s" % (name, shutil.which(binary) or "未找到")]
+    found = resolution.path if resolution is not None else shutil.which(binary)
+    if found:
+        label = _SOURCE_LABEL.get(resolution.source) if resolution is not None else ""
+        lines = ["%s: %s%s" % (name, found, "（%s）" % label if label else "")]
+    else:
+        lines = ["%s: 未找到" % name]
+        if resolution is not None and resolution.searched:
+            lines.append("  已查找: " + "、".join(resolution.searched))
+        lines.append("  修复: 运行 timetrace config set %s.bin /path/to/%s 然后 timetrace agent install" % (name, name))
+    if found and resolution is not None:
+        if resolution.needs_node and not resolution.node:
+            lines.append("  注意: %s 是 node 脚本，但没有找到 node" % name)
+        if runner_path is not None:
+            ok, reason = toolpath.runner_visibility(found, resolution.needs_node, runner_path)
+            if ok:
+                lines.append("  后台 Runner: 能找到")
+            else:
+                lines.append("  后台 Runner: 找不到 —— %s" % _VISIBILITY_REASON.get(reason, reason))
+                lines.append("  修复: 运行 timetrace agent install（LaunchAgent 的 PATH 会加入 %s）"
+                             % "、".join(dict.fromkeys(resolution.dirs)))
+    if found and show_version:
+        lines.append("  版本: %s" % _tool_version(found, resolution.node if resolution is not None else None))
     try:
         details = adapters[name].capability_details() if name in adapters else {}
     except Exception as exc:
@@ -455,6 +676,75 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any]):
     else:
         lines.append("  零付费核验: 未通过（%s）→ 该工具不会被派发任务" % (details.get("unsupported_reason") or "unknown"))
     return lines, verified
+
+
+def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
+    """LaunchAgent installed / running, and when the Runner last reached Valley."""
+    lines = []
+    if toolpath.installed_launch_path(user_home) is None:
+        lines.append("后台 Runner: 未安装 → 运行 timetrace agent install")
+    else:
+        state = toolpath.launch_agent_state(run=launchctl) if launchctl else toolpath.launch_agent_state()
+        if state["running"]:
+            lines.append("后台 Runner: 已安装，运行中（pid %s）" % state["pid"])
+        elif state["loaded"]:
+            lines.append("后台 Runner: 已安装，已加载但未在运行 → 查看 ~/.timetrace/daemon.err")
+        else:
+            lines.append("后台 Runner: 已安装，未加载 → 运行 timetrace agent install")
+    st = runner_state.load(home)
+    if st.get("inventory_pushed_at"):
+        lines.append("上次上报工具清单: %s（%s 个工作区，%s 个工具）" % (
+            _iso_local(st["inventory_pushed_at"]), st.get("inventory_workspaces", "?"), st.get("inventory_tools", "?")))
+    else:
+        lines.append("上次上报工具清单: 从未上报")
+    if st.get("quota_reported_at"):
+        lines.append("上次上报额度: %s" % _iso_local(st["quota_reported_at"]))
+    return lines
+
+
+def cmd_agent_doctor(args: argparse.Namespace) -> int:
+    home, cfg, db = _open(args)
+    user_home = Path.home()
+    cfg, resolutions = _discover_tools(home, user_home)
+    paired = CredentialStore().load() is not None
+    print("Valley: %s" % cfg["cloud_base_url"])
+    print("配对: %s" % ("已完成" if paired else "未完成 → 运行 timetrace cloud login"))
+    for line in _runner_lines(home, user_home):
+        print(line)
+    workspaces = db.list_workspaces()
+    if workspaces:
+        print("工作区: %d" % len(workspaces))
+    else:
+        print("工作区: 0 —— 没有登记仓库，手机无法派发远程任务；运行 timetrace workspace add <path> 登记"
+              "（工具清单和额度仍会照常上报）")
+    adapters = _adapters(cfg)
+    runner_path = toolpath.installed_launch_path(user_home)
+    for name in TOOLS:
+        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path, show_version=True)
+        for line in lines:
+            print(line)
+        if name in adapters:
+            _print_tool_quota(adapters[name])
+    for line in _statusline_lines(home, db):
+        print(line)
+    print("电脑端版本: %s（协议 %d）" % (__version__, PROTOCOL_VERSION))
+    local = pause.state(home)
+    print("接活: %s" % ("已在电脑上暂停 → 运行 timetrace agent resume 恢复" if local["paused"] else "本机未暂停"))
+    print("防休眠: %s" % ("开启（有任务运行时 caffeinate -i）" if cfg.get("prevent_sleep", True) else "关闭"))
+    print("自检:")
+    try:
+        report = health.check(adapters, workspaces, home)
+    except Exception as exc:
+        report = {}
+        print("  自检失败（%s）" % exc.__class__.__name__)
+    for line in _health_lines(report):
+        print(line)
+    for line in _reset_credit_lines(adapters):
+        print(line)
+    diagnostics = lock_diagnostics(home)
+    for message in diagnostics:
+        print("Execution lock: %s" % message)
+    return 0 if paired and workspaces and not diagnostics else 1
 
 
 def _print_tool_quota(adapter) -> None:
@@ -496,9 +786,10 @@ def timetrace_command() -> List[str]:
     return [sys.executable, "-m", "timetrace"]
 
 
-def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -> Path:
+def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run, path: Optional[str] = None) -> Path:
     """Write ~/Library/LaunchAgents/com.atlaspaces.timetrace.agent.plist and (re)load it.
-    Generated with plistlib, so any path is escaped correctly."""
+    Generated with plistlib, so any path is escaped correctly. `path` is the
+    Runner's PATH (toolpath.launch_path); defaults to the fixed system dirs."""
     user_home = Path(user_home or Path.home())
     destination = user_home / "Library" / "LaunchAgents" / "com.atlaspaces.timetrace.agent.plist"
     data_dir = user_home / ".timetrace"
@@ -506,8 +797,9 @@ def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -
         "Label": "com.atlaspaces.timetrace.agent",
         "ProgramArguments": timetrace_command() + ["agent", "run"],
         "EnvironmentVariables": {
-            # claude's native installer uses ~/.local/bin; Homebrew one of the others.
-            "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:%s" % (user_home / ".local" / "bin"),
+            # claude's native installer uses ~/.local/bin; Homebrew one of the others;
+            # plus the directories of the tools (and node) found in the login shell.
+            "PATH": path or toolpath.join_path(toolpath.default_path_dirs(user_home)),
             "TIMETRACE_HOME": str(data_dir),
         },
         "RunAtLoad": True,
@@ -522,9 +814,29 @@ def install_launch_agent(user_home: Optional[Path] = None, run=subprocess.run) -
     return destination
 
 
+def _install_runner(home: Path, out=print, resolutions=None) -> Path:
+    """`agent install` / setup step 4: find the tools, then write the
+    LaunchAgent with their directories (and node's) on its PATH."""
+    user_home = Path.home()
+    if resolutions is None:
+        _, resolutions = _discover_tools(home, user_home)
+    for name, res in resolutions.items():
+        if res.path:
+            out("  %s: %s" % (name, res.path))
+        else:
+            out("  %s: 未找到（运行 timetrace config set %s.bin /path/to/%s 然后 timetrace agent install）"
+                % (name, name, name))
+    return install_launch_agent(path=toolpath.launch_path(user_home, resolutions.values()))
+
+
 def cmd_agent_install(args: argparse.Namespace) -> int:
-    destination = install_launch_agent()
+    home, _, _ = _open(args)
+    _, resolutions = _discover_tools(home, Path.home())
+    destination = _install_runner(home, resolutions=resolutions)
     print("Runner 已安装并启动：%s" % destination)
+    claude = resolutions.get("claude")
+    if claude is not None and claude.path and not getattr(args, "no_statusline", False):
+        _install_statusline()  # a failure is reported but does not fail the install
     return 0
 
 
@@ -555,14 +867,32 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
     out("刻迹 Runner 设置（%s）" % home)
     out()
     out("1/4 检查本机 AI 工具")
+    user_home = Path.home()
+    cfg, resolutions = _discover_tools(home, user_home)
     adapters = _adapters(cfg)
     verified = []
+    installed_path = toolpath.installed_launch_path(user_home)
+    # What the Runner sees today: the installed LaunchAgent's PATH, else the
+    # fixed default an install without discovery would get.
+    runner_path = installed_path if installed_path is not None else toolpath.join_path(
+        toolpath.default_path_dirs(user_home))
+    hidden = []
     for name in TOOLS:
-        lines, ok = _tool_check(name, cfg, adapters)
+        lines, ok = _tool_check(name, cfg, adapters, resolutions.get(name))
         for line in lines:
             out(line)
         if ok:
             verified.append(name)
+        res = resolutions.get(name)
+        if res is not None and res.path:
+            visible, reason = toolpath.runner_visibility(res.path, res.needs_node, runner_path)
+            if not visible:
+                hidden.append(name)
+                out("  注意：%s 在终端里能找到（%s），但后台 Runner 的 PATH 里没有（%s）。"
+                    % (name, res.path, _VISIBILITY_REASON.get(reason, reason)))
+                out("        %s第 4 步安装后台 Runner 时会把 %s 加入它的 PATH。"
+                    % ("已记下 %s.bin；" % name if res.source != "config" else "",
+                       "、".join(dict.fromkeys(res.dirs))))
     if not verified:
         out("  注意：没有工具通过零付费核验，Runner 不会派发任务。请先用订阅账号登录 claude / codex（不要用 API key）。")
     out()
@@ -606,7 +936,7 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
         do_pair = confirm("  现在用手机扫码绑定？", args.no_pair)
     if do_pair:
         try:
-            code = pair_computer(cfg, db, home, out=out)
+            code = pair_computer(cfg, db, home, out=out, input_fn=ask)
         except Exception as exc:
             out("  绑定失败：%s" % exc.__class__.__name__)
             code = 1
@@ -618,13 +948,29 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
     out("4/4 后台 Runner（macOS LaunchAgent，开机自动运行）")
     if confirm("  安装并启动后台 Runner？", args.no_agent):
         try:
-            destination = install_launch_agent()
+            destination = _install_runner(home, out, resolutions)
             out("  已安装：%s" % destination)
         except Exception as exc:
             out("  安装失败：%s；可稍后运行 `timetrace agent install`" % exc.__class__.__name__)
             result = result or 1
     else:
         out("  跳过；需要时运行 `timetrace agent install`，或前台运行 `timetrace agent run`。")
+        if hidden and installed_path is not None:
+            out("  注意：已安装的后台 Runner 仍找不到 %s，运行 `timetrace agent install` 修复。" % "、".join(hidden))
+    claude = resolutions.get("claude")
+    if claude is not None and claude.path and not args.no_statusline:
+        if statusline_hook.installed(user_home, home):
+            out("  Claude 状态栏钩子：已安装")
+        else:
+            if args.yes:
+                wanted = True
+            else:
+                answer = ask("  让刻迹读取 Claude 额度（安装状态栏钩子）？[Y/n] ")
+                wanted = answer is not None and answer.lower() in ("", "y", "yes", "是", "好")
+            if wanted:
+                _install_statusline(out=lambda m: out("  " + m), err=lambda m: out("  " + m))
+            else:
+                out("  跳过状态栏钩子；需要时运行 `timetrace statusline --install`。")
     out()
     out("完成。随时运行 `timetrace agent doctor` 检查状态。" if result == 0 else "部分步骤未完成，见上方提示。")
     return result
@@ -643,6 +989,8 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("%s = %s" % (key, config.format_value(cfg.get(key))))
             for tool, value in _max_parallel_per_tool(cfg).items():
                 print("%s.%s = %d" % (config.PER_TOOL_KEY, tool, value))
+            for key in config.TOOL_BIN_KEYS:
+                print("%s = %s" % (key, (cfg.get(key.split(".")[0]) or {}).get("bin", "")))
             return 0
         if args.config_cmd == "get":
             if args.key.startswith(config.PER_TOOL_KEY + "."):
@@ -651,6 +999,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                 if tool not in limits:
                     config.parse_value(args.key, "1")  # raises naming the tools
                 print(limits[tool])
+                return 0
+            if args.key in config.TOOL_BIN_KEYS:
+                print((config.load(home).get(args.key.split(".")[0]) or {}).get("bin", ""))
                 return 0
             if args.key not in config.scalar_keys():
                 config.parse_value(args.key, "")  # raises with the list of keys
@@ -664,6 +1015,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     if args.key in ("cloud_base_url", "upload_output_tail", "interval_sec", "max_parallel") \
             or args.key.startswith(config.PER_TOOL_KEY + "."):
         print("restart the Runner to apply: launchctl kickstart -k gui/%d/com.atlaspaces.timetrace.agent" % os.getuid())
+    if args.key in config.TOOL_BIN_KEYS:
+        print("然后运行 timetrace agent install，让后台 Runner 使用它（并把它的目录加入 PATH）")
     return 0
 
 
@@ -841,6 +1194,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     """
     if args.install:
         return _install_statusline()
+    if args.uninstall:
+        return _uninstall_statusline()
     raw = sys.stdin.read()
     try:
         doc = json.loads(raw) if raw.strip() else {}
@@ -848,6 +1203,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         doc = {}
     home, cfg, db = _open(args)
     now = int(time.time())
+    runner_state.record(home, statusline_seen_at=now)
     rl = doc.get("rate_limits") or {}
     samples = []
     for key, w in rl.items():
@@ -877,29 +1233,49 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_statusline() -> int:
-    """Register `timetrace statusline` as the statusLine command in ~/.claude/settings.json."""
-    settings = Path(os.path.expanduser("~/.claude/settings.json"))
-    data: Dict[str, Any] = {}
-    if settings.exists():
-        try:
-            data = json.loads(settings.read_text(encoding="utf-8") or "{}")
-        except ValueError:
-            print("error: %s is not valid JSON; fix it first" % settings, file=sys.stderr)
-            return 1
-    timetrace_bin = " ".join(shlex.quote(part) for part in timetrace_command())
-    current = data.get("statusLine")
-    if current and "timetrace" not in json.dumps(current):
-        print("existing statusLine kept, not overwriting: %s" % json.dumps(current), file=sys.stderr)
-        print("add `%s statusline` to that script yourself, e.g. pipe stdin through it" % timetrace_bin,
-              file=sys.stderr)
+def _install_statusline(out=print, err=None) -> int:
+    """Register `<timetrace> statusline` as Claude Code's statusLine command,
+    chaining (never overwriting) a status line the user already has."""
+    err = err or (lambda message: print(message, file=sys.stderr))
+    home = config.home()
+    try:
+        result, detail = statusline_hook.install(Path.home(), home, timetrace_command())
+    except (OSError, ValueError) as exc:
+        err("状态栏钩子未安装：%s 不是有效的 JSON 或无法写入（%s），请先修好它"
+            % (statusline_hook.settings_path(Path.home()), exc.__class__.__name__))
         return 1
-    data["statusLine"] = {"type": "command", "command": "%s statusline" % timetrace_bin}
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print("statusLine set in %s → %s statusline" % (settings, timetrace_bin))
-    print("restart Claude Code; quota samples from your interactive sessions now flow into timetrace")
+    if result == "refused":
+        err("状态栏钩子未安装：%s" % detail)
+        return 1
+    if result == "chained":
+        out("状态栏钩子已安装（与你原来的状态栏命令串联，原设置已备份；timetrace statusline --uninstall 可还原）")
+    elif result == "unchanged":
+        out("状态栏钩子：已安装")
+    else:
+        out("状态栏钩子已安装：%s" % detail)
+    if result != "unchanged":
+        out("重启 Claude Code 后，你自己在 Claude Code 里用掉的额度也会同步到刻迹")
     return 0
+
+
+def _uninstall_statusline() -> int:
+    try:
+        result = statusline_hook.uninstall(Path.home(), config.home())
+    except (OSError, ValueError) as exc:
+        print("error: %s: %s" % (statusline_hook.settings_path(Path.home()), exc.__class__.__name__), file=sys.stderr)
+        return 1
+    print({"restored": "已还原原来的状态栏命令", "removed": "已移除状态栏钩子",
+           "absent": "没有安装状态栏钩子"}[result])
+    return 0
+
+
+def _statusline_lines(home: Path, db: Database) -> List[str]:
+    if not statusline_hook.installed(Path.home(), home):
+        return ["Claude 状态栏钩子: 未安装 → 运行 timetrace statusline --install"]
+    last = db.latest_sample_at("statusline")
+    if last:
+        return ["Claude 状态栏钩子: 已安装；上次额度样本 %s" % _iso_local(last)]
+    return ["Claude 状态栏钩子: 已安装；还没有收到额度样本（在 Claude Code 里发一条消息后会出现）"]
 
 
 # ---- parser ---------------------------------------------------------------------
@@ -955,6 +1331,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.set_defaults(fn=cmd_events)
 
     sl = sub.add_parser("statusline", help="Claude Code statusLine hook: ingest interactive quota")
+    sl.add_argument("--uninstall", action="store_true",
+                    help="remove the hook from ~/.claude/settings.json, restoring a chained original")
     sl.add_argument("--install", action="store_true",
                     help="register this command in ~/.claude/settings.json")
     sl.set_defaults(fn=cmd_statusline)
@@ -999,6 +1377,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--yes", "-y", action="store_true", help="accept the defaults without asking")
     st.add_argument("--no-pair", dest="no_pair", action="store_true", help="skip pairing with the phone")
     st.add_argument("--no-agent", dest="no_agent", action="store_true", help="skip installing the LaunchAgent")
+    st.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                    help="skip installing the Claude Code statusLine hook")
     st.set_defaults(fn=cmd_setup)
 
     conf = sub.add_parser("config", help="read or change ~/.timetrace/config.json")
@@ -1019,7 +1399,13 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--interval", type=int, default=5)
     ar.set_defaults(fn=cmd_agent_run)
     agent_sub.add_parser("doctor", help="check pairing, tools and workspaces").set_defaults(fn=cmd_agent_doctor)
-    agent_sub.add_parser("install", help="install the macOS LaunchAgent").set_defaults(fn=cmd_agent_install)
+    agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
+                         ).set_defaults(fn=cmd_agent_pause)
+    agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
+    ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
+    ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                    help="do not register the Claude Code statusLine hook")
+    ai.set_defaults(fn=cmd_agent_install)
     return p
 
 

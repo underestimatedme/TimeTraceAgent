@@ -109,7 +109,8 @@ def semantic_scope(slot: str, window_mins: Optional[int]) -> str:
 def payload_from_reading(bucket_key: str, tool: str, used_percent: Any, reset_at: Optional[float],
                          window_mins: Optional[int], pool_id: str, profile_id: str, now: float,
                          source: str = "runner", confidence: str = "exact",
-                         default_ttl: float = 3600.0, pool_authoritative: bool = False) -> Dict[str, Any]:
+                         default_ttl: float = 3600.0, pool_authoritative: bool = False,
+                         codex_ordinary_usage_allowed: Optional[bool] = None) -> Dict[str, Any]:
     """Wrap one vendor rate-limit reading as a Valley sample. A reset time is
     only trusted when it is still in the future; otherwise the reading is fresh
     for a bounded horizon and carries no reset boundary."""
@@ -123,20 +124,24 @@ def payload_from_reading(bucket_key: str, tool: str, used_percent: Any, reset_at
     # long vendor limit names; reposting the same payload is still idempotent.
     identity = [pool_id, profile_id, tool, bucket_key, window_mins, now,
                 window.used_percent, trusted_reset, source, confidence, pool_authoritative]
+    if codex_ordinary_usage_allowed is not None:
+        identity.append(codex_ordinary_usage_allowed)
     sample_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
     return sample_payload(
         sample_id=sample_id, pool_id=pool_id, profile_id=profile_id,
         scope=scope, kind=tool, window=window, source=source, confidence=confidence,
         limit_id=limit_id, window_mins=window_mins, pool_authoritative=pool_authoritative,
+        codex_ordinary_usage_allowed=codex_ordinary_usage_allowed,
     )
 
 
 def sample_payload(sample_id: str, pool_id: str, profile_id: str, scope: str, kind: str,
                    window: Window, source: str, confidence: str, limit_id: str = "",
-                   window_mins: Optional[int] = None, pool_authoritative: bool = False) -> Dict[str, Any]:
+                   window_mins: Optional[int] = None, pool_authoritative: bool = False,
+                   codex_ordinary_usage_allowed: Optional[bool] = None) -> Dict[str, Any]:
     """Wire shape for POST /runner/quota/samples. Carries only opaque ids and
     de-identified readings — never tokens, account emails, or environment."""
-    return {
+    payload = {
         "sample_id": sample_id,
         "pool_id": pool_id,
         "profile_id": profile_id,
@@ -152,3 +157,6 @@ def sample_payload(sample_id: str, pool_id: str, profile_id: str, scope: str, ki
         "source": source,
         "confidence": confidence,
     }
+    if type(codex_ordinary_usage_allowed) is bool:
+        payload["codex_ordinary_usage_allowed"] = codex_ordinary_usage_allowed
+    return payload

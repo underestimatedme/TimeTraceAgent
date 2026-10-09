@@ -127,6 +127,12 @@ class Database:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        # Failures an older agent delivered still hold their Plan's tombstone.
+        delivered = [row["id"] for row in self.conn.execute(
+            "SELECT o.id FROM remote_outbox o JOIN remote_plan_started p"
+            " ON p.job_id=o.job_id AND p.attempt_id=o.attempt_id WHERE o.sent_at IS NOT NULL")]
+        if delivered:
+            self._release_failed_plans(delivered)
 
     def _migrate(self) -> None:
         # Workspaces registered before folder workspaces existed are git repos.
@@ -220,6 +226,12 @@ class Database:
              json.dumps(event, ensure_ascii=False, sort_keys=True), now or _now()),
         )
 
+    def last_remote_seq(self, job_id: str, attempt_id: str) -> int:
+        """The highest event seq queued for this attempt (0 when none)."""
+        row = self.conn.execute("SELECT MAX(seq) FROM remote_outbox WHERE job_id=? AND attempt_id=?",
+                                (job_id, attempt_id)).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def pending_remote_events(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM remote_outbox WHERE sent_at IS NULL ORDER BY id"
@@ -233,6 +245,7 @@ class Database:
 
     def mark_remote_event_sent(self, event_id: int, now: Optional[int] = None) -> None:
         self.conn.execute("UPDATE remote_outbox SET sent_at=? WHERE id=?", (now or _now(), event_id))
+        self._release_failed_plans([event_id])
 
     def mark_remote_events_sent(self, event_ids: List[int], now: Optional[int] = None) -> None:
         if not event_ids:
@@ -242,6 +255,27 @@ class Database:
         placeholders = ",".join("?" for _ in event_ids)
         self.conn.execute("UPDATE remote_outbox SET sent_at=? WHERE id IN (" + placeholders + ")",
                           [now or _now()] + list(event_ids))
+        self._release_failed_plans(event_ids)
+
+    def _release_failed_plans(self, event_ids: List[int]) -> None:
+        """Valley now holds this job's `failed` event, so the run's outcome is
+        known: lift its Plan's started tombstone, letting a retry the user asks
+        for start fresh. Runs after the ack is stored; a crash in between only
+        keeps the (safe) block."""
+        rows = []
+        for start in range(0, len(event_ids), 500):  # under SQLite's variable limit
+            chunk = list(event_ids[start:start + 500])
+            rows += self.conn.execute(
+                "SELECT job_id, attempt_id, payload FROM remote_outbox WHERE sent_at IS NOT NULL AND id IN ("
+                + ",".join("?" for _ in chunk) + ")", chunk).fetchall()
+        for row in rows:
+            try:
+                kind = json.loads(row["payload"]).get("type")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if kind == "failed":
+                self.conn.execute("DELETE FROM remote_plan_started WHERE job_id=? AND attempt_id=?",
+                                  (row["job_id"], row["attempt_id"]))
 
     def prune_sent_remote_events(self, before: int) -> int:
         """Delete acknowledged events sent before `before` (epoch seconds).
@@ -416,6 +450,11 @@ class Database:
             (bucket_id, at or _now(), float(sample.used_pct), sample.reset_at, sample.source),
         )
         return int(cur.lastrowid)
+
+    def latest_sample_at(self, source: str) -> Optional[int]:
+        """Time of the newest sample from `source` (e.g. "statusline")."""
+        row = self.conn.execute("SELECT MAX(at) FROM sample WHERE source=?", (source,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
 
     def latest_samples(self) -> List[Dict[str, Any]]:
         """One row per bucket: the newest sample joined with bucket metadata."""
