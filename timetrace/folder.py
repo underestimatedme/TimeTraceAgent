@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, Tuple
 
 GIT = "git"
 FOLDER = "folder"
-KINDS = (GIT, FOLDER)
+PROJECT_ROOT = "project_root"
+KINDS = (GIT, FOLDER, PROJECT_ROOT)
 OUTPUT_ROOT = "timetrace-out"
 OUTPUT_NAME = re.compile(r"[A-Za-z0-9._-]{1,80}")
 SNAPSHOT_LIMIT = 50_000

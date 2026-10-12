@@ -155,7 +155,7 @@ class CloudClient:
                          extras: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """`extras`: the protocol-2 fields (protocol_version, agent_version,
         accepting_local, health, reset_credits)."""
-        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1}
+        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1}
         for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits"):
             if extras and key in extras:
                 body[key] = extras[key]

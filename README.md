@@ -60,6 +60,19 @@ Codex 的 workspace-write 沙箱只额外放行提交所需的几处 git 元数�
 
 ### 非 Git 工作区（素材文件夹）
 
+项目父目录需明确登记，可在同一台电脑添加多个：
+
+```sh
+timetrace workspace add ~/code --kind project_root --name App项目
+timetrace workspace add ~/videos --kind project_root --name 视频项目
+timetrace workspace list
+timetrace agent doctor
+```
+
+在手机目标中选择电脑和父目录，再填写项目目录名（例如 `sleepearlier` 或 `旅行 视频`）。父目录不能直接执行任务。首次执行会在缺失的子目录创建独立 Git 仓库和初始空提交；已有独立 Git 仓库直接复用，已有普通目录按下述文件夹工作区方式执行。聊天、复核、检查和续跑不会创建缺失子目录。目录名必须为一层，最长 128 个 Unicode 字符、255 个 UTF-8 字节；拒绝隐藏名称、路径分隔符、控制字符及跨平台保留名称。符号链接和 Git worktree 不能作为项目目录。
+
+项目父目录只上报直接子目录名、类型和少量 README 上下文，不上报本机完整路径。每个父目录最多 500 个项目候选；README 最多 2048 字节/项目、65536 字节/父目录。隐藏、缓存、构建、`timetrace-out`、符号链接、Git worktree 和含嵌套仓库的普通目录会排除；扫描不完整时手机不能导入全部。Agent 库存包含 `project_directories_version: 1`，以便手机判断是否支持。
+
 `timetrace workspace add <路径>` 自动判断类型：目录里有 `.git` 就是 Git 仓库，否则登记为文件夹工作区（`--kind git|folder` 可强制）。文件夹工作区没有 worktree、分支和提交：每个任务在 `<文件夹>/timetrace-out/<名称>/` 里执行（名称为任务下发的 `output_name`，否则为计划 id），AI 只能写这个目录，素材只读。运行前后电脑端对 `timetrace-out/` 以外的文件做路径 / 大小 / 修改时间快照比对，任何改动都会让任务失败并列出被改动的文件（最多 20 个）；文件超过 50,000 个时只校验顶层两级。完成后自动登记一个 `folder` 产出物（输出目录的文件清单）。
 
 并行数按工具计：`timetrace config set max_parallel_per_tool.claude <1-8>`、`max_parallel_per_tool.codex <1-8>`（默认各 2，Claude 与 Codex 的任务同时跑）；`max_parallel <1-8>` 是整台电脑的总上限（默认 0 = 各工具之和；设为 1 即逐个执行），两者都随工具清单上报给 Valley。同一 Git 仓库的多个任务各自在独立 worktree 里并行（只有创建 worktree 那一步串行）；拆分出的子任务使用服务端下发的分支名加上任务后缀 `timetrace/<阶段>/<子任务>-<8 位>`（每个任务独占一个分支；不合法时回落到 `timetrace/<id>`，与已有分支前缀冲突时直接报错）。文件夹工作区同一时刻只跑一个任务。

@@ -146,7 +146,7 @@ class Database:
     # ---- remote runner ---------------------------------------------------
     def upsert_workspace(self, workspace_id: str, name: str, path: str, default_branch: str,
                          now: Optional[int] = None, kind: str = "git") -> None:
-        if kind not in ("git", "folder"):
+        if kind not in ("git", "folder", "project_root"):
             raise ValueError("unknown workspace kind: %s" % kind)
         self.conn.execute(
             "INSERT INTO remote_workspace (id,name,path,default_branch,updated_at,kind) VALUES (?,?,?,?,?,?)"
