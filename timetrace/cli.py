@@ -22,7 +22,7 @@ from timetrace import (__version__, audit, checks, config, folder, health, limit
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
-from timetrace.credentials import CredentialStore, SessionManager
+from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
 from timetrace.dispatch import adapter_capabilities, lock_diagnostics
 from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, FAILED, RUNNABLE, RUNNING, TOOLS,
@@ -47,7 +47,7 @@ def _log(msg: str) -> None:
 
 
 def _cloud(cfg: Dict[str, Any]) -> CloudClient:
-    return CloudClient(str(cfg["cloud_base_url"]))
+    return CloudClient(str(cfg["cloud_base_url"]), device_id=device_identity(config.home()))
 
 
 def _acquire_execution_lock(home: Path):
@@ -98,6 +98,14 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
     runner credentials in the Keychain and reports inventory and quota. An
     expired code is replaced by a fresh one, up to `max_rounds` times."""
     cloud = _cloud(cfg)
+    existing = CredentialStore().load()
+    if existing is not None:
+        runner = existing.get("runner") if isinstance(existing, dict) else None
+        runner_id = runner.get("id") if isinstance(runner, dict) else None
+        if not isinstance(runner_id, str) or not runner_id or len(runner_id) > 32:
+            out("本机绑定记录无法核对，请先恢复或解绑原绑定；未创建新的配对码。")
+            return 1
+        cloud.previous_runner_id = runner_id
     name = platform.node() or "Mac"
     colour = out is print and pairscreen.color_supported()
     previous = ""
@@ -182,7 +190,7 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
                 elif exc.status == 410:
                     return None
                 elif exc.status == 409:
-                    out("本次绑定已锁定或取消；请重新开始。")
+                    out(str(exc) if exc.code == 40901 else "本次绑定已锁定或取消；请重新开始。")
                     return 1
                 elif exc.status and exc.status < 500:
                     raise
@@ -270,9 +278,8 @@ def _workspace_id(path: str) -> str:
 
 def add_workspace(db: Database, path: str, workspace_id: Optional[str] = None,
                   name: Optional[str] = None, kind: Optional[str] = None) -> Dict[str, str]:
-    """Register a workspace for remote tasks: a git repository, or (kind
-    `folder`) a plain directory of source material. The kind is detected
-    (`.git` present → git) unless given. Raises ValueError otherwise."""
+    """Register a Git repo, a source folder, or an explicit project container.
+    Auto detection selects git/folder; project_root must be requested."""
     path = str(Path(path).expanduser().resolve())
     if not Path(path).is_dir():
         raise ValueError("workspace must be a directory: %s" % path)
@@ -292,7 +299,7 @@ def add_workspace(db: Database, path: str, workspace_id: Optional[str] = None,
         timetrace_home = config.home().resolve()
         if path == "/" or folder.overlaps(path, str(timetrace_home)) or home_dir.is_relative_to(path):
             raise ValueError("folder workspace too broad: %s" % path)
-        nested = folder.nested_repository(path)
+        nested = folder.nested_repository(path) if kind == folder.FOLDER else None
         if nested:
             raise ValueError("folder workspace contains a git repository (%s); register the repository "
                              "itself, or a folder without one" % nested)
@@ -408,10 +415,19 @@ def _runner_workspaces(db: Database) -> list:
     names = {}
     for row in db.list_checks():
         names.setdefault(row["workspace_id"], []).append(row["name"])
-    return [{"id": row["id"], "name": row["name"], "default_branch": row["default_branch"],
-             "kind": row.get("kind") or "git", "checks": sorted(names.get(row["id"], [])),
-             "context": collect_workspace_context(row["path"])}
-            for row in db.list_workspaces()]
+    from .project_directories import scan
+    entries = []
+    for row in db.list_workspaces():
+        kind = row.get("kind") or folder.GIT
+        entry = {"id": row["id"], "name": row["name"], "default_branch": row["default_branch"],
+                 "kind": kind, "checks": sorted(names.get(row["id"], []))}
+        if kind == folder.PROJECT_ROOT:
+            entry["directory_inventory"] = scan(row["path"])
+            entry["enabled"] = entry["directory_inventory"]["status"] == "ok"
+        else:
+            entry["context"] = collect_workspace_context(row["path"])
+        entries.append(entry)
+    return entries
 
 
 MAX_PARALLEL_CAP = 8
@@ -1349,7 +1365,7 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("path")
     wa.add_argument("--id")
     wa.add_argument("--name")
-    wa.add_argument("--kind", choices=("git", "folder"), help="default: git when the path has .git, else folder")
+    wa.add_argument("--kind", choices=folder.KINDS, help="default: git when the path has .git, else folder")
     wa.set_defaults(fn=cmd_workspace_add)
     wl = workspace_sub.add_parser("list")
     wl.add_argument("--json", action="store_true")

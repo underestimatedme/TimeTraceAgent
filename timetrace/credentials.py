@@ -3,7 +3,51 @@ import json
 import ctypes
 import time
 import uuid
+import fcntl
+import hashlib
+import os
+import plistlib
+import re
+import subprocess
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+
+
+def _hardware_identity() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice", "-a"],
+            check=True, capture_output=True, timeout=5,
+        )
+        rows = plistlib.loads(result.stdout)
+        value = uuid.UUID(rows[0]["IOPlatformUUID"])
+        return str(value) if value.int else None
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError, plistlib.InvalidFileException):
+        return None
+
+
+def device_identity(home: Path) -> str:
+    """Stable app-scoped identifier, separate from removable login secrets."""
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(str(home / "device-id.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = home / "device-id"
+        if path.exists():
+            value = path.read_text().strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise RuntimeError("电脑标识文件损坏，请先保留文件并联系支持")
+            return value
+        source = _hardware_identity() or str(uuid.uuid4())
+        value = hashlib.sha256(("com.atlaspaces.timetrace.device:v1:" + source).encode()).hexdigest()
+        temporary = home / ".device-id.tmp"
+        fd = os.open(str(temporary), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as output:
+            output.write(value + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        return value
 
 
 class CredentialStore:

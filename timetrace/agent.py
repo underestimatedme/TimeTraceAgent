@@ -370,7 +370,7 @@ class Agent:
     def inventory_extras(self) -> Dict[str, Any]:
         """The protocol-2 inventory fields (docs/remote-control-protocol.md §3/§4)."""
         extras = {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
-                  "accepting_local": not self.locally_paused()}
+                  "accepting_local": not self.locally_paused(), "project_directories_version": 1}
         if self._health is not None:
             health = dict(self._health)
             health["sleep_prevention"] = self.sleep_state()
@@ -527,18 +527,34 @@ class Agent:
             # No workspace: the run reads nothing on this computer.
             return self._import_parse(claim)
         workspace = self.db.get_workspace(job.get("workspace_id"))
+        from . import project_directories
+        kind = job.get("kind") or "task"
+        project_root = workspace and workspace.get("kind") == folder.PROJECT_ROOT
+        try:
+            if project_root:
+                workspace = project_directories.resolve(
+                    workspace, job.get("project_directory"),
+                    allow_missing=kind == "task" and not job.get("resume_of_job_id")
+                    and not self.db.plan_started(job.get("plan_id") or job_id)
+                    and not self.db.get_checkpoint(job.get("plan_id") or job_id))
+            elif job.get("project_directory") is not None:
+                raise ValueError("project directory requires project root")
+        except (ValueError, TypeError, KeyError):
+            self._report(claim, [{"seq": 1, "type": "failed", "message": "project directory unavailable or unsafe"}])
+            self.db.update_remote_claim(job_id, "reported")
+            return "job %s → rejected (project directory unavailable or unsafe)" % job_id
         registered = Path(workspace["path"]) if workspace else None
         ws_kind = (workspace or {}).get("kind") or folder.GIT
+        pending_child = project_root and kind == "task" and registered and not registered.exists()
         # A git workspace must still be a repository; a folder workspace only
         # a directory (and only when it was registered as one).
-        if (not registered or not registered.is_dir()
+        if (not registered or (not pending_child and not registered.is_dir())
                 or str(registered.resolve()) != workspace["path"]
-                or ws_kind not in folder.KINDS
-                or (ws_kind == folder.GIT and not worktree.is_git_repo(workspace["path"]))):
+                or ws_kind not in (folder.GIT, folder.FOLDER)
+                or (ws_kind == folder.GIT and not pending_child and not worktree.is_git_repo(workspace["path"]))):
             self._report(claim, [{"seq": 1, "type": "failed", "message": "unknown workspace"}])
             self.db.update_remote_claim(job_id, "reported")
             return "job %s → rejected (unknown workspace)" % job_id
-        kind = job.get("kind") or "task"
         if kind not in JOB_KINDS:
             self._report(claim, [{"seq": 1, "type": "failed", "message": "unsupported job kind"}])
             self.db.update_remote_claim(job_id, "reported")
@@ -609,6 +625,17 @@ class Agent:
             elif (self.db.plan_started(plan_key) or (existing and existing["state"] != "claimed")
                   or (latest and latest["state"] != "claimed")):
                 return self._blocked(claim, plan_key, "checkpoint missing for previously started job; manual recovery required")
+            if project_root:
+                try:
+                    project_directories.prepare(workspace)
+                    if workspace["kind"] == folder.FOLDER and not (
+                            callable(getattr(adapter, "start_folder", None))
+                            and callable(getattr(adapter, "resume_folder", None))):
+                        raise ValueError("folder workspace unsupported")
+                except ValueError:
+                    self._report(claim, [{"seq": 1, "type": "failed", "message": "project directory preparation failed"}])
+                    self.db.update_remote_claim(job_id, "reported")
+                    return "job %s → rejected (project directory preparation failed)" % job_id
             return self._execute(claim, workspace, adapter, checkpoint, plan_key, log_file, deadline, ws_lock)
         finally:
             ws_lock.release()

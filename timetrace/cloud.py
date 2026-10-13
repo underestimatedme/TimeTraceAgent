@@ -63,10 +63,13 @@ def _segment(value: Any) -> str:
 
 
 class CloudClient:
-    def __init__(self, base_url: str, opener: Optional[Callable] = None, timeout: int = 30):
+    def __init__(self, base_url: str, opener: Optional[Callable] = None, timeout: int = 30,
+                 device_id: str = ""):
         self.base_url = check_base_url(base_url).rstrip("/")
         self.opener = opener or no_redirect_opener()
         self.timeout = timeout
+        self.device_id = device_id
+        self.previous_runner_id = ""
 
     def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
                 token: Optional[str] = None, raw: Optional[bytes] = None,
@@ -117,6 +120,7 @@ class CloudClient:
     def create_device_authorization(self, name: str, platform: str, version: str) -> Dict[str, Any]:
         return self.request("POST", "/device-authorizations", {
             "device_name": name, "platform": platform, "client_version": version,
+            **({"device_id": self.device_id} if self.device_id else {}),
         })
 
     def poll_device_authorization(self, device_code: str) -> Dict[str, Any]:
@@ -132,6 +136,8 @@ class CloudClient:
         value = self.request("POST", "/iphone/device-authorizations", {
             "device_name": name, "platform": platform, "client_version": version,
             "previous_device_code": previous_device_code,
+            **({"device_id": self.device_id} if self.device_id else {}),
+            **({"previous_runner_id": self.previous_runner_id} if self.previous_runner_id else {}),
         })
         value["pairing_version"] = 2
         return value
@@ -155,7 +161,9 @@ class CloudClient:
                          extras: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """`extras`: the protocol-2 fields (protocol_version, agent_version,
         accepting_local, health, reset_credits)."""
-        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1}
+        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1}
+        if self.device_id:
+            body["device_id"] = self.device_id
         for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits"):
             if extras and key in extras:
                 body[key] = extras[key]

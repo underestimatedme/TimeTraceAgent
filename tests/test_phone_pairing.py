@@ -76,7 +76,7 @@ class PhonePairingTest(unittest.TestCase):
                 return {'device_code':'qa-device-secret','user_code':'ABCD2345','verification_uri':link,'expires_in':300,'pairing_version':2}
             def poll_device_authorization(self,*a): return {'status':'expired'}
         out=[]
-        with patch('timetrace.cli._cloud',return_value=Cloud()):
+        with patch('timetrace.cli._cloud',return_value=Cloud()), patch('timetrace.cli.CredentialStore.load',return_value=None):
             result=cli.pair_computer({},None,None,out=lambda *a:out.append(' '.join(map(str,a))),max_rounds=1)
         self.assertEqual(result,1)
         self.assertIn('v=2','\n'.join(out))
