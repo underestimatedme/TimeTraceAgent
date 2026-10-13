@@ -11,7 +11,7 @@
 
 同一账号下同一设备只允许一个有效绑定，重复绑定会明确提示使用现有绑定或先在手机解绑；同名的不同电脑仍可分别绑定。已有绑定通过新版 Runner 的已登录库存上报登记设备标识，不需重新配对。旧记录缺少可靠标识，不能按名称自动合并，请在手机确认后解绑多余记录。
 
-服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。本次源代码升级未发布新的 Homebrew 包。
+服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。0.5.1 已发布到 GitHub Release 与 Homebrew；升级用 `brew upgrade timetraceagent`。
 
 ## 0.5.0 起：手机数字确认绑定
 
@@ -111,7 +111,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.0"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.1"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
