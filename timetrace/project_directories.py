@@ -27,7 +27,7 @@ README_BYTES = 2048
 TOTAL_README_BYTES = 65536
 EXCLUDED = {'node_modules', 'vendor', 'build', 'dist', 'target', 'out', 'cache',
             '__pycache__', 'venv', 'env', 'coverage', folder.OUTPUT_ROOT}
-DEVICE = re.compile(r'^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)', re.I)
+DEVICE = re.compile(r'^(?:con|conin\$|conout\$|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)', re.I)
 LOCAL_PATH = re.compile(r"(?<![\w:/\\])(?:[A-Za-z]:[\\/]|/|\\+)[^\s\"'<>`()\[\]]+")
 
 

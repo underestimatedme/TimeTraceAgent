@@ -197,6 +197,19 @@ class DirectoryTest(RootFixture):
         for name in ('', '.', '..', '.hidden', 'a/b', 'a\\b', 'a\x00b', 'a\x7fb', 'a\nb', 'CON', 'con.txt', 'LPT1', 'COM².txt', 'x:', 'x?', 'x*', 'x|', 'x<', 'x>', 'x"', 'x.', 'x ', 'a' * 129, '中' * 86, None, {}):
             with self.subTest(name=name), self.assertRaises(ValueError): m.validate_name(name)
 
+    def test_console_device_names_are_excluded_without_poisoning_inventory(self):
+        m = self.module()
+        unsafe = ('CONIN$', 'CONOUT$', 'conin$.txt', 'cOnOuT$.video')
+        for name in unsafe:
+            (self.root / name).mkdir()
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.validate_name(name)
+        (self.root / 'safe').mkdir()
+        inventory = m.scan(str(self.root))
+        self.assertEqual(inventory['status'], 'ok')
+        self.assertEqual(inventory['excluded_count'], 4)
+        self.assertEqual([e['directory_name'] for e in inventory['entries']], ['safe'])
+
     def test_resolver_reuses_git_folder_and_never_overwrites_root(self):
         m = self.module(); self.register()
         init_repo(self.root / 'sleep')
