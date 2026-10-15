@@ -1,4 +1,5 @@
 """Outbound-only Valley runner loop."""
+import json
 import time
 import uuid
 import hashlib
@@ -16,7 +17,7 @@ from typing import Any, Callable, Dict
 from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import Database
-from timetrace import approvals, audit, checks, folder, pause, quota, results, runner_state, worktree
+from timetrace import approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, worktree
 from timetrace.remote_control import RunControl
 from timetrace.process import tail_text
 from timetrace.redact import redact
@@ -29,7 +30,7 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
-JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse")
+JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "dev_status")
 # The import record an import_parse job belongs to (Valley's id alphabet).
 IMPORT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # A provider session id goes into argv after --resume / `exec resume`: it must
@@ -565,6 +566,9 @@ class Agent:
         if kind == "check":
             # A locally registered command; no AI tool is involved.
             return self._check_job(claim, workspace, log_file)
+        if kind == "dev_status":
+            # Fixed read-only git / gh reads; no AI tool is involved.
+            return self._dev_status_job(claim, workspace)
         provider = job.get("provider")
         adapter = self.adapters.get(provider)
         if adapter is None:
@@ -1736,6 +1740,32 @@ class Agent:
         finally:
             slot.release()
 
+    def _dev_status_job(self, claim, workspace):
+        """Development facts of this repository (branch, HEAD, changed file
+        names, the named documents) and of the named GitHub PRs through the
+        local gh. Reads only; the job's spec is data, never a command."""
+        job = claim["job"]
+        job_id = job["id"]
+        try:
+            spec = json.loads(job.get("prompt") or "")
+            if not isinstance(spec, dict):
+                raise ValueError
+        except (TypeError, ValueError):
+            return self._fail(claim, "invalid dev status request", "rejected (invalid dev status request)")
+        if (workspace.get("kind") or folder.GIT) != folder.GIT:
+            return self._fail(claim, "not a repository", "rejected (not a repository)")
+        self._report(claim, [{"seq": 1, "type": "running", "message": "正在读取开发状态"}], flush=False)
+        try:
+            facts = dev_status.collect(workspace["path"], spec, deadline=self._deadline(claim) - 15)
+        except Exception as exc:
+            self._report(claim, [{"seq": 2, "type": "failed", "message": "采集出错：%s" % exc.__class__.__name__}])
+            self.db.update_remote_claim(job_id, "reported")
+            return "job %s → dev status failed" % job_id
+        self._report(claim, [{"seq": 2, "type": "completed", "message": "开发状态已采集", "result_summary": "开发状态已采集",
+                              "dev_status": facts}])
+        self.db.update_remote_claim(job_id, "reported")
+        return "job %s → dev status collected" % job_id
+
     def run_forever(self, interval: int = 5, log: Callable[[str], None] = None) -> None:
         """Claim and run until stop() (the SIGTERM/SIGINT handlers call it).
         A KeyboardInterrupt also cancels the running jobs before it returns."""
@@ -1895,6 +1925,8 @@ class Agent:
                 event[key] = results.redact_all(event[key])
         if "import_result" in event:
             event["import_result"] = results.redact_deep(event["import_result"])
+        if "dev_status" in event:
+            event["dev_status"] = results.redact_deep(event["dev_status"])
         if isinstance(event.get("check_result"), dict):
             check = results.redact_all(event["check_result"])
             check["output_tail"] = (checks.bounded_tail(check.get("output_tail") or "")
