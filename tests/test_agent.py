@@ -973,7 +973,10 @@ class RecoveryFenceTest(unittest.TestCase):
                 self.flushed = True
                 super().flush()
         output = Output()
+        # This checks crash-lock diagnostics, not the host's disk capacity.
+        # A real low-disk report prevents claims, so the fixture never exits.
         with redirect_stdout(output), patch("timetrace.agent.time.sleep"), \
+                patch("timetrace.cli.health.check", return_value={"disk_free_gb": 10}), \
                 patch("timetrace.cli._open", return_value=(self.home, {"max_parallel": 1}, self.db)), \
                 patch("timetrace.cli._cloud", return_value=self.cloud), \
                 patch("timetrace.cli._adapters", return_value={"codex": self.adapter}), \

@@ -59,6 +59,18 @@ class LocalGitTest(Repo):
         git("remote", "remove", "origin", cwd=self.repo)
         self.assertEqual(dev_status.local_git(str(self.repo))["remote"], "")
 
+    def test_status_failure_never_reports_a_clean_repository(self):
+        for exit_code in (1, 124):
+            with self.subTest(exit_code=exit_code):
+                def failing_status(argv, **kwargs):
+                    if "status" in argv:
+                        return exit_code, "", "private path or credential"
+                    return dev_status.run(argv, **kwargs)
+                facts = dev_status.local_git(str(self.repo), run=failing_status)
+                self.assertEqual(facts["status"], "failed")
+                self.assertNotIn("dirty", facts)
+                self.assertNotIn("private path", json.dumps(facts))
+
     def test_not_a_repository_is_a_failure_not_empty_facts(self):
         facts = dev_status.local_git(str(self.d))
         self.assertEqual(facts["status"], "failed")
@@ -74,6 +86,19 @@ class DocTest(Repo):
         self.assertFalse(facts["dirty"])
         self.assertIn("目标：提醒功能", facts["excerpt"])
         self.assertNotIn(SECRET, facts["excerpt"])
+
+    def test_git_failure_never_reports_fresh_or_clean_document(self):
+        for command in ("log", "rev-list", "status"):
+            with self.subTest(command=command):
+                def failing_git(argv, **kwargs):
+                    if command in argv:
+                        return 124, "", "private path or credential"
+                    return dev_status.run(argv, **kwargs)
+                facts = dev_status.doc_facts(str(self.repo), "docs/handoff.md", run=failing_git)
+                self.assertEqual(facts["status"], "failed")
+                self.assertNotIn("dirty", facts)
+                self.assertNotIn("commits_since", facts)
+                self.assertNotIn("private path", json.dumps(facts))
 
     def test_paths_outside_or_sensitive_are_not_read(self):
         (self.d / "outside.md").write_text("outside")
