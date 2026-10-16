@@ -91,7 +91,9 @@ def local_git(path: str, run: Runner = run) -> Dict[str, Any]:
     code2, head, _ = _git(path, "rev-parse", "HEAD", run=run)
     if code != 0 or code2 != 0:
         return {"status": "failed", "message": "读取仓库失败（不是 Git 仓库或还没有提交）"}
-    _, status, _ = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=normal", run=run)
+    status_code, status, _ = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=normal", run=run)
+    if status_code != 0:
+        return {"status": "failed", "message": "读取仓库改动失败，请重试（不能判断工作区是否干净）"}
     entries = _status_entries(status)
     code, remote, _ = _git(path, "remote", "get-url", "origin", run=run)
     _, subject, _ = _git(path, "log", "-1", "--format=%s", "HEAD", run=run)
@@ -128,13 +130,19 @@ def doc_facts(root: str, rel: str, run: Runner = run) -> Dict[str, Any]:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return {"path": rel, "status": "failed", "message": "不是文本文件"}
-    _, log, _ = _git(root, "log", "-1", "--format=%H%x09%cI", "--", rel, run=run)
+    code, log, _ = _git(root, "log", "-1", "--format=%H%x09%cI", "--", rel, run=run)
+    if code != 0:
+        return {"path": rel, "status": "failed", "message": "读取文档提交记录失败，请重试"}
     last, last_at = (log.strip().split("\t") + ["", ""])[:2] if log.strip() else ("", "")
     since = 0
     if last:
         code, count, _ = _git(root, "rev-list", "--count", "%s..HEAD" % last, run=run)
-        since = int(count.strip()) if code == 0 and count.strip().isdigit() else 0
-    _, status, _ = _git(root, "status", "--porcelain=v1", "--untracked-files=normal", "--", rel, run=run)
+        if code != 0 or not count.strip().isdigit():
+            return {"path": rel, "status": "failed", "message": "读取文档之后的提交数失败，请重试"}
+        since = int(count.strip())
+    code, status, _ = _git(root, "status", "--porcelain=v1", "--untracked-files=normal", "--", rel, run=run)
+    if code != 0:
+        return {"path": rel, "status": "failed", "message": "读取文档改动失败，请重试"}
     return {
         "path": rel, "status": "ok", "sha256": hashlib.sha256(data).hexdigest(), "size": size,
         "excerpt": redact(text[:EXCERPT_CHARS]), "last_commit": last, "last_commit_at": last_at,
