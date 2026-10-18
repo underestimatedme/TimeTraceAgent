@@ -11,7 +11,7 @@
 
 同一账号下同一设备只允许一个有效绑定，重复绑定会明确提示使用现有绑定或先在手机解绑；同名的不同电脑仍可分别绑定。已有绑定通过新版 Runner 的已登录库存上报登记设备标识，不需重新配对。旧记录缺少可靠标识，不能按名称自动合并，请在手机确认后解绑多余记录。
 
-服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。0.5.2 已发布到 [GitHub Release](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)；Homebrew 0.5.2 公式更新见 [PR #3](https://github.com/underestimatedme/homebrew-timetrace/pull/3)，合并后可用 `brew update && brew upgrade timetraceagent`。
+服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。0.5.2 已发布到 [GitHub Release](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)；Homebrew 0.5.2 公式更新见 [PR #3](https://github.com/underestimatedme/homebrew-timetrace/pull/3)，2026-10-18 按用户要求暂缓，保留 PR 待后续恢复。
 
 ## 0.5.0 起：手机数字确认绑定
 
@@ -106,7 +106,7 @@ timetrace workspace check remove TimeTrace build
 
 0.5.2 包含只读开发状态采集、Git 读取失败时的正确报告，以及多电脑时间偏差导致事件回执失败的修复。先部署包含 `server_now` 的 Valley 服务端，再升级 Agent。旧服务端缺少该字段时仍使用本地时间；已持久化的事件保持原时间戳，系统时钟仍应同步。
 
-0.5.2 已发布，下面的 pipx 命令可直接安装新版。Homebrew 版本取决于上面的公式更新状态。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
+0.5.2 已发布，下面的 pipx 命令可直接安装新版。Homebrew 0.5.2 更新暂缓，当前公式尚未提供本版。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
 
 ## 安装
 
