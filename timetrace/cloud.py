@@ -6,6 +6,10 @@ servers), certificate verification by the default SSL context, no redirects
 timeout on every call and a bounded response size."""
 import ipaddress
 import json
+import re
+import threading
+import time
+from datetime import datetime, timezone
 import uuid
 import urllib.error
 import urllib.parse
@@ -70,6 +74,43 @@ class CloudClient:
         self.timeout = timeout
         self.device_id = device_id
         self.previous_runner_id = ""
+        self._observation_lock = threading.Lock()
+        self._observation_anchor = None
+        self._last_observation = None
+
+    def _observe_server_clock(self, response) -> None:
+        # The authenticated lease response timestamps the server-side operation.
+        # Anchor it at receipt and advance only by monotonic elapsed time; never
+        # adjust the user's clock or rewrite timestamps already in the outbox.
+        raw = response.get("server_now") if isinstance(response, dict) else None
+        if not isinstance(raw, str):
+            return
+        try:
+            raw = re.sub(r"\.(\d{1,9})(?=Z$|[+-]\d{2}:\d{2}$)",
+                         lambda m: "." + m.group(1)[:6].ljust(6, "0"), raw)
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return
+            timestamp = parsed.timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return
+        with self._observation_lock:
+            # Parallel claim/renew responses may arrive out of order.
+            if self._observation_anchor is None or timestamp >= self._observation_anchor[0]:
+                self._observation_anchor = (timestamp, time.monotonic())
+
+    def observed_now(self) -> str:
+        with self._observation_lock:
+            if self._observation_anchor is None:
+                # Older servers omit server_now; retain the previous behaviour.
+                observed = datetime.now(timezone.utc)
+            else:
+                timestamp, started = self._observation_anchor
+                value = timestamp + max(0.0, time.monotonic() - started)
+                value = max(value, self._last_observation or value)
+                self._last_observation = value
+                observed = datetime.fromtimestamp(value, timezone.utc)
+        return observed.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
                 token: Optional[str] = None, raw: Optional[bytes] = None,
@@ -179,7 +220,9 @@ class CloudClient:
         return self.request("POST", "/runner/quota/samples", {"samples": samples}, token)
 
     def claim(self, token: str) -> Optional[Dict[str, Any]]:
-        return self.request("POST", "/runner/jobs/claim", {"wait_seconds": 0}, token)
+        value = self.request("POST", "/runner/jobs/claim", {"wait_seconds": 0}, token)
+        self._observe_server_clock(value)
+        return value
 
     def append_events(self, token: str, job_id: str, attempt_id: str, epoch: int, events: list) -> Dict[str, Any]:
         return self.request("POST", "/runner/attempts/%s/events" % _segment(attempt_id), {
@@ -187,9 +230,11 @@ class CloudClient:
         }, token)
 
     def renew(self, token: str, attempt_id: str, epoch: int) -> Dict[str, Any]:
-        return self.request("POST", "/runner/attempts/%s/renew" % _segment(attempt_id), {
+        value = self.request("POST", "/runner/attempts/%s/renew" % _segment(attempt_id), {
             "lease_epoch": epoch,
         }, token)
+        self._observe_server_clock(value)
+        return value
 
 
 def _int(value: Any) -> int:
