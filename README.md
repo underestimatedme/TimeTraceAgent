@@ -373,8 +373,14 @@ lease-fenced attempt without a trustworthy terminal remains unknown.
 Outbox retries, including after restart, retain the
 original timestamp and event sequence. The server separately records receipt
 time, validates observation order and lease/clock bounds, and uses occurrence
-time for report day slicing. Keep the runner clock synchronized; deploy the
-Valley nullable `observed_at` migration before this runner update. Legacy outbox
+time for report day slicing. When claim/renew responses include `server_now`,
+new observations use that authenticated server timestamp plus monotonic elapsed
+time rather than the computer's wall clock. Out-of-order responses and clock
+corrections cannot move recorded observations backwards. Older servers retain
+local-UTC behaviour, so keep the system clock synchronized for compatibility
+and local lease deadlines. This does not extend a lease or rewrite pending
+outbox events. Deploy the Valley `server_now` addition before this runner fix;
+the existing nullable `observed_at` migration remains required. Legacy outbox
 events without this field remain unknown report measurements, not zero-duration
 execution. Existing expired-lease reporting restrictions remain in force.
 

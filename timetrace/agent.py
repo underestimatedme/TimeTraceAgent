@@ -1867,8 +1867,10 @@ class Agent:
             pool.shutdown(wait=False)
         log("stopped")
 
-    @staticmethod
-    def _observed_now():
+    def _observed_now(self):
+        clock = getattr(self.cloud, "observed_now", None)
+        if callable(clock):
+            return clock()
         return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _report(self, claim: Dict[str, Any], events: list, flush=True) -> None:
