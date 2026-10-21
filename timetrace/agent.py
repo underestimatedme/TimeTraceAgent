@@ -660,6 +660,10 @@ class Agent:
             return 0.0
 
     def _gate(self, adapter, job, deadline):
+        from .routing import problem
+        routing_problem = problem(adapter, job)
+        if routing_problem:
+            return routing_problem
         reason = deny_reason(DispatchGate(
             cancelled=job.get("status") == "cancelled" or job.get("desired_action") == "cancel",
             lease_valid=deadline > time.time(), runner_online=True, dependencies_ready=True,

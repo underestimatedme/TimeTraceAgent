@@ -333,6 +333,9 @@ class CodexAdapter(ToolAdapter):
     def plan_tier(self) -> Optional[str]:
         return tiers.codex_plan_tier(self._auth_path())
 
+    def routing_account_key(self) -> Optional[str]:
+        return tiers.codex_account_key(self._auth_path(), digest_length=64)
+
     def account_key(self) -> Optional[str]:
         return tiers.codex_account_key(self._auth_path())
 
