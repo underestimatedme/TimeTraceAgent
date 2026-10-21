@@ -11,7 +11,12 @@ def identity(adapter):
     try:
         provider = getattr(adapter, "name", "")
         key = adapter.routing_account_key()
-        model = (getattr(adapter, "cfg", {}) or {}).get("model")
+        cfg = getattr(adapter, "cfg", {}) or {}
+        model = cfg.get("model")
+        # Extra CLI arguments can override --model or select a fallback.
+        # Their semantics vary by provider; do not claim a strict model proof.
+        if cfg.get("extra_args"):
+            model = None
         if provider not in ("codex", "claude") or not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
             return "", ""
         if not isinstance(model, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,99}", model):

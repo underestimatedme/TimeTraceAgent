@@ -20,3 +20,9 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(identity(a),('account-codex-'+'a'*64,''))
         a.routing_account_key=lambda:None
         self.assertEqual(identity(a),('',''))
+
+    def test_extra_arguments_cannot_override_reported_model(self):
+        a = Adapter()
+        for args in (["--model", "other"], ["--fallback-model=other"], ["-c", "model=other"]):
+            a.cfg = {"model": "explicit-test-model", "extra_args": args}
+            self.assertEqual(identity(a), ("account-codex-" + "a" * 64, ""))
