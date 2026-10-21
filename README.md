@@ -413,3 +413,5 @@ uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
 服务端领取结果携带所需账号、模型；执行器在开始、续租和创建进程前核对本地实际登录与模型配置。切换账号、切换模型或 profile 不匹配会阻止运行。旧任务在所属账号未启用新规则时保持兼容。
 
 当前同一供应商在一台电脑上仍使用其默认终端配置；多个账号可分布于已绑定的不同电脑。此分支尚未发布为 Homebrew 版本，不能把当前稳定版的安装成功当作协议已支持。
+
+模型需显式配置，例如 `tta config set claude.model sonnet`。Codex 使用该账号 `model/list` 返回的模型 ID：`tta config set codex.model <模型ID>`。修改后按命令提示重启 Runner，网页刷新「AI 账号与模型」即可看到上报结果。
