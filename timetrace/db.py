@@ -200,7 +200,7 @@ class Database:
         job = claim["job"]
         # An import_parse prompt is a whole shared conversation: it is never
         # kept on disk here (it has no workspace either).
-        prompt = "" if job.get("kind") == "import_parse" else job.get("prompt") or ""
+        prompt = "" if job.get("kind") in ("import_parse", "planning") else job.get("prompt") or ""
         self.conn.execute(
             "INSERT INTO remote_claim (job_id,attempt_id,lease_epoch,workspace_id,tool_id,prompt,state,updated_at)"
             " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "

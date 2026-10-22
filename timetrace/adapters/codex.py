@@ -20,7 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from timetrace import __version__
-from timetrace.adapters.base import CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
+from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
 from timetrace.models import CODEX, RunResult, Sample
 from timetrace.billing import billing_env_keys, codex_verifier, sanitized_env
@@ -375,6 +375,12 @@ class CodexAdapter(ToolAdapter):
         sandbox pinned through config, no writable roots) with the review
         rules, always a new thread."""
         return self.chat(prompt, cwd, "", log_file, cancel_event, rules=REVIEW_RULES)
+
+    def plan(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
+        """One read-only project planning request: a chat turn's argv (read-only
+        sandbox pinned through config, no writable roots, no git repository
+        required) with the planning rules, always a new thread."""
+        return self.chat(prompt, cwd, "", log_file, cancel_event, rules=PLANNING_RULES)
 
     def parse_import(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
         """One read-only conversation import: a chat turn's argv (read-only

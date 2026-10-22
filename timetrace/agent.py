@@ -30,7 +30,7 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
-JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "dev_status")
+JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status")
 # The import record an import_parse job belongs to (Valley's id alphabet).
 IMPORT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # A provider session id goes into argv after --resume / `exec resume`: it must
@@ -524,7 +524,7 @@ class Agent:
                 and existing["state"] in ("launching", "running", "reported")):
             return "job %s → duplicate ignored" % job_id
         self.db.save_remote_claim(claim)  # durable before any local process starts
-        if job.get("kind") == "import_parse":
+        if job.get("kind") in ("import_parse", "planning"):
             # No workspace: the run reads nothing on this computer.
             return self._import_parse(claim)
         workspace = self.db.get_workspace(job.get("workspace_id"))
@@ -1591,26 +1591,28 @@ class Agent:
         finally:
             slot.release()
 
-    # ---- import_parse: a shared conversation → import proposal -------------
+    # ---- isolated text jobs: import proposal or project planning ----------
     def _import_parse(self, claim):
-        """Turn a shared conversation (all of it in the prompt) into the JSON
-        import proposal: the local AI runs read-only (chat_turn argv, always a
+        """Turn scoped input into an import proposal or project plan: the local AI runs read-only (chat_turn argv, always a
         new session) in a fresh empty directory ~/.timetrace/imports/<job>,
         removed afterwards. No workspace, worktree or checkpoint; the same
         zero-spend gate, lease and fencing as a chat turn, one slot of its
         tool plus an overall slot."""
         job = claim["job"]
         job_id = job["id"]
-        import_id = job.get("import_id")
+        is_planning = job.get("kind") == "planning"
+        import_id = job.get("planning_job_id" if is_planning else "import_id")
         if not isinstance(import_id, str) or not IMPORT_ID.fullmatch(import_id):
-            return self._fail(claim, "invalid import", "rejected (invalid import)")
+            reason = "invalid planning job" if is_planning else "invalid import"
+            return self._fail(claim, reason, "rejected (%s)" % reason)
         provider = job.get("provider")
         adapter = self.adapters.get(provider)
         if adapter is None:
             return self._fail(claim, "tool unavailable", "rejected (tool unavailable)")
-        parse = getattr(adapter, "parse_import", None)
+        parse = getattr(adapter, "plan" if is_planning else "parse_import", None)
         if not callable(parse):
-            return self._fail(claim, "import unsupported", "rejected (import unsupported)")
+            reason = "planning unsupported" if is_planning else "import unsupported"
+            return self._fail(claim, reason, "rejected (%s)" % reason)
         prompt = job.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return self._fail(claim, "invalid prompt", "rejected (invalid prompt)")
@@ -1635,7 +1637,7 @@ class Agent:
                 if found is None:
                     event["message"] += "; " + results.INVALID_IMPORT_NOTE
                     return "parsed (invalid)", event
-                event["import_result"] = found
+                event["planning_result" if is_planning else "import_result"] = found
                 return "parsed", event
 
             Path(log_file).touch(exist_ok=True)

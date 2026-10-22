@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from timetrace.adapters.base import CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
+from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace.billing import billing_env_keys, claude_verifier
 from timetrace import tiers
 from timetrace.adapters import claude_usage
@@ -354,6 +354,14 @@ class ClaudeAdapter(ToolAdapter):
         a new session."""
         session_id = str(uuid.uuid4())
         cmd = build_chat_cmd(self.cfg, prompt, session_id=session_id, rules=REVIEW_RULES)
+        return self._run(cmd, cwd, log_file, session_id, cancel_event)
+
+    def plan(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
+        """One read-only project planning request: a chat turn's argv (plan mode,
+        user settings only, no MCP server) with the planning rules, always in
+        a new session."""
+        session_id = str(uuid.uuid4())
+        cmd = build_chat_cmd(self.cfg, prompt, session_id=session_id, rules=PLANNING_RULES)
         return self._run(cmd, cwd, log_file, session_id, cancel_event)
 
     def parse_import(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
