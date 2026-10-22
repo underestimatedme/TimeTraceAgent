@@ -387,6 +387,18 @@ def cmd_workspace_check(args: argparse.Namespace) -> int:
     if not checks.valid_name(args.name):
         print("error: check name must match [a-z0-9_-]{1,40}: %r" % args.name, file=sys.stderr)
         return 2
+    if args.check_cmd == "trust":
+        from . import objective_checks
+        argv = db.get_check(workspace["id"], args.name)
+        try:
+            contract = objective_checks.register(workspace["path"], args.name, argv or [],
+                                                 args.objective, args.checker, args.protect)
+        except (ValueError, OSError) as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 2
+        db.save_objective_check(workspace["id"], args.name, contract)
+        print("objective contract registered: %s (%s)" % (args.name, contract["version"]))
+        return 0
     if args.check_cmd == "remove":
         if not db.remove_check(workspace["id"], args.name):
             print("no check %s in workspace %s" % (args.name, workspace["id"]), file=sys.stderr)
@@ -426,6 +438,10 @@ def _runner_workspaces(db: Database) -> list:
             entry["enabled"] = entry["directory_inventory"]["status"] == "ok"
         else:
             entry["context"] = collect_workspace_context(row["path"])
+        from .objective_checks import inventory
+        contracts = inventory(db, row["id"])
+        if contracts:
+            entry["objective_checks"] = contracts
         entries.append(entry)
     return entries
 
@@ -1380,6 +1396,13 @@ def build_parser() -> argparse.ArgumentParser:
     wr.set_defaults(fn=cmd_workspace_remove)
     wc = workspace_sub.add_parser("check", help="check commands a step's automatic acceptance may run")
     wc_sub = wc.add_subparsers(dest="check_cmd", required=True)
+    trust = wc_sub.add_parser("trust", help="bind a finite objective to an independent external checker")
+    trust.add_argument("workspace")
+    trust.add_argument("name")
+    trust.add_argument("--objective", required=True)
+    trust.add_argument("--checker", required=True)
+    trust.add_argument("--protect", action="append", default=[])
+    trust.set_defaults(fn=cmd_workspace_check)
     wca = wc_sub.add_parser("add", help="register: timetrace workspace check add <workspace> <name> -- <command...>")
     wca.add_argument("workspace", help="workspace id, name or path")
     wca.add_argument("name", help="[a-z0-9_-]{1,40}")

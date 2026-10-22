@@ -655,7 +655,11 @@ class Agent:
             value = re.sub(r"\.(\d{1,9})(?=Z$|[+-]\d{2}:\d{2}$)",
                            lambda match: "." + match.group(1)[:6].ljust(6, "0"),
                            lease["lease_expires_at"])
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            deadline = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            policy_end = lease.get("job", {}).get("autonomy_deadline")
+            if policy_end:
+                deadline = min(deadline, Agent._deadline({"lease_expires_at": policy_end}))
+            return deadline
         except (KeyError, TypeError, ValueError, AttributeError):
             return 0.0
 
@@ -705,7 +709,7 @@ class Agent:
             claim["job"]["desired_action"] = "cancel"
         if control is not None:
             control.apply_lease(lease)
-        renewed = self._deadline(lease)
+        renewed = self._deadline(dict(lease, job=claim["job"]))
         # Include time spent in the renewal request: a late response cannot
         # bridge an interval in which this owner no longer held a lease.
         if time.time() >= deadline and claim["job"].get("desired_action") != "cancel":
@@ -1690,6 +1694,13 @@ class Agent:
         argv = self.db.get_check(workspace["id"], name) if checks.valid_name(name) else None
         if argv is None:
             return self._fail(claim, checks.UNKNOWN, "rejected (unknown check)")
+        from . import objective_checks
+        contract = None
+        if job.get("check_contract_version"):
+            contract = self.db.get_objective_check(workspace["id"], name)
+            if (not contract or contract["version"] != job["check_contract_version"]
+                    or not objective_checks.valid(contract, argv)):
+                return self._fail(claim, "客观检查器版本已变化，需要人工核对", "rejected (contract changed)")
         deadline = self._deadline(claim)
         gate = lambda at: self._check_gate(job, at)
         reason = self._stop_reason() or gate(deadline)
@@ -1705,6 +1716,9 @@ class Agent:
             return self._busy(job_id, exc)
 
         def work(cwd):
+            if contract:
+                return lambda cancel: objective_checks.run(contract, argv, cwd, log_file, cancel,
+                                                           extra_drop=self.check_env_drop, keep=self.check_env_keep)
             return lambda cancel: checks.run(name, argv, cwd, log_file, cancel,
                                              extra_drop=self.check_env_drop, keep=self.check_env_keep)
 
@@ -1718,6 +1732,8 @@ class Agent:
                 message = "检查未通过（退出码 %d）" % result.exit_code
             event = {"seq": 2, "type": "completed", "message": message, "result_summary": message,
                      "verdict": verdict, "check_result": result.as_event()}
+            if contract:
+                event["check_result"].update(result.objective_evidence)
             if out_dir is None:
                 event["checked_branch"], event["checked_commit"] = detail
             else:

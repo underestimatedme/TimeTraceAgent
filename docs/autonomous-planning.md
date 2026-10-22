@@ -11,3 +11,7 @@ The agent uses the same isolated text-job transport as `import_parse`: fresh pri
 Valley validates the draft and performs canonical Task/Pipeline application. Agent planning is not permission to execute it directly. Subsequent task / check / review jobs continue using the existing protocol. Registration of a local check remains an explicit local setup action; the server sends only its registered name. A selected check runs after output is committed, in an isolated checkout. The model is told not to request the same shell test again.
 
 `tests/live_autonomy.py` is an explicit opt-in driver run by Valley's `TestAutonomyLiveCodex`; it accepts only a loopback fixture and a fresh test directory, uses the existing selected adapter configuration, and reports independent tests and the explicit final test-user acceptance separately. Default provider is Codex; `TIMETRACE_A1_LIVE_PROVIDER=claude` selects an already configured Claude subscription. It never switches automatically after failure. See the TimeTrace A1 QA record for invocation and limits.
+
+## A2 extension
+
+The A1 contract above remains supported. Objective autonomous completion adds operator-owned check contracts and round deadline enforcement; see [objective check contracts](autonomous-objective-checks.md). Arbitrary goal prose and AI self-review remain insufficient for automatic final receipt.

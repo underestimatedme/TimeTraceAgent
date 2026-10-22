@@ -105,6 +105,10 @@ CREATE TABLE IF NOT EXISTS workspace_check (
     updated_at   INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, name)
 );
+CREATE TABLE IF NOT EXISTS objective_check (
+    workspace_id TEXT NOT NULL, name TEXT NOT NULL, contract TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, name)
+);
 CREATE TABLE IF NOT EXISTS remote_plan_started (
     plan_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -168,11 +172,21 @@ class Database:
 
     # ---- local check commands (only ever registered on this computer) -----
     def save_check(self, workspace_id: str, name: str, argv: List[str], now: Optional[int] = None) -> None:
+        self.conn.execute("DELETE FROM objective_check WHERE workspace_id=? AND name=?", (workspace_id, name))
         self.conn.execute(
             "INSERT INTO workspace_check (workspace_id,name,argv,updated_at) VALUES (?,?,?,?)"
             " ON CONFLICT(workspace_id,name) DO UPDATE SET argv=excluded.argv,updated_at=excluded.updated_at",
             (workspace_id, name, json.dumps(list(argv), ensure_ascii=False), now or _now()),
         )
+
+    def save_objective_check(self, workspace_id, name, contract):
+        self.conn.execute("INSERT OR REPLACE INTO objective_check VALUES (?,?,?)",
+                          (workspace_id, name, json.dumps(contract, ensure_ascii=False)))
+
+    def get_objective_check(self, workspace_id, name):
+        row = self.conn.execute("SELECT contract FROM objective_check WHERE workspace_id=? AND name=?",
+                                (workspace_id, name)).fetchone()
+        return json.loads(row["contract"]) if row else None
 
     def get_check(self, workspace_id: str, name: str) -> Optional[List[str]]:
         row = self.conn.execute("SELECT argv FROM workspace_check WHERE workspace_id=? AND name=?",
