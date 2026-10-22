@@ -1699,7 +1699,8 @@ class Agent:
         if job.get("check_contract_version"):
             contract = self.db.get_objective_check(workspace["id"], name)
             if (not contract or contract["version"] != job["check_contract_version"]
-                    or not objective_checks.valid(contract, argv)):
+                    or not objective_checks.valid(contract, argv)
+                    or not objective_checks.workflow_valid(self.db, workspace["id"], contract)):
                 return self._fail(claim, "客观检查器版本已变化，需要人工核对", "rejected (contract changed)")
         deadline = self._deadline(claim)
         gate = lambda at: self._check_gate(job, at)

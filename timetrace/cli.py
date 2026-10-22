@@ -393,6 +393,9 @@ def cmd_workspace_check(args: argparse.Namespace) -> int:
         try:
             contract = objective_checks.register(workspace["path"], args.name, argv or [],
                                                  args.objective, args.checker, args.protect)
+            if args.workflow:
+                with open(args.workflow, encoding="utf-8") as stream:
+                    contract = objective_checks.with_workflow(db, workspace["id"], contract, json.load(stream))
         except (ValueError, OSError) as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
@@ -1402,6 +1405,7 @@ def build_parser() -> argparse.ArgumentParser:
     trust.add_argument("--objective", required=True)
     trust.add_argument("--checker", required=True)
     trust.add_argument("--protect", action="append", default=[])
+    trust.add_argument("--workflow", help="operator-owned JSON component DAG; final integration is automatic")
     trust.set_defaults(fn=cmd_workspace_check)
     wca = wc_sub.add_parser("add", help="register: timetrace workspace check add <workspace> <name> -- <command...>")
     wca.add_argument("workspace", help="workspace id, name or path")

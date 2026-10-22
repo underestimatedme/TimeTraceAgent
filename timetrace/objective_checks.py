@@ -6,6 +6,7 @@ hashed at registration. Optional repository fixtures are pinned as well.
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from timetrace import checks
@@ -63,8 +64,11 @@ def inventory(db, workspace_id):
     result = []
     for row in db.list_checks(workspace_id):
         contract = db.get_objective_check(workspace_id, row["name"])
-        if contract and valid(contract, row["argv"]):
-            result.append({key: contract[key] for key in ("name", "objective", "version")})
+        if contract and valid(contract, row["argv"]) and workflow_valid(db, workspace_id, contract):
+            public = {key: contract[key] for key in ("name", "objective", "version")}
+            if contract.get("steps"):
+                public["steps"] = contract["steps"]
+            result.append(public)
     return result
 
 
@@ -90,3 +94,51 @@ def run(contract, argv, cwd, log_file, cancel, **kwargs):
         "failure_class": "assertion" if result.exit_code == 1 and not result.timed_out else
                          ("none" if result.passed else "infrastructure")}
     return result
+
+
+def with_workflow(db, workspace_id, contract, manifest):
+    """Pin local single-objective registrations; final integration is implicit.
+
+    The operator supplies topologically ordered steps. Models never supply or
+    change this manifest. A dependency-free step may run alongside another.
+    """
+    if not isinstance(manifest, list) or not 1 <= len(manifest) <= 7:
+        raise ValueError("workflow needs 1-7 component steps plus final integration")
+    seen = set()
+    steps = []
+    for row in manifest:
+        if not isinstance(row, dict) or set(row) != {"key", "title", "check_name", "depends_on"}:
+            raise ValueError("each step needs key, title, check_name, depends_on")
+        key, deps, title = row["key"], row["depends_on"], row["title"]
+        if (not isinstance(key, str) or not re.fullmatch(r"[a-z0-9_]{1,40}", key)
+                or key == "objective_final" or key in seen
+                or not isinstance(title, str) or not title.strip() or len(title) > 80
+                or not isinstance(deps, list) or not all(isinstance(d, str) for d in deps)
+                or len(set(deps)) != len(deps) or any(d not in seen for d in deps)):
+            raise ValueError("use unique step keys, titles, and earlier dependencies")
+        if not isinstance(row["check_name"], str):
+            raise ValueError("invalid check name")
+        check = db.get_objective_check(workspace_id, row["check_name"])
+        argv = db.get_check(workspace_id, row["check_name"])
+        if (not check or check["name"] == contract["name"] or check.get("steps")
+                or not argv or not valid(check, argv)):
+            raise ValueError("components must reference current single-objective check contracts")
+        steps.append(dict(row, objective=check["objective"], check_version=check["version"]))
+        seen.add(key)
+    updated = dict(contract)
+    updated.pop("version", None)
+    updated["steps"] = steps
+    updated["protocol"] = 2
+    updated["version"] = digest(updated)
+    return updated
+
+
+def workflow_valid(db, workspace_id, contract):
+    for step in contract.get("steps", []):
+        check = db.get_objective_check(workspace_id, step["check_name"])
+        argv = db.get_check(workspace_id, step["check_name"])
+        if (not check or check.get("steps") or not argv
+                or check["version"] != step["check_version"]
+                or check["objective"] != step["objective"] or not valid(check, argv)):
+            return False
+    return True

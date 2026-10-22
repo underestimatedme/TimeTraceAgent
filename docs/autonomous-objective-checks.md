@@ -23,3 +23,22 @@ The measured result includes `contract_version`, `integrity_valid`, `snapshot_cl
 A task claim may carry `autonomy_deadline`. The existing lease deadline calculation caps both initial and renewed leases at that absolute round deadline, so pause/resume or renewal cannot prolong the round. Process cancellation and outbox receipts reuse existing Agent behavior.
 
 Real opt-in driver: `tests/live_objective_autonomy.py`, run by Valley's existing `TestAutonomyLiveCodex`. `TIMETRACE_A2_SCENARIO=success|repair|exhausted`; it uses an existing locally verified subscription and a fresh loopback fixture/repository. It never calls accept/redo APIs. `repair` deliberately asks the real model to leave the initial defect; `exhausted` asks it to keep the defect across retries. Both are explicit fault-injection samples, not natural model failure-rate measurements. No production credential/config files belong in reports.
+
+## Registered component workflow
+
+A complete objective can optionally pin a DAG of existing single-objective checks. Register each component first. Each component's objective becomes its exact execution brief, so include only that component's scope. The complete objective describes the final integrated behavior; its checker must verify the whole result.
+
+Create an operator-owned JSON file outside the model's checkout:
+
+```json
+[
+  {"key":"addition","title":"Addition","check_name":"addition","depends_on":[]},
+  {"key":"subtraction","title":"Subtraction","check_name":"subtraction","depends_on":[]}
+]
+```
+
+Then pass `--workflow /outside/project/workflow.json` to the existing `workspace check trust PROJECT complete --objective '...' --checker ...` command. The command snapshots each component's current objective and version, and hashes the full manifest into the complete contract (protocol 2). Inventory includes public `steps`; argv and local paths still remain local. Changing/removing any referenced registration withdraws the complete template until explicitly re-registered. Root check claims also recheck referenced registrations locally.
+
+Components must be topologically ordered, with unique keys and earlier dependencies, 1–7 components maximum; nesting is rejected. Valley appends one dedicated final integration stage depending on all components. It runs the complete checker on the final merged commit. Use `completion_version=2` in a capable client. No new Agent merge or retry engine is added: existing accepted input merges, `repair_inputs`, and independent checks apply. All N stages share 2 repairs, N+2 total check jobs, and the same absolute deadline.
+
+Opt-in driver `tests/live_objective_workflow.py` uses `TIMETRACE_A2_SCENARIO=dag_success|dag_repair` with the existing Valley loopback fixture. It creates two independent branches and a final calculator module. `dag_repair` injects one initial failure per component and verifies that the two repairs affect distinct steps. It checks Git ancestry of both accepted branches in the final commit and reruns the integration checker separately. No accept/redo calls or production credentials are used.

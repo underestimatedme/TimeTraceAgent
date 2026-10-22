@@ -84,3 +84,40 @@ class ObjectiveChecksTests(unittest.TestCase):
         self.assertEqual(Agent._deadline({'lease_expires_at':'2030-01-01T11:00:00Z'}),Agent._deadline(claim))
         claim['job']['autonomy_deadline']='invalid'
         self.assertEqual(0,Agent._deadline(claim))
+
+    def workflow_fixture(self):
+        db = Database(self.root/'workflow.sqlite')
+        self.addCleanup(db.conn.close)
+        db.save_check('w', 'unit', self.argv)
+        db.save_objective_check('w', 'unit', self.contract)
+        final = objective_checks.register(self.repo, 'all', self.argv, 'whole goal', self.checker)
+        manifest = [{'key': 'code', 'title': 'Implement code', 'check_name': 'unit', 'depends_on': []}]
+        return db, final, manifest
+
+    def test_workflow_pins_subgoals_and_revokes_on_component_change(self):
+        db, final, manifest = self.workflow_fixture()
+        workflow = objective_checks.with_workflow(db, 'w', final, manifest)
+        self.assertNotEqual(final['version'], workflow['version'])
+        self.assertEqual(self.contract['version'], workflow['steps'][0]['check_version'])
+        db.save_check('w', 'all', self.argv)
+        db.save_objective_check('w', 'all', workflow)
+        self.assertEqual(2, len(objective_checks.inventory(db, 'w')))
+        db.save_check('w', 'unit', [sys.executable, '--version'])
+        self.assertFalse(objective_checks.workflow_valid(db, 'w', workflow))
+        self.assertEqual([], objective_checks.inventory(db, 'w'))
+
+    def test_workflow_rejects_cycles_missing_checks_duplicates_and_nesting(self):
+        db, final, manifest = self.workflow_fixture()
+        invalid = [[], manifest * 8, manifest * 2,
+                   [dict(manifest[0], depends_on=['code'])],
+                   [dict(manifest[0], key='objective_final')],
+                   [dict(manifest[0], check_name='missing')],
+                   [dict(manifest[0], check_version='untrusted')]]
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                objective_checks.with_workflow(db, 'w', final, case)
+        workflow = objective_checks.with_workflow(db, 'w', final, manifest)
+        db.save_check('w', 'all', self.argv)
+        db.save_objective_check('w', 'all', workflow)
+        with self.assertRaises(ValueError):
+            objective_checks.with_workflow(db, 'w', self.contract, [dict(manifest[0], check_name='all')])
