@@ -478,8 +478,11 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any]) -> list:
     for name, adapter in adapters.items():
         binary = str(cfg.get(name, {}).get("bin", name))
         tier = adapter.plan_tier() if hasattr(adapter, "plan_tier") else None
+        from timetrace.routing import identity
+        routing_account, routing_model = identity(adapter)
         tools.append({
             "id": name + "-default", "provider": name, "version": "local",
+            "routing_version": 1, "routing_account": routing_account, "routing_model": routing_model,
             "can_enforce_zero_spend": adapter_capabilities(adapter).get("can_enforce_zero_spend") is True,
             "status": "available" if shutil.which(binary) else "unavailable",
             "plan_tier": tier or "",
@@ -1005,8 +1008,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("%s = %s" % (key, config.format_value(cfg.get(key))))
             for tool, value in _max_parallel_per_tool(cfg).items():
                 print("%s.%s = %d" % (config.PER_TOOL_KEY, tool, value))
-            for key in config.TOOL_BIN_KEYS:
-                print("%s = %s" % (key, (cfg.get(key.split(".")[0]) or {}).get("bin", "")))
+            for key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+                section, field = key.split(".", 1)
+                print("%s = %s" % (key, config.format_value((cfg.get(section) or {}).get(field))))
             return 0
         if args.config_cmd == "get":
             if args.key.startswith(config.PER_TOOL_KEY + "."):
@@ -1016,8 +1020,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                     config.parse_value(args.key, "1")  # raises naming the tools
                 print(limits[tool])
                 return 0
-            if args.key in config.TOOL_BIN_KEYS:
-                print((config.load(home).get(args.key.split(".")[0]) or {}).get("bin", ""))
+            if args.key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+                section, field = args.key.split(".", 1)
+                print(config.format_value((config.load(home).get(section) or {}).get(field)))
                 return 0
             if args.key not in config.scalar_keys():
                 config.parse_value(args.key, "")  # raises with the list of keys
@@ -1029,7 +1034,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 2
     print("%s = %s  (%s)" % (args.key, config.format_value(value), home / "config.json"))
     if args.key in ("cloud_base_url", "upload_output_tail", "interval_sec", "max_parallel") \
-            or args.key.startswith(config.PER_TOOL_KEY + "."):
+            or args.key.startswith(config.PER_TOOL_KEY + ".") or args.key in config.TOOL_MODEL_KEYS:
         print("restart the Runner to apply: launchctl kickstart -k gui/%d/com.atlaspaces.timetrace.agent" % os.getuid())
     if args.key in config.TOOL_BIN_KEYS:
         print("然后运行 timetrace agent install，让后台 Runner 使用它（并把它的目录加入 PATH）")

@@ -80,12 +80,12 @@ def claude_plan_tier(credentials_path: Path, keychain: Callable[[], Optional[str
     return _clean(claude_oauth(credentials_path, keychain).get("subscriptionType"))
 
 
-def _digest(value: Any) -> Optional[str]:
+def _digest(value: Any, length: int = 8) -> Optional[str]:
     text = str(value or "").strip()
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8] if text else None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:length] if text else None
 
 
-def codex_account_key(auth_path: Path) -> Optional[str]:
+def codex_account_key(auth_path: Path, digest_length: int = 8) -> Optional[str]:
     """Opaque 8-hex digest of the ChatGPT account the Codex login uses. Two
     computers on one account share a quota pool; different accounts do not."""
     tokens = _load(auth_path).get("tokens") or {}
@@ -96,11 +96,11 @@ def codex_account_key(auth_path: Path) -> Optional[str]:
         claims = _jwt_claims(str(tokens.get("id_token") or ""))
         auth = claims.get("https://api.openai.com/auth") or {}
         account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    return _digest(account)
+    return _digest(account, digest_length)
 
 
-def claude_account_key(claude_json: Path) -> Optional[str]:
+def claude_account_key(claude_json: Path, digest_length: int = 8) -> Optional[str]:
     """Opaque digest of the Claude account (`oauthAccount.accountUuid` in ~/.claude.json)."""
     account = _load(claude_json).get("oauthAccount") or {}
-    return _digest(account.get("accountUuid")) if isinstance(account, dict) else None
+    return _digest(account.get("accountUuid"), digest_length) if isinstance(account, dict) else None
 

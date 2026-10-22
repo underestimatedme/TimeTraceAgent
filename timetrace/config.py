@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -116,6 +117,7 @@ PER_TOOL_MAX = 8
 
 # `timetrace config set claude.bin /path/to/claude`: the tool binary the Runner starts.
 TOOL_BIN_KEYS = ("claude.bin", "codex.bin")
+TOOL_MODEL_KEYS = ("claude.model", "codex.model")
 # Marks a `<tool>.bin` that setup / agent install / doctor found on their own;
 # such a value is re-resolved later, one the user set is never overwritten.
 BIN_SOURCE_AUTO = "auto"
@@ -148,6 +150,11 @@ def parse_value(key: str, raw: str) -> Any:
         return _per_tool_value(key, raw)
     if key in TOOL_BIN_KEYS:
         return _tool_bin_value(key, raw)
+    if key in TOOL_MODEL_KEYS:
+        text = str(raw).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", text):
+            raise ValueError("%s expects an explicit model ID or supported alias" % key)
+        return text
     keys = scalar_keys()
     if key not in keys:
         raise ValueError("unknown or non-scalar key: %s (settable: %s)" % (key, ", ".join(sorted(keys))))
@@ -230,7 +237,7 @@ def set_value(home_dir: Path, key: str, raw: str) -> Any:
     """Validate and write one key into config.json (atomic, 0600)."""
     value = parse_value(key, raw)
     doc = load_user(home_dir)
-    if key.startswith(PER_TOOL_KEY + ".") or key in TOOL_BIN_KEYS:
+    if key.startswith(PER_TOOL_KEY + ".") or key in TOOL_BIN_KEYS + TOOL_MODEL_KEYS:
         section, sub = key.split(".", 1)
         nested = doc.get(section)
         nested = dict(nested) if isinstance(nested, dict) else {}

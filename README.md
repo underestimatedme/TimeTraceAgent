@@ -405,3 +405,13 @@ unreadable, plus a root README snapshot (README.md, README.markdown, README,
 README.txt in that order, ignoring case). Snapshots are limited to 32 KiB of
 UTF-8 and descriptions to 500 characters. Local paths and linked files are not
 uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
+
+## 项目分类执行规则（待发布）
+
+本分支支持 Valley 的 `routing_version: 1` 协议。终端清单上报登录账号的完整 SHA-256 指纹与配置中明确指定的 `claude.model` / `codex.model`；不会上传账号凭据。未指定模型时，Web 显示需要配置，不能加入允许列表。
+
+服务端领取结果携带所需账号、模型；执行器在开始、续租和创建进程前核对本地实际登录与模型配置。切换账号、切换模型或 profile 不匹配会阻止运行。旧任务在所属账号未启用新规则时保持兼容。
+
+当前同一供应商在一台电脑上仍使用其默认终端配置；多个账号可分布于已绑定的不同电脑。此分支尚未发布为 Homebrew 版本，不能把当前稳定版的安装成功当作协议已支持。
+
+模型需显式配置，例如 `tta config set claude.model sonnet`。Codex 使用该账号 `model/list` 返回的模型 ID：`tta config set codex.model <模型ID>`。修改后按命令提示重启 Runner，网页刷新「AI 账号与模型」即可看到上报结果。

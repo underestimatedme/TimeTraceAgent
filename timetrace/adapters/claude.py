@@ -281,6 +281,9 @@ class ClaudeAdapter(ToolAdapter):
     def plan_tier(self) -> Optional[str]:
         return tiers.claude_plan_tier(self.credentials_path())
 
+    def routing_account_key(self) -> Optional[str]:
+        return tiers.claude_account_key(Path(self.cfg.get("claude_json_path") or Path.home() / ".claude.json"), digest_length=64)
+
     def account_key(self) -> Optional[str]:
         return tiers.claude_account_key(Path(self.cfg.get("claude_json_path") or Path.home() / ".claude.json"))
 
