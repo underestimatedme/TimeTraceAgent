@@ -227,6 +227,18 @@ def ensure(repo: str, task_id: int, home: Path, base: str = "HEAD", branch: str 
                 raise BranchConflict("无法创建任务分支 %s：与仓库里已有的分支 %s 冲突（git 不允许一个分支名同时是"
                                      "另一个分支的目录）。请删除或改名旧分支，或给子任务换一个名字后重试。" % (branch, conflict))
             _git(*SAFE_GIT, "-C", repo, "worktree", "add", "-b", branch, str(path), base)
+        # Git copies the source checkout's config.worktree (for example Codex's
+        # localEnvironmentConfigPath). This checkout is newly created and has
+        # never been handed to a model: replace that inherited configuration
+        # before installing only the runner-owned push fence. Never do this on
+        # reuse, where extra keys must still fail the integrity check below.
+        admin = Path(_git(*SAFE_GIT, "-C", str(path), "rev-parse", "--absolute-git-dir"))
+        if admin.is_symlink() or admin.resolve().parent != Path(git_common_dir(repo)) / "worktrees":
+            raise MetadataTampered("new worktree metadata is outside the registered repository")
+        inherited = admin / "config.worktree"
+        if inherited.exists() or inherited.is_symlink():
+            _read_small(inherited)  # Refuse symlinks and non-regular files.
+            inherited.unlink()
     else:
         verify_metadata(str(path), repo)
         if _git(*SAFE_GIT, "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD") != branch:
