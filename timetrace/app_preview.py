@@ -86,7 +86,7 @@ def collect(root, commit):
             data = _git(root, 'cat-file', 'blob', oid)
             mime = {'.js':'text/javascript','.mjs':'text/javascript','.html':'text/html','.css':'text/css','.json':'application/json'}.get(suffix) or mimetypes.guess_type(relative)[0] or 'application/octet-stream'
             files.append({'path': relative, 'mime': mime, 'data': base64.b64encode(data).decode('ascii')})
-        body = json.dumps({'format':MARKER, 'commit':commit, 'entry':'index.html', 'files':files}, ensure_ascii=False, separators=(',', ':')).encode()
+        body = json.dumps({'format':MARKER, 'commit':commit, 'entry':'index.html', 'backend':'.keji/preview.json' in entries, 'files':files}, ensure_ascii=False, separators=(',', ':')).encode()
         if len(body) > 2 * 1024 * 1024:
             return None, '应用预览包超过读取上限，请让 AI 精简产物。'
         return body, ''

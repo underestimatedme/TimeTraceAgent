@@ -1867,6 +1867,9 @@ class Agent:
         running job cancelled, and at most SHUTDOWN_GRACE_SECONDS of waiting."""
         backoff = interval
         manual_diagnostics = set()
+        from timetrace.runtime_preview import RuntimePreviews
+        previews = RuntimePreviews(self)
+        previews.start()
         active = {}  # future → job id
         pool = ThreadPoolExecutor(max_workers=8 if self.remote_config is not None else self.max_parallel, thread_name_prefix="timetrace-job")
 
