@@ -45,3 +45,12 @@ class WebWorkspaceTest(unittest.TestCase):
         self.git(root,'add','.');self.git(root,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','link')
         c=inventory(self.db,row['id'])[0];argv=self.db.get_check(row['id'],c['name'])
         self.assertEqual(subprocess.run(argv,cwd=root,capture_output=True).returncode,1)
+
+    def test_add_contract_to_existing_web_created_project(self):
+        row=apply(self.home,self.db,self.spec)
+        updated=copy.deepcopy(self.spec)
+        updated.update(create=False,path=row['path'],objective='新一轮明确客观目标')
+        apply(self.home,self.db,updated)
+        self.assertEqual(len(inventory(self.db,row['id'])),2)
+        updated['id']='unregistered'
+        with self.assertRaisesRegex(ValueError,'workspace_unavailable'):apply(self.home,self.db,updated)

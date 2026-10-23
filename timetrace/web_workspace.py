@@ -93,11 +93,14 @@ def apply(home, db, spec):
     if not root.is_absolute():
         raise ValueError('workspace_unavailable')
     root = root.resolve()
-    if not spec.get('create') and (root == Path.home().resolve() or root == Path('/') or Path(home).resolve() in root.parents or root == Path(home).resolve()):
-        raise ValueError('workspace_unavailable')
     existing = db.get_workspace(spec['id'])
     if existing and existing['path'] != str(root):
         raise ValueError('local_conflict')
+    # An already registered Web-created repository may gain another contract.
+    # Do not confuse that exact managed project with arbitrary Runner home paths.
+    managed = bool(existing and root == (Path(home) / 'projects' / spec['id']).resolve())
+    if not spec.get('create') and not managed and (root == Path.home().resolve() or root == Path('/') or Path(home).resolve() in root.parents or root == Path(home).resolve()):
+        raise ValueError('workspace_unavailable')
     for row in db.list_workspaces():
         if row['path'] == str(root) and row['id'] != spec['id']:
             raise ValueError('local_conflict')
