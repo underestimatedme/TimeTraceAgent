@@ -154,7 +154,7 @@ class RemoteConfig:
             if receipt.get("runner_id") == op.get("runner_id") and receipt.get("revision", 0) > op["revision"]:
                 raise ConfigFailure("local_conflict")
             web_workspace.apply(self.home, agent.db, d["workspace"])
-            user["_remote_configuration"] = {"runner_id": op.get("runner_id"), "revision": op["revision"], "desired": d}
+            user["_remote_configuration"] = {"operation_id":op.get("id", ""), "runner_id": op.get("runner_id"), "revision": op["revision"], "desired": d}
             config._write_user(self.home, user)
             self.cfg.clear(); self.cfg.update(config.load(self.home))
             agent._health_due = True

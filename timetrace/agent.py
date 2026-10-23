@@ -375,6 +375,7 @@ class Agent:
                   "accepting_local": not self.locally_paused(), "project_directories_version": 1}
         if self.remote_config is not None:
             extras["config_version"] = 2
+            extras["config_receipt"] = (self.remote_config.cfg.get("_remote_configuration") or {}).get("operation_id", "")
             from timetrace.web_workspace import candidates
             extras["workspace_candidates"] = candidates(self.db)
         if self._health is not None:
