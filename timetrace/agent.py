@@ -1198,6 +1198,20 @@ class Agent:
             if not in_folder and job.get("stage_iteration"):
                 from .review_artifacts import collect as collect_review
                 event["artifacts"] = collect_review(execution_path, workflow_input.get("head"), workflow_output, event.get("artifacts") or [])
+                from .app_preview import collect as collect_app, MARKER as PREVIEW_MARKER
+                bundle, diagnostic = collect_app(execution_path, workflow_output)
+                if bundle:
+                    try:
+                        stored = self.cloud.upload_job_file(self.access_token(), job["id"], "keji-app-preview.json", bundle)
+                        if not stored or not stored.get("id"):
+                            raise ValueError("missing upload receipt")
+                        event["artifacts"].insert(0, {"kind": "file", "ref": stored["id"], "commit_sha": workflow_output,
+                                                    "content": PREVIEW_MARKER + "\n可运行前端应用，版本 " + workflow_output})
+                    except Exception:
+                        diagnostic = "应用预览上传失败，原成果已保留。可发送修改要求让 AI 重新交付预览。"
+                if diagnostic:
+                    event["artifacts"].append({"kind": "note", "ref": "review/preview-diagnostic", "commit_sha": workflow_output, "content": diagnostic})
+
             if not in_folder and prepared_branch:
                 # The branch review and check jobs name (`branch_name`).
                 event["branch"] = prepared_branch
