@@ -31,7 +31,7 @@ def validate_model(adapter, desired):
         raise ConfigFailure("login_required")
     catalog = read_catalog(adapter)
     if catalog['status'] != 'ready':
-        raise ConfigFailure('model_catalog_unavailable')
+        raise ConfigFailure({'login_required': 'login_required', 'unsupported': 'unsupported_profile'}.get(catalog['status'], 'model_catalog_unavailable'))
     if desired['model'] not in {row['id'] for row in catalog['models']}:
         raise ConfigFailure('model_unavailable')
 

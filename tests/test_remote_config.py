@@ -69,6 +69,12 @@ class RemoteConfigTest(unittest.TestCase):
             validate_model(adapter,self.op['desired']);rpc.assert_called_once_with(adapter)
             with self.assertRaisesRegex(ConfigFailure,'model_unavailable'):validate_model(adapter,{**self.op['desired'],'model':'missing'})
 
+    def test_catalog_failures_preserve_specific_diagnostics(self):
+        adapter=SimpleNamespace(cfg={})
+        for status,code in [('login_required','login_required'),('unsupported','unsupported_profile'),('error','model_catalog_unavailable')]:
+            with self.subTest(status=status),patch('timetrace.remote_config.identity',return_value=('account','old')),patch('timetrace.remote_config.read_catalog',return_value={'status':status,'models':[]}):
+                with self.assertRaisesRegex(ConfigFailure,code):validate_model(adapter,self.op['desired'])
+
     def test_real_worker_loop_drains_before_apply_and_can_grow_from_one_slot(self):
         import threading
         from timetrace.agent import Agent

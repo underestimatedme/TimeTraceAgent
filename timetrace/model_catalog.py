@@ -101,7 +101,7 @@ def read_catalog(adapter):
             rows = claude_models(adapter.cfg.get('bin', 'claude'))
         models, seen = [], set()
         for row in rows:
-            model = row.get('model') or row.get('id') if provider == 'codex' else row.get('value')
+            model = (row.get('model') or row.get('id')) if provider == 'codex' else row.get('value')
             if not isinstance(model, str) or not MODEL_ID.fullmatch(model) or model in seen or row.get('hidden'):
                 continue
             seen.add(model)
