@@ -205,7 +205,7 @@ class CloudClient:
         body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1, "planning_version": 1}
         if self.device_id:
             body["device_id"] = self.device_id
-        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits"):
+        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits", "config_version"):
             if extras and key in extras:
                 body[key] = extras[key]
         if max_parallel is not None:
@@ -213,6 +213,12 @@ class CloudClient:
         if max_parallel_per_tool is not None:
             body["max_parallel_per_tool"] = {str(k): int(v) for k, v in max_parallel_per_tool.items()}
         return self.request("PUT", "/runner/inventory", body, token)
+
+    def runner_config(self, token):
+        return self.request("GET", "/runner/config", token=token)
+
+    def ack_runner_config(self, token, revision, status, error_code=""):
+        return self.request("POST", "/runner/config/ack", {"revision": revision, "status": status, "error_code": error_code}, token)
 
     def post_quota_samples(self, token: str, samples: list) -> Dict[str, Any]:
         """Send de-identified quota readings to Valley (dedup by sample_id).

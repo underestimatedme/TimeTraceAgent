@@ -533,7 +533,9 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         CredentialStore().delete()
         state["sessions"].credentials = None
 
+    from timetrace.remote_config import RemoteConfig
     agent = Agent(db, cloud, adapters, home, token,
+                  remote_config=RemoteConfig(home, cfg, adapters),
                   inventory=lambda: (_runner_workspaces(db), _runner_tools(cfg, adapters), _max_parallel(cfg),
                                      _max_parallel_per_tool(cfg)),
                   log=_log, on_revoked=revoked,

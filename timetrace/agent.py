@@ -181,8 +181,9 @@ class Agent:
                  health_interval: float = HEALTH_INTERVAL_SECONDS,
                  reset_credits: Callable[[], list] = None,
                  reset_credits_interval: float = RESET_CREDITS_INTERVAL_SECONDS,
-                 sleep_guard: Any = None, user_home: str = None):
+                 sleep_guard: Any = None, user_home: str = None, remote_config=None):
         self.db, self.cloud, self.adapters = db, cloud, adapters
+        self.remote_config = remote_config
         # Protocol 2: the inventory carries protocol/agent version, the local
         # pause, the self-check and the reset credits.
         self.report_protocol = report_protocol
@@ -372,6 +373,8 @@ class Agent:
         """The protocol-2 inventory fields (docs/remote-control-protocol.md §3/§4)."""
         extras = {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
                   "accepting_local": not self.locally_paused(), "project_directories_version": 1}
+        if self.remote_config is not None:
+            extras["config_version"] = 1
         if self._health is not None:
             health = dict(self._health)
             health["sleep_prevention"] = self.sleep_state()
@@ -427,6 +430,8 @@ class Agent:
             audit.record(self.home, "version_rejected", where=where, message=str(exc)[:200])
 
     def run_once(self) -> str:
+        if self.remote_config is not None and self.remote_config(self, False):
+            return "idle"
         claim = self._next_claim()
         if isinstance(claim, str):
             return claim
@@ -1794,7 +1799,7 @@ class Agent:
         A KeyboardInterrupt also cancels the running jobs before it returns."""
         log = log or (lambda message: print(message, flush=True))
         self.log = log
-        if self.max_parallel > 1:
+        if self.max_parallel > 1 or self.remote_config is not None:
             return self._run_parallel(interval, log)
         backoff = interval
         manual_diagnostics = set()
@@ -1843,7 +1848,7 @@ class Agent:
         backoff = interval
         manual_diagnostics = set()
         active = {}  # future → job id
-        pool = ThreadPoolExecutor(max_workers=self.max_parallel, thread_name_prefix="timetrace-job")
+        pool = ThreadPoolExecutor(max_workers=8 if self.remote_config is not None else self.max_parallel, thread_name_prefix="timetrace-job")
 
         def reap(futures):
             for future in futures:
@@ -1856,6 +1861,9 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
+                if self.remote_config is not None and self.remote_config(self, bool(active)):
+                    self._stop.wait(interval)
+                    continue
                 if self._maintain_due:
                     self._maintain_due = False
                     self.maintain(force=True)
