@@ -68,3 +68,43 @@ class RemoteConfigTest(unittest.TestCase):
         with patch('timetrace.remote_config.identity',return_value=('account','old')),patch('timetrace.remote_config.app_server_request',return_value={'data':[{'id':'new-model'}]}) as rpc:
             validate_model(adapter,self.op['desired']);rpc.assert_called_once_with('codex','model/list',{'limit':100})
             with self.assertRaisesRegex(ConfigFailure,'model_unavailable'):validate_model(adapter,{**self.op['desired'],'model':'missing'})
+
+    def test_real_worker_loop_drains_before_apply_and_can_grow_from_one_slot(self):
+        import threading
+        from timetrace.agent import Agent
+        from timetrace.db import Database
+        db=Database(self.home/'worker.db')
+        self.addCleanup(db.close)
+        release=threading.Event();finished=threading.Event();states=[];claims=[]
+        cloud=Mock();cloud.runner_config.return_value={'latest':None}
+        agent=Agent(db,cloud,self.adapters,self.home,lambda:'token',max_parallel=1)
+        agent.maintain=Mock()
+        def handle(claim):
+            self.assertTrue(release.wait(2),'configuration interrupted or deadlocked worker')
+            finished.set()
+            return 'completed'
+        agent.handle=handle
+        def claim():
+            claims.append(1)
+            return {'job':{'id':'running-job'}} if len(claims)==1 else 'idle'
+        agent._next_claim=claim
+        def remote(a,busy):
+            self.control.next_poll=0
+            if busy:
+                cloud.runner_config.return_value={'latest':self.op}
+            holding=self.control(a,busy)
+            if busy:
+                states.append('waiting')
+                self.assertEqual(config.load(self.home)['codex']['model'],'old-model')
+                release.set()
+            elif states:
+                self.assertTrue(finished.is_set())
+                self.assertEqual(a.max_parallel,3)
+                states.append('applied');a.stop()
+            return holding
+        agent.remote_config=remote
+        timer=threading.Timer(3,agent.stop);timer.start()
+        try:agent.run_forever(interval=.01,log=lambda line:None)
+        finally:release.set();timer.cancel()
+        self.assertEqual(states[-1],'applied')
+        self.assertEqual(self.validator.call_count,1)
