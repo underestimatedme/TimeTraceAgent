@@ -5,13 +5,12 @@ paths and permission flags cannot be changed by a configuration operation.
 """
 import copy
 import re
-import subprocess
 import time
 from pathlib import Path
 from timetrace import config
 from timetrace.routing import identity
 from timetrace.adapters import build_adapters
-from timetrace.adapters.codex import app_server_request
+from timetrace.model_catalog import read_catalog
 
 
 class ConfigFailure(Exception):
@@ -30,39 +29,11 @@ def validate_model(adapter, desired):
     account, _ = identity(adapter)
     if not account:
         raise ConfigFailure("login_required")
-    model = desired["model"]
-    if desired["provider"] == "codex":
-        try:
-            names = set()
-            cursor = None
-            for _ in range(10):
-                data = app_server_request(adapter.cfg.get("bin", "codex"), "model/list",
-                                          {"limit": 100, **({"cursor": cursor} if cursor else {})})
-                for row in data.get("data", []):
-                    names.update(str(row[k]) for k in ("id", "model") if row.get(k))
-                cursor = data.get("nextCursor")
-                if not cursor:
-                    break
-            if not names:
-                raise ValueError("empty catalog")
-        except Exception:
-            raise ConfigFailure("model_catalog_unavailable") from None
-        if model not in names:
-            raise ConfigFailure("model_unavailable")
-    else:
-        # Claude has no read-only account model catalog. Only allow the current
-        # explicit ID or aliases advertised by the installed CLI itself.
-        if model == adapter.cfg.get("model"):
-            return
-        try:
-            help_text = subprocess.run([adapter.cfg.get("bin", "claude"), "--help"],
-                                       capture_output=True, text=True, timeout=10, check=True).stdout
-            section = help_text.partition("--model <model>")[2].split("\n  --", 1)[0]
-            aliases = set(re.findall(r"'([A-Za-z][A-Za-z0-9_-]*)'", section))
-        except Exception:
-            raise ConfigFailure("model_catalog_unavailable") from None
-        if model not in aliases:
-            raise ConfigFailure("model_unavailable")
+    catalog = read_catalog(adapter)
+    if catalog['status'] != 'ready':
+        raise ConfigFailure('model_catalog_unavailable')
+    if desired['model'] not in {row['id'] for row in catalog['models']}:
+        raise ConfigFailure('model_unavailable')
 
 
 class RemoteConfig:

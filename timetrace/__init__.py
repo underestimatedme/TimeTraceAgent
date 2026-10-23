@@ -1,3 +1,3 @@
 """timetrace — 刻迹 CLI: quota-aware task queue for Claude Code and Codex."""
 
-__version__ = "0.5.3rc2"
+__version__ = "0.5.3rc3"

@@ -19,6 +19,8 @@ def git(*args, cwd):
 class CliTest(unittest.TestCase):
     def test_inventory_uploads_explicit_zero_spend_capability(self):
         class CapabilityAdapter:
+            name = "codex"
+            cfg = {}
             def __init__(self, value):
                 self.value = value
 
@@ -47,10 +49,13 @@ class CliTest(unittest.TestCase):
                     code, _, err = self.run_cli("agent", "run", "--once")
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len(payloads), 1)
+                self.assertEqual(payloads[0]["tools"][0]["model_catalog"]["status"], "login_required")
                 self.assertIs(payloads[0]["tools"][0].get("can_enforce_zero_spend"), expected)
 
     def test_inventory_uploads_plan_tier(self):
         class TierAdapter:
+            name = "claude"
+            cfg = {}
             def capabilities(self):
                 return {"can_enforce_zero_spend": True}
 

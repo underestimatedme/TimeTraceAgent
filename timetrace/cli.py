@@ -490,7 +490,7 @@ def _str_list(value) -> List[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
-def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any]) -> list:
+def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) -> list:
     """Inventory entry per adapter. `plan_tier` is display only; the zero-spend
     flag is the adapter's verified capability, never inferred from a binary."""
     tools = []
@@ -506,6 +506,8 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any]) -> list:
             "status": "available" if shutil.which(binary) else "unavailable",
             "plan_tier": tier or "",
         })
+        if catalogs is not None:
+            tools[-1]['model_catalog'] = catalogs.get(adapter)
     return tools
 
 
@@ -534,9 +536,11 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         state["sessions"].credentials = None
 
     from timetrace.remote_config import RemoteConfig
+    from timetrace.model_catalog import ModelCatalogCache
+    catalogs = ModelCatalogCache()
     agent = Agent(db, cloud, adapters, home, token,
                   remote_config=RemoteConfig(home, cfg, adapters),
-                  inventory=lambda: (_runner_workspaces(db), _runner_tools(cfg, adapters), _max_parallel(cfg),
+                  inventory=lambda: (_runner_workspaces(db), _runner_tools(cfg, adapters, catalogs), _max_parallel(cfg),
                                      _max_parallel_per_tool(cfg)),
                   log=_log, on_revoked=revoked,
                   upload_output_tail=bool(cfg.get("upload_output_tail", True)),

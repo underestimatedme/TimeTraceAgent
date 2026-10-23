@@ -113,6 +113,7 @@ def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
     finally:
         proc.kill()
         proc.wait()
+        t.join(timeout=2)
         for stream in (proc.stdin, proc.stdout):
             try:
                 stream.close()

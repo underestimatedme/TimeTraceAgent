@@ -9,6 +9,9 @@
 - Runner 将 revision/runner_id/desired 收据与配置一起保存，宕机、响应丢失可重放。CLI 配置写入与远程更新共用文件锁。
 - 只有真实 inventory 的模型、账号及两个并行上限均与期望值一致，服务端才接受 applied。可选项目规则同步在同一事务中把同账号旧模型替换为新模型并提升路由 revision。
 - 状态 queued → waiting_idle（可选）→ applied/failed。失败释放接单门禁；保留原值与固定诊断码。网页展示待处理、实际值、失败恢复和新 revision 重试。
-- Codex 校验登录账号的 model/list；Claude 无只读账号模型目录，只接受已安装 CLI 帮助中公开的别名或当前显式模型。该确认代表配置生效，不宣称进行过收费推理验证。
+- Codex 校验登录账号的 model/list；Claude 通过 stream-json initialize 获取 models（不发送 user 消息、不启动模型生成），两者共用目录读取与应用前校验。只传规范化模型名称、ID、解析模型、描述、账号指纹和更新时间，不传原始初始化响应。该确认代表配置生效，模型额度另行检查。
 
-升级顺序：Valley additive migration → Runner 0.5.3rc2 → Web。旧 Runner 不上报能力时 Web 禁止保存，不假装下发成功。首次登录/配对、CLI 认证和本地目录授权仍走现有安全流程。
+升级顺序：Valley additive migration → Runner 0.5.3rc3 → Web。旧 Runner 不上报能力时 Web 禁止保存，不假装下发成功。首次登录/配对、CLI 认证和本地目录授权仍走现有安全流程。
+
+
+模型目录 v1 随既有 tools inventory 每约 5 分钟同步，成功缓存最多 240 秒，失败不保留可选项；账号或 CLI 路径变化立即失效。服务端和网页以 10 分钟为新鲜度上限，保存后电脑仍在空闲边界重新查询目录。旧 Runner 缺少目录时网页显示能力缺失而不退回手填。Claude 名称来自实际 initialize 返回，已在 CLI 2.1.302 实机验证（13 个选项）；Codex CLI 0.147.0 实机返回 3 项。

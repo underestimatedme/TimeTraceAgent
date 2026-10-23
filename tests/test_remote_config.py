@@ -65,8 +65,8 @@ class RemoteConfigTest(unittest.TestCase):
         self.assertEqual(self.cfg['codex']['model'],'old-model');self.assertEqual(self.agent.max_parallel,4)
     def test_codex_catalog_validation_without_inference(self):
         adapter=SimpleNamespace(cfg={'bin':'codex'})
-        with patch('timetrace.remote_config.identity',return_value=('account','old')),patch('timetrace.remote_config.app_server_request',return_value={'data':[{'id':'new-model'}]}) as rpc:
-            validate_model(adapter,self.op['desired']);rpc.assert_called_once_with('codex','model/list',{'limit':100})
+        with patch('timetrace.remote_config.identity',return_value=('account','old')),patch('timetrace.remote_config.read_catalog',return_value={'status':'ready','models':[{'id':'new-model'}]}) as rpc:
+            validate_model(adapter,self.op['desired']);rpc.assert_called_once_with(adapter)
             with self.assertRaisesRegex(ConfigFailure,'model_unavailable'):validate_model(adapter,{**self.op['desired'],'model':'missing'})
 
     def test_real_worker_loop_drains_before_apply_and_can_grow_from_one_slot(self):
