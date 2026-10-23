@@ -127,6 +127,7 @@ class RuntimePreviews:
             except subprocess.SubprocessError:
                 try: command(['docker', 'pull', image], timeout=45)
                 except subprocess.SubprocessError: raise ValueError('官方运行镜像准备失败，请检查电脑网络后在网页重试') from None
+            lifetime = min(1800, max(60, int(p.get('lifetime_seconds', 1800))))
             name = 'keji-preview-' + key
             # Container has a hard expiry even if the Runner exits or loses contact.
             command(['docker', 'run', '-d', '--rm', '--name', name, '--label', 'keji.preview=1',
@@ -136,8 +137,8 @@ class RuntimePreviews:
                      '--user', '65534:65534', '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
                      '--mount', 'type=bind,src='+str(root)+',dst=/app,readonly', '-w', '/app',
                      '-e', 'PORT='+str(spec['port']), '-e', 'HOME=/tmp', '-e', 'PYTHONDONTWRITEBYTECODE=1',
-                     image, 'timeout', '-k', '5', '1800', *spec['command']])
-            self.instances[key] = {'name':name, 'root':root, 'spec':spec, 'expires':time.monotonic()+1800}
+                     image, 'timeout', '-k', '5', str(lifetime), *spec['command']])
+            self.instances[key] = {'name':name, 'root':root, 'spec':spec, 'expires':time.monotonic()+lifetime}
             deadline = time.monotonic()+25
             while time.monotonic()<deadline:
                 try:

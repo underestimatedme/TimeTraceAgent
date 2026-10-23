@@ -1,0 +1,1217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="自主推进体验：从目标澄清到成果交付，让复杂任务持续、透明地向前推进。">
+  <title>自主推进体验｜让目标持续向前</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5d6a62;
+      --paper: #f3f0e8;
+      --surface: rgba(255, 255, 255, 0.72);
+      --line: rgba(23, 33, 27, 0.14);
+      --accent: #f25f3a;
+      --accent-dark: #b83320;
+      --green: #174f3c;
+      --lime: #d9eea8;
+      --shadow: 0 24px 70px rgba(27, 47, 36, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 6%, rgba(217, 238, 168, 0.72), transparent 30rem),
+        radial-gradient(circle at 90% 22%, rgba(242, 95, 58, 0.12), transparent 27rem),
+        var(--paper);
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      line-height: 1.65;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .shell {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 76px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: 10px;
+      color: white;
+      background: var(--green);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+    }
+
+    .nav-link {
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 72px;
+      align-items: center;
+      min-height: 640px;
+      padding: 82px 0 96px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      margin: 0 0 22px;
+      color: var(--green);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 5px rgba(242, 95, 58, 0.14);
+      content: "";
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-family: "Songti SC", "STSong", serif;
+      font-size: clamp(54px, 8vw, 96px);
+      font-weight: 700;
+      letter-spacing: -0.06em;
+      line-height: 0.98;
+    }
+
+    h1 span {
+      display: block;
+      color: var(--accent);
+      font-style: italic;
+    }
+
+    .hero-copy {
+      max-width: 640px;
+      margin: 30px 0 0;
+      color: var(--muted);
+      font-size: clamp(17px, 2vw, 20px);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 36px;
+    }
+
+    .button {
+      display: inline-flex;
+      min-height: 48px;
+      align-items: center;
+      justify-content: center;
+      padding: 0 22px;
+      border: 1px solid var(--green);
+      border-radius: 999px;
+      color: var(--ink);
+      background: transparent;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 750;
+      text-decoration: none;
+      transition: transform 160ms ease, box-shadow 160ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 24px rgba(23, 79, 60, 0.16);
+    }
+
+    .button-primary {
+      color: white;
+      background: var(--green);
+    }
+
+    .button:focus-visible {
+      outline: 3px solid rgba(242, 95, 58, 0.42);
+      outline-offset: 3px;
+    }
+
+    .signal-card {
+      position: relative;
+      overflow: hidden;
+      padding: 34px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 28px;
+      color: white;
+      background: var(--green);
+      box-shadow: var(--shadow);
+      transform: rotate(2deg);
+    }
+
+    .signal-card::after {
+      position: absolute;
+      right: -56px;
+      bottom: -82px;
+      width: 210px;
+      height: 210px;
+      border: 38px solid rgba(217, 238, 168, 0.18);
+      border-radius: 50%;
+      content: "";
+    }
+
+    .signal-label {
+      color: var(--lime);
+      font: 700 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.12em;
+    }
+
+    .signal-card h2 {
+      margin: 70px 0 16px;
+      font-size: 30px;
+      line-height: 1.2;
+    }
+
+    .signal-card p {
+      position: relative;
+      z-index: 1;
+      margin: 0;
+      color: rgba(255, 255, 255, 0.74);
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 72px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      color: var(--green);
+      background: var(--lime);
+      font: 800 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.04em;
+    }
+
+    .status::before {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      content: "";
+    }
+
+    .section {
+      padding: 96px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: 0.7fr 1.3fr;
+      gap: 40px;
+      align-items: end;
+      margin-bottom: 46px;
+    }
+
+    .kicker {
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 850;
+      letter-spacing: 0.12em;
+    }
+
+    .section h2 {
+      margin: 0;
+      font-family: "Songti SC", "STSong", serif;
+      font-size: clamp(36px, 5vw, 58px);
+      letter-spacing: -0.04em;
+      line-height: 1.12;
+    }
+
+    .demo {
+      display: grid;
+      grid-template-columns: minmax(0, 0.82fr) minmax(360px, 1.18fr);
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: rgba(255, 255, 255, 0.58);
+      box-shadow: var(--shadow);
+    }
+
+    .demo-copy {
+      padding: 46px;
+      background: var(--lime);
+    }
+
+    .demo-copy .kicker {
+      display: block;
+      margin-bottom: 24px;
+    }
+
+    .demo-copy h2 {
+      margin-bottom: 18px;
+      font-size: clamp(36px, 4vw, 52px);
+    }
+
+    .demo-copy p {
+      margin: 0;
+      color: #47614f;
+    }
+
+    .demo-note {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin-top: 34px !important;
+      padding-top: 24px;
+      border-top: 1px solid rgba(23, 79, 60, 0.18);
+      font-size: 13px;
+    }
+
+    .demo-note::before {
+      flex: 0 0 auto;
+      display: grid;
+      width: 21px;
+      height: 21px;
+      place-items: center;
+      border: 1px solid rgba(23, 79, 60, 0.3);
+      border-radius: 50%;
+      color: var(--green);
+      content: "i";
+      font: 800 12px/1 serif;
+    }
+
+    .demo-console {
+      min-height: 430px;
+      padding: 46px;
+      color: white;
+      background: var(--green);
+    }
+
+    .demo-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .demo-status-label {
+      color: rgba(255, 255, 255, 0.56);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+    }
+
+    .demo-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      color: var(--green);
+      background: rgba(255, 255, 255, 0.84);
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .demo-state::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #88958d;
+      content: "";
+    }
+
+    .demo[data-state="progress"] .demo-state::before {
+      background: var(--accent);
+      box-shadow: 0 0 0 4px rgba(242, 95, 58, 0.16);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .demo[data-state="complete"] .demo-state {
+      background: var(--lime);
+    }
+
+    .demo[data-state="complete"] .demo-state::before {
+      background: var(--green);
+    }
+
+    .demo-steps {
+      display: grid;
+      gap: 12px;
+      margin: 30px 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .demo-step {
+      display: grid;
+      grid-template-columns: 32px 1fr auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 52px;
+      padding: 8px 14px 8px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 13px;
+      color: rgba(255, 255, 255, 0.48);
+      transition: color 180ms ease, background 180ms ease, border-color 180ms ease;
+    }
+
+    .step-mark {
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.08);
+      font: 750 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .step-result {
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .demo[data-state="progress"] .demo-step,
+    .demo[data-state="complete"] .demo-step {
+      color: white;
+      background: rgba(255, 255, 255, 0.07);
+      border-color: rgba(217, 238, 168, 0.26);
+    }
+
+    .demo[data-state="progress"] .demo-step:nth-child(2) {
+      transition-delay: 80ms;
+    }
+
+    .demo[data-state="progress"] .demo-step:nth-child(3) {
+      transition-delay: 160ms;
+    }
+
+    .demo[data-state="complete"] .step-result {
+      color: var(--lime);
+    }
+
+    .demo-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .demo-actions .button {
+      border-color: var(--lime);
+      color: var(--green);
+      background: var(--lime);
+    }
+
+    .demo-actions .button-secondary {
+      color: white;
+      background: transparent;
+      border-color: rgba(255, 255, 255, 0.5);
+    }
+
+    .demo-summary {
+      margin: 18px 0 0;
+      color: rgba(255, 255, 255, 0.68);
+      font-size: 13px;
+    }
+
+    .backend-panel {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.74fr) minmax(420px, 1.26fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .backend-copy,
+    .todo-card {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+    }
+
+    .backend-copy {
+      padding: 38px;
+      background: var(--surface);
+    }
+
+    .backend-copy h2 {
+      margin: 20px 0 14px;
+      font-size: clamp(36px, 4vw, 52px);
+    }
+
+    .backend-copy p {
+      max-width: 600px;
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .backend-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 30px;
+    }
+
+    .backend-facts span {
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--green);
+      background: white;
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .storage-note {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin-top: 28px !important;
+      padding: 16px;
+      border-radius: 14px;
+      color: #47614f !important;
+      background: rgba(217, 238, 168, 0.54);
+      font-size: 13px;
+    }
+
+    .storage-note strong {
+      flex: 0 0 auto;
+      color: var(--green);
+    }
+
+    .todo-card {
+      display: flex;
+      min-height: 460px;
+      flex-direction: column;
+      padding: 34px;
+      color: white;
+      background: var(--green);
+      box-shadow: var(--shadow);
+    }
+
+    .todo-label {
+      color: var(--lime);
+      font: 750 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.1em;
+    }
+
+    .todo-form {
+      display: flex;
+      gap: 10px;
+      margin: 18px 0 20px;
+    }
+
+    .todo-input {
+      width: 100%;
+      min-width: 0;
+      min-height: 46px;
+      padding: 0 15px;
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      border-radius: 12px;
+      outline: 0;
+      color: white;
+      background: rgba(255, 255, 255, 0.09);
+      font: inherit;
+    }
+
+    .todo-input::placeholder {
+      color: rgba(255, 255, 255, 0.48);
+    }
+
+    .todo-input:focus {
+      border-color: var(--lime);
+      box-shadow: 0 0 0 3px rgba(217, 238, 168, 0.15);
+    }
+
+    .todo-form .button {
+      flex: 0 0 auto;
+      min-height: 46px;
+      border-color: var(--lime);
+      color: var(--green);
+      background: var(--lime);
+    }
+
+    .todo-toolbar {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0;
+      border-top: 1px solid rgba(255, 255, 255, 0.13);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.13);
+    }
+
+    .todo-count {
+      margin: 0;
+      color: rgba(255, 255, 255, 0.68);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .todo-filters {
+      display: flex;
+      gap: 6px;
+    }
+
+    .filter-button {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      min-height: 34px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      color: rgba(255, 255, 255, 0.68);
+      background: transparent;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .filter-button span {
+      display: grid;
+      min-width: 19px;
+      height: 19px;
+      place-items: center;
+      padding: 0 5px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, 0.1);
+      font-size: 10px;
+    }
+
+    .filter-button:hover,
+    .filter-button.is-active {
+      border-color: rgba(217, 238, 168, 0.28);
+      color: var(--green);
+      background: var(--lime);
+    }
+
+    .filter-button.is-active span {
+      background: rgba(23, 79, 60, 0.13);
+    }
+
+    .filter-button:focus-visible,
+    .todo-checkbox:focus-visible {
+      outline: 3px solid rgba(242, 95, 58, 0.72);
+      outline-offset: 2px;
+    }
+
+    .todo-list {
+      display: grid;
+      gap: 9px;
+      max-height: 290px;
+      margin: 16px 0 0;
+      padding: 0 4px 0 0;
+      overflow-y: auto;
+      list-style: none;
+      scrollbar-color: rgba(217, 238, 168, 0.42) transparent;
+    }
+
+    .todo-item {
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 11px;
+      align-items: center;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.065);
+    }
+
+    .todo-checkbox {
+      width: 20px;
+      height: 20px;
+      margin: 0;
+      accent-color: var(--lime);
+      cursor: pointer;
+    }
+
+    .todo-item-copy {
+      min-width: 0;
+    }
+
+    .todo-item-copy strong,
+    .todo-item-copy small {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+
+    .todo-item-copy strong {
+      font-size: 14px;
+    }
+
+    .todo-item-copy small {
+      margin-top: 2px;
+      color: rgba(255, 255, 255, 0.5);
+      font-size: 11px;
+    }
+
+    .todo-item[data-completed="true"] strong {
+      color: rgba(255, 255, 255, 0.52);
+      text-decoration: line-through;
+    }
+
+    .todo-empty {
+      display: grid;
+      min-height: 112px;
+      place-items: center;
+      padding: 20px;
+      border: 1px dashed rgba(255, 255, 255, 0.2);
+      border-radius: 13px;
+      color: rgba(255, 255, 255, 0.52);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .todo-status {
+      min-height: 20px;
+      margin: auto 0 0;
+      padding-top: 18px;
+      color: rgba(255, 255, 255, 0.6);
+      font-size: 12px;
+    }
+
+    .todo-status[data-tone="success"] {
+      color: var(--lime);
+    }
+
+    .todo-status[data-tone="error"] {
+      color: #ffc2b2;
+    }
+
+    .button:disabled {
+      cursor: wait;
+      opacity: 0.55;
+      transform: none;
+      box-shadow: none;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @keyframes pulse {
+      50% {
+        opacity: 0.55;
+      }
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+
+    .feature {
+      min-height: 280px;
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: var(--surface);
+      backdrop-filter: blur(8px);
+    }
+
+    .feature-number {
+      display: inline-grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--green);
+      background: var(--lime);
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .feature h3 {
+      margin: 62px 0 12px;
+      font-size: 22px;
+    }
+
+    .feature p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .route {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: 24px;
+      color: white;
+      background: var(--green);
+      box-shadow: var(--shadow);
+    }
+
+    .route-item {
+      position: relative;
+      min-height: 230px;
+      padding: 30px 26px;
+      border-right: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .route-item:last-child {
+      border-right: 0;
+    }
+
+    .route-item strong {
+      display: block;
+      margin-bottom: 70px;
+      color: var(--lime);
+      font: 750 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.1em;
+    }
+
+    .route-item h3 {
+      margin: 0 0 8px;
+      font-size: 21px;
+    }
+
+    .route-item p {
+      margin: 0;
+      color: rgba(255, 255, 255, 0.68);
+      font-size: 14px;
+    }
+
+    .route-item:not(:last-child)::after {
+      position: absolute;
+      top: 29px;
+      right: -10px;
+      z-index: 1;
+      display: grid;
+      width: 20px;
+      height: 20px;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--green);
+      background: var(--lime);
+      font-size: 12px;
+      content: "→";
+    }
+
+    .closing {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 40px;
+      align-items: center;
+      padding: 56px;
+      border-radius: 28px;
+      color: var(--green);
+      background: var(--lime);
+    }
+
+    .closing h2 {
+      max-width: 650px;
+      margin: 0 0 12px;
+      font-size: clamp(34px, 5vw, 58px);
+    }
+
+    .closing p {
+      max-width: 600px;
+      margin: 0;
+      color: #47614f;
+    }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 28px 0 42px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 820px) {
+      .hero,
+      .section-head,
+      .closing,
+      .demo,
+      .backend-panel {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        gap: 54px;
+        padding: 64px 0 80px;
+      }
+
+      .signal-card {
+        max-width: 520px;
+        transform: none;
+      }
+
+      .grid,
+      .route {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .route-item:nth-child(2) {
+        border-right: 0;
+      }
+
+      .route-item:nth-child(-n+2) {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+      }
+
+      .route-item:nth-child(2)::after {
+        display: none;
+      }
+
+      .closing {
+        padding: 40px;
+      }
+
+      .demo-console {
+        min-height: 0;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .shell {
+        width: min(100% - 28px, 1120px);
+      }
+
+      .nav-link {
+        display: none;
+      }
+
+      h1 {
+        font-size: clamp(50px, 17vw, 72px);
+      }
+
+      .grid,
+      .route {
+        grid-template-columns: 1fr;
+      }
+
+      .route-item,
+      .route-item:nth-child(2) {
+        border-right: 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+      }
+
+      .route-item:last-child {
+        border-bottom: 0;
+      }
+
+      .route-item::after {
+        display: none !important;
+      }
+
+      .closing {
+        padding: 32px 26px;
+      }
+
+      .demo-copy,
+      .demo-console {
+        padding: 32px 24px;
+      }
+
+      .demo-status-row {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .demo-step {
+        grid-template-columns: 32px 1fr;
+      }
+
+      .step-result {
+        grid-column: 2;
+      }
+
+      .todo-card,
+      .backend-copy {
+        padding: 28px 22px;
+      }
+
+      .todo-form,
+      .todo-toolbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .todo-form .button {
+        width: 100%;
+      }
+
+      .todo-filters {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+      }
+
+      .filter-button {
+        justify-content: center;
+      }
+
+      footer {
+        flex-direction: column;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      .button {
+        transition: none;
+      }
+
+      .demo[data-state="progress"] .demo-state::before {
+        animation: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="shell">
+    <nav class="nav" aria-label="主导航">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">↗</span>
+        自主推进体验
+      </a>
+      <a class="nav-link" href="#journey">查看推进路径 ↓</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero shell" aria-labelledby="hero-title">
+      <div>
+        <p class="eyebrow">Autonomous momentum</p>
+        <h1 id="hero-title">让目标<span>自己向前。</span></h1>
+        <p class="hero-copy">
+          自主推进体验把一个清晰目标转化为连续行动：主动理解上下文、拆解任务、执行验证，并在关键节点留下可检查的成果。
+        </p>
+        <div class="actions">
+          <button class="button button-primary" id="heroStart" type="button">开始体验</button>
+          <a class="button" href="#principles">看看它如何工作</a>
+        </div>
+      </div>
+
+      <aside class="signal-card" aria-label="体验状态">
+        <div class="signal-label">CURRENT SIGNAL / 01</div>
+        <h2>目标已明确，<br>行动正在发生。</h2>
+        <p>不是等待每一步指令，而是在边界内持续判断、执行与校验，直到形成可交付的结果。</p>
+        <div class="status">READY_TO_REVIEW</div>
+      </aside>
+    </section>
+
+    <section class="section" id="experience" aria-labelledby="experience-title">
+      <div class="shell">
+        <div class="demo" id="experienceDemo" data-state="idle">
+          <div class="demo-copy">
+            <span class="kicker">交互体验</span>
+            <h2 id="experience-title">亲手推进一次流程。</h2>
+            <p>从收到目标到交付成果，用三个状态感受一段清楚、可追踪的推进过程。</p>
+            <p class="demo-note">这个三态流程仍是本地界面演示；下方“真实后端体验”会调用随页面启动的隔离服务。</p>
+          </div>
+
+          <div class="demo-console" aria-live="polite">
+            <div class="demo-status-row">
+              <span class="demo-status-label">EXPERIENCE STATUS</span>
+              <strong class="demo-state" id="demoState">准备就绪</strong>
+            </div>
+
+            <ol class="demo-steps" aria-label="演示流程">
+              <li class="demo-step">
+                <span class="step-mark">01</span>
+                <span>理解目标与完成标准</span>
+                <span class="step-result">等待中</span>
+              </li>
+              <li class="demo-step">
+                <span class="step-mark">02</span>
+                <span>组织行动与检查路径</span>
+                <span class="step-result">等待中</span>
+              </li>
+              <li class="demo-step">
+                <span class="step-mark">03</span>
+                <span>汇总可验收的成果</span>
+                <span class="step-result">等待中</span>
+              </li>
+            </ol>
+
+            <div class="demo-actions">
+              <button class="button" id="startDemo" type="button">开始体验</button>
+              <button class="button" id="viewResult" type="button" hidden>查看成果</button>
+              <button class="button button-secondary" id="resetDemo" type="button" hidden>从头体验</button>
+            </div>
+            <p class="demo-summary" id="demoSummary">准备好后，点击“开始体验”进入流程。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="backend" aria-labelledby="backend-title">
+      <div class="shell backend-panel">
+        <div class="backend-copy">
+          <span class="kicker">真实后端体验</span>
+          <h2 id="backend-title">把下一步，真正写进清单。</h2>
+          <p>输入标题新增任务，勾选完成，再次勾选即可恢复。每次操作都会调用本地 Python 接口，任务由 SQLite 保存，不用模拟数据或浏览器状态代替。</p>
+          <div class="backend-facts" aria-label="后端特性">
+            <span>Python 3.12 标准库</span>
+            <span>SQLite 持久化</span>
+            <span>仅监听 127.0.0.1</span>
+          </div>
+          <p class="storage-note"><strong>临时数据说明</strong><span>同一预览实例内，刷新或重新打开页面仍可读取任务；实例停止后，隔离环境会丢弃 `/tmp` 中的临时数据并重新开始。</span></p>
+        </div>
+
+        <div class="todo-card">
+          <span class="todo-label">PERSONAL TODO / SQLITE</span>
+          <form class="todo-form" id="todoForm">
+            <label class="sr-only" for="todoInput">任务标题</label>
+            <input class="todo-input" id="todoInput" name="title" type="text" maxlength="120" placeholder="例如：整理本周复盘" autocomplete="off" required>
+            <button class="button" id="addTask" type="submit">新增任务</button>
+          </form>
+
+          <div class="todo-toolbar">
+            <p class="todo-count" id="todoCount">全部 0 · 未完成 0 · 已完成 0</p>
+            <div class="todo-filters" aria-label="筛选任务">
+              <button class="filter-button is-active" type="button" data-filter="all" aria-pressed="true">全部 <span>0</span></button>
+              <button class="filter-button" type="button" data-filter="active" aria-pressed="false">未完成 <span>0</span></button>
+              <button class="filter-button" type="button" data-filter="completed" aria-pressed="false">已完成 <span>0</span></button>
+            </div>
+          </div>
+
+          <ul class="todo-list" id="todoList" aria-label="个人待办任务"></ul>
+          <p class="todo-status" id="todoStatus" data-tone="loading" role="status" aria-live="polite">正在读取服务端任务…</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="principles" aria-labelledby="principles-title">
+      <div class="shell">
+        <div class="section-head">
+          <span class="kicker">体验核心</span>
+          <h2 id="principles-title">少一点来回确认，<br>多一点可靠进展。</h2>
+        </div>
+
+        <div class="grid">
+          <article class="feature">
+            <span class="feature-number">01</span>
+            <h3>理解目标</h3>
+            <p>先识别真正的完成标准、已有约束与风险，让行动始终围绕结果展开。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">02</span>
+            <h3>主动执行</h3>
+            <p>在明确边界内自主选择下一步，减少无意义停顿，把复杂工作持续向前推进。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">03</span>
+            <h3>验证交付</h3>
+            <p>用检查、记录与清晰说明证明成果，让每一次交付都可复核、可继续。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="journey" aria-labelledby="journey-title">
+      <div class="shell">
+        <div class="section-head">
+          <span class="kicker">推进路径</span>
+          <h2 id="journey-title">从一句目标，<br>到一份完整成果。</h2>
+        </div>
+
+        <div class="route" role="list" aria-label="自主推进的四个阶段">
+          <article class="route-item" role="listitem">
+            <strong>STEP 01</strong>
+            <h3>读取现场</h3>
+            <p>理解现状、背景和边界。</p>
+          </article>
+          <article class="route-item" role="listitem">
+            <strong>STEP 02</strong>
+            <h3>形成路线</h3>
+            <p>拆分任务并确定优先级。</p>
+          </article>
+          <article class="route-item" role="listitem">
+            <strong>STEP 03</strong>
+            <h3>持续行动</h3>
+            <p>执行、观察并及时调整。</p>
+          </article>
+          <article class="route-item" role="listitem">
+            <strong>STEP 04</strong>
+            <h3>交付证据</h3>
+            <p>检查成果并清晰地总结。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="closing">
+          <div>
+            <h2>你给方向，进展持续发生。</h2>
+            <p>这就是自主推进体验：保持透明、尊重边界，以完成目标为终点。</p>
+          </div>
+          <a class="button button-primary" href="#top">回到顶部 ↑</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="shell">
+    <span>自主推进体验 · 本地交互演示</span>
+    <span>清晰目标 → 连续行动 → 可验收成果</span>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>

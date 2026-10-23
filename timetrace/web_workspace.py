@@ -49,8 +49,14 @@ def validate(spec):
         p = a['path']
         if not isinstance(p, str) or not p or len(p) > 240 or Path(p).is_absolute() or any(x.startswith('.') or not x for x in p.split('/')) or '\\' in p or '\0' in p:
             raise ValueError('invalid_config')
-        if a['kind'] not in ('exists', 'contains', 'json') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
+        if a['kind'] not in ('exists', 'contains', 'json', 'todo_browser') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
             raise ValueError('invalid_config')
+        if a['kind'] == 'todo_browser':
+            if a['path'] != 'index.html': raise ValueError('invalid_config')
+            from timetrace.browser_checks import selectors
+            selectors(a['value'])
+    if sum(a['kind'] == 'todo_browser' for a in assertions) > 1:
+        raise ValueError('invalid_config')
     return assertions
 
 
@@ -108,7 +114,23 @@ def apply(home, db, spec):
     # Prepare everything before the SQLite transaction; retry uses stable IDs.
     contract = argv = None
     if assertions:
-        content = CHECKER.replace('RULES', repr(json.dumps(assertions, ensure_ascii=False)))
+        browser = next((a for a in assertions if a['kind'] == 'todo_browser'), None)
+        if browser:
+            from timetrace import browser_checks
+            browser_checks.prepare()
+        content = CHECKER.replace('RULES', repr(json.dumps([a for a in assertions if a['kind'] != 'todo_browser'], ensure_ascii=False)))
+        if browser:
+            # Package comes only from this installed Runner; never from model cwd.
+            prefix = f"""import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+try:
+    from timetrace.browser_checks import main
+except Exception as e:
+    print('浏览器验收运行时不可用: '+type(e).__name__)
+    sys.exit(2)
+main({browser!r})
+"""
+            content = prefix + content
         digest = hashlib.sha256(content.encode()).hexdigest()
         checker = Path(home) / 'web-checks' / (digest + '.py')
         checker.parent.mkdir(parents=True, exist_ok=True)
@@ -117,8 +139,15 @@ def apply(home, db, spec):
         elif checker.read_text(encoding='utf-8') != content:
             raise ValueError('local_conflict')
         name = 'web-' + hashlib.sha256((spec['objective'] + digest).encode()).hexdigest()[:20]
-        argv = [str(Path(sys.executable).resolve()), '-I', '-B', str(checker)]
+        argv = [str(Path(sys.executable).absolute()), '-I', '-B', str(checker)]
         contract = objective_checks.register(str(root), name, argv, spec['objective'], str(checker))
+        if browser:
+            contract.pop('version')
+            for dep in ('browser_checks.py', 'runtime_preview.py', 'app_preview.py', 'preview_renderer.js', 'preview_renderer.sha256'):
+                dep_path = str(Path(__file__).resolve().parent / dep)
+                contract['trusted_files'][dep_path] = objective_checks.file_hash(dep_path)
+            contract['timeout_seconds'] = 180
+            contract['version'] = objective_checks.digest(contract)
     detected = []
     package = root / 'package.json'
     if package.is_file() and not package.is_symlink() and package.stat().st_size <= 100000:
