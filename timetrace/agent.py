@@ -374,7 +374,9 @@ class Agent:
         extras = {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
                   "accepting_local": not self.locally_paused(), "project_directories_version": 1}
         if self.remote_config is not None:
-            extras["config_version"] = 1
+            extras["config_version"] = 2
+            from timetrace.web_workspace import candidates
+            extras["workspace_candidates"] = candidates(self.db)
         if self._health is not None:
             health = dict(self._health)
             health["sleep_prevention"] = self.sleep_state()
@@ -1192,6 +1194,9 @@ class Agent:
                     event["artifacts"], failed = self._upload_files(job["id"], execution_path, event["artifacts"])
                     if failed:
                         event["message"] += "; " + results.FILE_DROPPED_NOTE % failed
+            if not in_folder and job.get("stage_iteration"):
+                from .review_artifacts import collect as collect_review
+                event["artifacts"] = collect_review(execution_path, workflow_input.get("head"), workflow_output, event.get("artifacts") or [])
             if not in_folder and prepared_branch:
                 # The branch review and check jobs name (`branch_name`).
                 event["branch"] = prepared_branch

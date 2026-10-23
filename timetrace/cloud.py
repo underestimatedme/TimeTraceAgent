@@ -205,7 +205,7 @@ class CloudClient:
         body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1, "planning_version": 1}
         if self.device_id:
             body["device_id"] = self.device_id
-        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits", "config_version"):
+        for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits", "config_version", "workspace_candidates"):
             if extras and key in extras:
                 body[key] = extras[key]
         if max_parallel is not None:

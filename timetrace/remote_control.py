@@ -244,4 +244,4 @@ class RunControl:
                      remember=remember, summary=summary)
         if approved:
             return {"behavior": "allow"}
-        return {"behavior": "deny", "message": TIMEOUT_DENY if expired else USER_DENY}
+        return {"behavior": "deny", "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000]}

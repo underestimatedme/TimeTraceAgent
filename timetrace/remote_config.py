@@ -1,11 +1,13 @@
 """Bounded remote settings, applied at an idle boundary with durable receipts.
 
-Only model and concurrency fields cross this channel. Credentials, commands,
-paths and permission flags cannot be changed by a configuration operation.
+Model/concurrency and typed workspace setup cross this channel. Credentials,
+arbitrary commands and permission flags cannot be changed by an operation.
 """
 import copy
 import re
 import time
+import sqlite3
+import subprocess
 from pathlib import Path
 from timetrace import config
 from timetrace.routing import identity
@@ -86,6 +88,9 @@ class RemoteConfig:
 
     def _apply_locked(self, agent, op):
         d = op.get("desired") or {}
+        if d.get("workspace") is not None:
+            self._apply_workspace(agent, op)
+            return
         provider = d.get("provider")
         if (set(d) != {"provider", "model", "parallel", "max_parallel"}
                 or provider not in ("codex", "claude")
@@ -135,3 +140,26 @@ class RemoteConfig:
         from timetrace.cli import _max_parallel_per_tool
         agent.max_parallel_per_tool = _max_parallel_per_tool(effective_cfg)
         agent._health_due = True
+
+    def _apply_workspace(self, agent, op):
+        from timetrace import web_workspace
+        d = op.get("desired") or {}
+        if (set(d) - {"workspace", "provider", "model", "parallel", "max_parallel"}
+                or any(d.get(k) for k in ("provider", "model", "parallel", "max_parallel"))
+                or type(op.get("revision")) is not int or op["revision"] < 1):
+            raise ConfigFailure("invalid_config")
+        try:
+            user = config.load_user(self.home)
+            receipt = user.get("_remote_configuration") or {}
+            if receipt.get("runner_id") == op.get("runner_id") and receipt.get("revision", 0) > op["revision"]:
+                raise ConfigFailure("local_conflict")
+            web_workspace.apply(self.home, agent.db, d["workspace"])
+            user["_remote_configuration"] = {"runner_id": op.get("runner_id"), "revision": op["revision"], "desired": d}
+            config._write_user(self.home, user)
+            self.cfg.clear(); self.cfg.update(config.load(self.home))
+            agent._health_due = True
+        except ValueError as exc:
+            code = str(exc)
+            raise ConfigFailure(code if code in ("invalid_config", "local_conflict", "workspace_unavailable") else "workspace_unavailable") from None
+        except (OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
+            raise ConfigFailure("write_failed") from None
