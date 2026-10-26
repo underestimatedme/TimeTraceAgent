@@ -744,7 +744,7 @@ class AccountPoolTest(unittest.TestCase):
 
 
 class RevokedRunnerTest(unittest.TestCase):
-    def test_revoked_credentials_are_cleared_and_the_loop_waits_for_repairing(self):
+    def test_auth_failure_invalidates_access_without_claiming_credentials_were_deleted(self):
         from timetrace.cloud import CloudError
         cleared, lines = [], []
 
@@ -760,7 +760,8 @@ class RevokedRunnerTest(unittest.TestCase):
                           on_revoked=lambda: cleared.append(True), log=lines.append)
             self.assertEqual(agent.run_once(), "revoked")
         self.assertEqual(cleared, [True])
-        self.assertTrue(any("解绑" in l for l in lines), lines)
+        self.assertTrue(any("保留本机凭据" in l for l in lines), lines)
+        self.assertFalse(any("凭据已清除" in l for l in lines), lines)
 
 
 class RecoveryFenceTest(unittest.TestCase):
