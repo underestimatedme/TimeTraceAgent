@@ -73,7 +73,7 @@ class GateReverifiesTest(unittest.TestCase):
 
 class DispatchedEnvironmentTest(unittest.TestCase):
     def test_run_streaming_drops_requested_keys(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"TIMETRACE_BILL_TEST": "leak", "TIMETRACE_KEEP": "ok"}):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"TIMETRACE_BILL_TEST": "leak", "TIMETRACE_KEEP": "ok"}, clear=True):
             code, lines = run_streaming([sys.executable, "-c", "import os; print(sorted(k for k in os.environ if k.startswith('TIMETRACE_')))"],
                                         d, str(Path(d) / "run.log"), drop_env=["TIMETRACE_BILL_TEST"], timeout=10)
         self.assertEqual(code, 0)
