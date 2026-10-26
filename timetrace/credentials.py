@@ -9,6 +9,8 @@ import os
 import plistlib
 import re
 import subprocess
+import threading
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -88,6 +90,16 @@ class CredentialStore:
             "security", "delete-generic-password", "-s", self.SERVICE, "-a", account,
         ], check=False, capture_output=True, text=True)
 
+    @contextmanager
+    def session_lock(self):
+        from timetrace import config
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(home / "runner-session.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
 
 class _NativeKeychain:
     """Minimal Security.framework bridge; secrets never appear in process argv."""
@@ -151,8 +163,24 @@ class SessionManager:
         self.credentials = store.load()
         self._access_token = str((self.credentials or {}).get("access_token") or "")
         self._expires_at = int((self.credentials or {}).get("expires_at") or 0)
+        self._lock = threading.RLock()
+
+    def invalidate_access(self) -> None:
+        # A rejected access token is not proof that the device was revoked.
+        # Preserve the refresh credential and retry through normal authentication.
+        with self._lock:
+            self._access_token, self._expires_at = "", 0
 
     def token(self) -> str:
+        with self._lock:
+            with self.store.session_lock() if hasattr(self.store, "session_lock") else nullcontext():
+                latest = self.store.load()
+                if (latest or {}).get("refresh_token") != (self.credentials or {}).get("refresh_token"):
+                    self._access_token, self._expires_at = "", 0
+                self.credentials = latest
+                return self._token_locked()
+
+    def _token_locked(self) -> str:
         if not self.credentials:
             raise RuntimeError("computer is not paired; run `timetrace cloud login`")
         if not self._access_token or self._expires_at <= int(self.clock()) + 30:
@@ -160,8 +188,8 @@ class SessionManager:
             self.credentials["pending_refresh_key"] = request_key
             self.store.save(self.credentials)
             refreshed = self.cloud.refresh(self.credentials["refresh_token"], request_key)
+            self.store.save(refreshed)
             self._access_token = str(refreshed["access_token"])
             self._expires_at = int(self.clock()) + int(refreshed.get("expires_in") or 900)
-            self.store.save(refreshed)
             self.credentials = refreshed
         return self._access_token

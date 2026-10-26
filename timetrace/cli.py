@@ -532,8 +532,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return state["sessions"].token()
 
     def revoked() -> None:
-        CredentialStore().delete()
-        state["sessions"].credentials = None
+        state["sessions"].invalidate_access()
 
     from timetrace.remote_config import RemoteConfig
     from timetrace.model_catalog import ModelCatalogCache

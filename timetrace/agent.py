@@ -454,13 +454,16 @@ class Agent:
         except CloudError as exc:
             if exc.status == 401:
                 self._on_revoked()
-                self.log("此电脑已在手机上解绑（或授权失效）；本机凭据已清除。重新运行 `timetrace cloud login` 即可再次绑定。")
+                if not getattr(self, "_auth_failure_reported", False):
+                    self.log("刻迹连接授权失败，已暂停领取任务；保留本机凭据并尝试刷新登录。此状态不代表电脑断网或已解绑。")
+                    self._auth_failure_reported = True
                 return "revoked"
             raise
         except RuntimeError as exc:
             if "not paired" in str(exc):
                 return "unpaired"
             raise
+        self._auth_failure_reported = False
         return claim or "idle"
 
     @staticmethod
