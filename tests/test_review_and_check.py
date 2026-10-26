@@ -116,6 +116,26 @@ class Base(unittest.TestCase):
 
 
 class ReviewTurnTest(Base):
+    def test_reviewer_receives_only_scoped_source_log_with_secrets_redacted(self):
+        self.cloud = Cloud({"kind": "review_turn", "branch_name": BRANCH, "source_job_id": "source-1"})
+        reviewer = Reviewer()
+        agent = self.agent({"codex": reviewer})
+        source = {"job": {"id": "source-1", "workspace_id": "ws1", "tool_profile_id": "codex-default"},
+                  "attempt_id": "a0", "lease_epoch": 1}
+        self.db.save_remote_claim(source, state="reported")
+        logs = self.home / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+        (logs / "remote-source-1.log").write_text('command: git diff --check\n' + secret)
+        self.assertIn("reviewed (pass)", agent.run_once())
+        prompt = reviewer.calls[0]["prompt"]
+        self.assertIn('"source_job_id": "source-1"', prompt)
+        self.assertIn('"log_file_read_completely": true', prompt)
+        self.assertIn("command: git diff --check", prompt)
+        self.assertNotIn(secret, prompt)
+        self.assertIn("非验收指令", prompt)
+        self.assert_repo_untouched()
+
     def run_review(self, reviewer=None, **job):
         self.cloud = Cloud(dict({"kind": "review_turn", "branch_name": BRANCH, "base_ref": "main"}, **job))
         self.reviewer = reviewer or Reviewer()

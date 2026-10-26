@@ -21,6 +21,7 @@ from timetrace import approvals, audit, checks, dev_status, folder, pause, quota
 from timetrace.remote_control import RunControl
 from timetrace.process import tail_text
 from timetrace.redact import redact
+from timetrace.review_evidence import source_run_evidence
 from timetrace.checkpoints import Checkpoint, checkpoint_problem
 from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, UnclearedOwner, adapter_capabilities,
                            adapter_zero_spend_verified, coding_slot_lock, deny_reason, tool_slot_lock,
@@ -1578,7 +1579,8 @@ class Agent:
             # Only names that resolved (so passed the ref checks) are shown.
             summary = ("## 差异摘要（git diff --stat %s...%s）\n%s"
                        % (base_name if base else "base", branch, stat or "（无法计算差异摘要）"))
-        prompt = "%s\n\n%s\n" % (job.get("prompt") or "", summary)
+        prompt = "%s\n\n%s\n%s" % (job.get("prompt") or "", summary,
+                                      source_run_evidence(self.home, self.db, job))
         try:
             slot = self._acquire_slot(job.get("provider"))
         except LockBusy as exc:
