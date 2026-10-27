@@ -31,7 +31,7 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
-JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status")
+JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
 IMPORT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # A provider session id goes into argv after --resume / `exec resume`: it must
@@ -575,7 +575,7 @@ class Agent:
         self.home.joinpath("logs").mkdir(parents=True, exist_ok=True)
         # The job id comes from the server: keep it from naming a path.
         log_file = str(self.home / "logs" / ("remote-%s.log" % _safe_id(job_id)))
-        if kind == "check":
+        if kind in ("check", "operations_check"):
             # A locally registered command; no AI tool is involved.
             return self._check_job(claim, workspace, log_file)
         if kind == "dev_status":
@@ -1717,6 +1717,27 @@ class Agent:
         except OSError:
             pass
 
+    def _operations_target(self, claim, workspace):
+        """Inspect a committed snapshot only. A previous receipt is a candidate,
+        not a merge: use it only while the registered default branch is unchanged.
+        Missing receipt commits fail closed, never silently check a different tree.
+        """
+        job = claim["job"]
+        if (workspace.get("kind") or folder.GIT) != folder.GIT or not job.get("check_contract_version"):
+            return self._fail(claim, "巡检需要已登记的 Git 客观检查", "rejected (operations contract)")
+        branch = workspace.get("default_branch") or "main"
+        head = worktree.resolve_commit(workspace["path"], branch)
+        if not head:
+            return self._fail(claim, "巡检基线分支不存在", "failed (operations baseline)")
+        commit = head
+        if job.get("input_head") == head and job.get("input_commit"):
+            candidate = job["input_commit"]
+            if not re.fullmatch(r"[a-f0-9]{40}", candidate) or not worktree.resolve_commit(workspace["path"], candidate):
+                return self._fail(claim, "上次收件提交在本机不可用", "failed (operations receipt missing)")
+            commit = candidate
+        job["operations_observed_head"] = head
+        return None, (branch, commit)
+
     def _check_job(self, claim, workspace, log_file):
         """An automatic check: the command registered on this computer under
         (workspace, check_name) runs in a fresh detached checkout of the step
@@ -1741,7 +1762,8 @@ class Agent:
         reason = self._stop_reason() or gate(deadline)
         if reason:
             return self._blocked(claim, job_id, reason)
-        target = self._acceptance_target(claim, workspace, "检查")
+        target = (self._operations_target(claim, workspace) if job.get("kind") == "operations_check"
+                  else self._acceptance_target(claim, workspace, "检查"))
         if isinstance(target, str):
             return target
         out_dir, detail = target
@@ -1771,6 +1793,8 @@ class Agent:
                 event["check_result"].update(result.objective_evidence)
             if out_dir is None:
                 event["checked_branch"], event["checked_commit"] = detail
+                if job.get("kind") == "operations_check":
+                    event["input_head"] = job["operations_observed_head"]
             else:
                 event["checked_output"] = "%s/%s" % (folder.OUTPUT_ROOT, detail)
             return "check %s" % ("passed" if result.passed else "failed"), event
