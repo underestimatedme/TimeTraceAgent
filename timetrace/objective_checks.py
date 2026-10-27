@@ -134,6 +134,9 @@ def with_workflow(db, workspace_id, contract, manifest):
 
 
 def workflow_valid(db, workspace_id, contract):
+    for name, argv in contract.get("prerequisite_checks", {}).items():
+        if db.get_check(workspace_id, name) != argv:
+            return False
     for step in contract.get("steps", []):
         check = db.get_objective_check(workspace_id, step["check_name"])
         argv = db.get_check(workspace_id, step["check_name"])

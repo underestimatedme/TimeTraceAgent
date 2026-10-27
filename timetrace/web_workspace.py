@@ -49,13 +49,18 @@ def validate(spec):
         p = a['path']
         if not isinstance(p, str) or not p or len(p) > 240 or Path(p).is_absolute() or any(x.startswith('.') or not x for x in p.split('/')) or '\\' in p or '\0' in p:
             raise ValueError('invalid_config')
-        if a['kind'] not in ('exists', 'contains', 'json', 'python_syntax', 'todo_browser') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
+        if a['kind'] not in ('exists', 'contains', 'json', 'python_syntax', 'todo_browser', 'markdown_sections', 'regression', 'web_flow') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
             raise ValueError('invalid_config')
+        if a['kind'] in ('markdown_sections', 'regression', 'web_flow'):
+            from timetrace.acceptance_packs import parse
+            parse(a['kind'], a['value'])
+            if a['kind'] == 'web_flow' and a['path'] != 'index.html':
+                raise ValueError('invalid_config')
         if a['kind'] == 'todo_browser':
             if a['path'] != 'index.html': raise ValueError('invalid_config')
             from timetrace.browser_checks import selectors
             selectors(a['value'])
-    if sum(a['kind'] == 'todo_browser' for a in assertions) > 1:
+    if sum(a['kind'] in ('todo_browser', 'web_flow') for a in assertions) > 1:
         raise ValueError('invalid_config')
     return assertions
 
@@ -76,6 +81,9 @@ for a in rules:
         subprocess.run(['git', 'ls-files', '--error-unmatch', '--', a['path']], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if a['kind'] == 'contains' and a['value'] not in p.read_text(encoding='utf-8'):
             raise ValueError('required text missing')
+        if a['kind'] == 'markdown_sections':
+            from timetrace.acceptance_packs import markdown_sections
+            markdown_sections(p.read_text(encoding='utf-8'), json.loads(a['value']))
         if a['kind'] == 'python_syntax':
             ast.parse(p.read_text(encoding='utf-8'), filename=a['path'])
         if a['kind'] == 'json':
@@ -119,11 +127,22 @@ def apply(home, db, spec):
     # Prepare everything before the SQLite transaction; retry uses stable IDs.
     contract = argv = None
     if assertions:
-        browser = next((a for a in assertions if a['kind'] == 'todo_browser'), None)
+        browser = next((a for a in assertions if a['kind'] in ('todo_browser', 'web_flow')), None)
         if browser:
             from timetrace import browser_checks
-            browser_checks.prepare()
-        content = CHECKER.replace('RULES', repr(json.dumps([a for a in assertions if a['kind'] != 'todo_browser'], ensure_ascii=False)))
+            browser_checks.prepare(backend_required=browser['kind'] == 'todo_browser')
+        content = CHECKER.replace('RULES', repr(json.dumps([a for a in assertions if a['kind'] not in ('todo_browser', 'web_flow', 'regression')], ensure_ascii=False)))
+        regression = []
+        from timetrace import acceptance_packs
+        for assertion in assertions:
+            if assertion['kind'] == 'regression':
+                regression.append(acceptance_packs.regression_contract(db, spec['id'], root, acceptance_packs.parse('regression', assertion['value'])))
+        prefix = f"import sys\nsys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+        if regression:
+            prefix += 'from timetrace.acceptance_packs import run_regression\n'
+            for item in regression:
+                prefix += f"code = run_regression({item!r})\nif code: sys.exit(code)\n"
+        content = prefix + content
         if browser:
             # Package comes only from this installed Runner; never from model cwd.
             prefix = f"""import sys
@@ -146,6 +165,16 @@ main({browser!r})
         name = 'web-' + hashlib.sha256((spec['objective'] + digest).encode()).hexdigest()[:20]
         argv = [str(Path(sys.executable).absolute()), '-I', '-B', str(checker)]
         contract = objective_checks.register(str(root), name, argv, spec['objective'], str(checker))
+        if any(a['kind'] in acceptance_packs.KINDS for a in assertions):
+            contract.pop('version')
+            dep_path = str(Path(acceptance_packs.__file__).resolve())
+            contract['trusted_files'][dep_path] = objective_checks.file_hash(dep_path)
+            if regression:
+                contract['prerequisite_checks'] = {r['check']: r['registered_argv'] for r in regression}
+                for item in regression:
+                    executable = str(Path(item['argv'][0]).resolve())
+                    contract['trusted_files'][executable] = objective_checks.file_hash(executable)
+            contract['version'] = objective_checks.digest(contract)
         if browser:
             contract.pop('version')
             for dep in ('browser_checks.py', 'runtime_preview.py', 'app_preview.py', 'preview_renderer.js', 'preview_renderer.sha256'):

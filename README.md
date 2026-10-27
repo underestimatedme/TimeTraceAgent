@@ -432,3 +432,24 @@ uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
 当前同一供应商在一台电脑上仍使用其默认终端配置；多个账号可分布于已绑定的不同电脑。此分支尚未发布为 Homebrew 版本，不能把当前稳定版的安装成功当作协议已支持。
 
 模型需显式配置，例如 `tta config set claude.model sonnet`。Codex 使用该账号 `model/list` 返回的模型 ID：`tta config set codex.model <模型ID>`。修改后按命令提示重启 Runner，网页刷新「AI 账号与模型」即可看到上报结果。
+
+### P0 acceptance packs (0.5.8rc1 candidate)
+
+Workspace configuration protocol 3 adds `regression`, `markdown_sections` and
+`web_flow` contracts. Upgrade the backend to accept config protocol 3 **before**
+installing this candidate. The execution protocol stays at 2.
+
+Regression reuses a locally registered check, freezes tracked tests/configuration
+and every file outside an explicit repair scope, and pins the executable/checker.
+It proves the registered tests only, not test coverage or an OS sandbox. Markdown
+checks require real headings and non-placeholder section bodies; factual accuracy
+is outside their scope. Web flow uses at most 20 declarative browser actions with
+explicit assertions on the exact commit in the trusted preview renderer; static
+pages do not require Docker, stateful previews do. No arbitrary remote command,
+JavaScript or external URL is accepted as a contract.
+
+`TIMETRACE_WEB_FLOW_LIVE=1 python3 -m unittest tests.test_web_flow_live` runs the
+actual Chromium negative/positive fixture. `tests/live_acceptance_packs.py` is
+an opt-in loopback Valley harness with real model calls; it records three task
+categories and optionally a same-task feedback/re-receipt round. These are
+assistant-operated acceptance samples, never independent new-user research.

@@ -160,6 +160,6 @@ class RemoteConfig:
             agent._health_due = True
         except ValueError as exc:
             code = str(exc)
-            raise ConfigFailure(code if code in ("invalid_config", "local_conflict", "workspace_unavailable", "browser_runtime_unavailable") else "workspace_unavailable") from None
+            raise ConfigFailure(code if code in ("invalid_config", "local_conflict", "workspace_unavailable", "browser_runtime_unavailable", "registered_check_missing", "repair_scope_unavailable") else "workspace_unavailable") from None
         except (OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
             raise ConfigFailure("write_failed") from None

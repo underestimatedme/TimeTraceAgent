@@ -34,11 +34,12 @@ def selectors(raw):
         raise ValueError('invalid_config') from None
 
 
-def prepare():
-    """Web config ACK requires an actual browser launch and Docker availability."""
+def prepare(backend_required=True):
+    """Web config ACK requires an actual browser launch; stateful suites also require Docker."""
     try:
         from playwright.sync_api import sync_playwright
-        runtime_preview.command(['docker', 'info', '--format', '{{.ServerVersion}}'])
+        if backend_required:
+            runtime_preview.command(['docker', 'info', '--format', '{{.ServerVersion}}'])
         with sync_playwright() as p:
             if not Path(p.chromium.executable_path).is_file():
                 subprocess.run([sys.executable, '-I', '-m', 'playwright', 'install', 'chromium', '--no-shell'],
@@ -67,10 +68,15 @@ PARENT = '''async ({bundle, nonce}) => {
 
 def run(spec, evidence_dir=None):
     from playwright.sync_api import sync_playwright, expect, TimeoutError as BrowserTimeout
-    cfg = selectors(spec['value'])
+    generic = spec.get('kind') == 'web_flow'
+    if generic:
+        from timetrace.acceptance_packs import parse
+        cfg = parse('web_flow', spec['value'])
+    else:
+        cfg = selectors(spec['value'])
     root = Path.cwd()
     commit = runtime_preview.command(['git', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
-    report = {'suite':'todo_browser_v1', 'commit':commit, 'steps':[], 'http':[], 'status':'error',
+    report = {'suite':'web_flow_v1' if generic else 'todo_browser_v1', 'commit':commit, 'steps':[], 'http':[], 'status':'error',
               'renderer_source_sha256':Path(__file__).with_name('preview_renderer.sha256').read_text().strip()}
     key = uuid.uuid4().hex
     agent = SimpleNamespace(db=SimpleNamespace(get_workspace=lambda _: {'path':str(root)}), _stop=threading.Event())
@@ -78,6 +84,7 @@ def run(spec, evidence_dir=None):
     browser = None
     playwright = None
     page = None
+    launched = False
     phase = '启动隔离后端'
     def passed(label):
         report['steps'].append({'name':label,'status':'passed'})
@@ -87,20 +94,22 @@ def run(spec, evidence_dir=None):
         if not body:
             raise AssertionError(diagnostic or '当前提交缺少可预览的 index.html')
         bundle = json.loads(body)
-        if bundle['entry'] != spec['path'] or not bundle.get('backend'):
+        if bundle['entry'] != spec['path'] or (not generic and not bundle.get('backend')):
             raise AssertionError('交互保存验收需要 index.html 与 .keji/preview.json 隔离后端配置')
-        # The infrastructure probe distinguishes an unavailable computer from an app failure.
-        runtime_preview.command(['docker','info','--format','{{.ServerVersion}}'])
-        try:
-            previews.launch({'id':key, 'workspace_id':'check', 'commit':commit, 'lifetime_seconds':180})
-        except ValueError as e:
-            if '镜像准备失败' in str(e) or 'Docker' in str(e): raise
-            raise AssertionError(str(e)) from e
-        initial = previews.http(key, {'method':'GET','path':'/'})
-        if initial['code'] != 200 or 'text/html' not in initial['content_type']:
-            raise AssertionError('后端入口 / 必须返回 200 HTML')
-        for f in bundle['files']:
-            if f['path'] == bundle['entry']: f['data'] = initial['body']
+        if bundle.get('backend'):
+            # The infrastructure probe distinguishes an unavailable computer from an app failure.
+            runtime_preview.command(['docker','info','--format','{{.ServerVersion}}'])
+            launched = True
+            try:
+                previews.launch({'id':key, 'workspace_id':'check', 'commit':commit, 'lifetime_seconds':180})
+            except ValueError as e:
+                if '镜像准备失败' in str(e) or 'Docker' in str(e): raise
+                raise AssertionError(str(e)) from e
+            initial = previews.http(key, {'method':'GET','path':'/'})
+            if initial['code'] != 200 or 'text/html' not in initial['content_type']:
+                raise AssertionError('后端入口 / 必须返回 200 HTML')
+            for f in bundle['files']:
+                if f['path'] == bundle['entry']: f['data'] = initial['body']
         playwright = sync_playwright().start()
         p = playwright
         phase = '启动验收浏览器'
@@ -125,6 +134,11 @@ def run(spec, evidence_dir=None):
             except Exception as e: raise AssertionError('预览渲染失败：'+str(e)[:300]) from e
             return tab, tab.frame_locator('iframe')
         page, frame = open_page()
+        if generic:
+            phase = '运行登记的网页行为断言'
+            page, frame = run_flow(cfg, page, frame, open_page, passed)
+            report['status'] = 'passed'
+            return report
         phase = '载入任务清单'
         inp = frame.locator(cfg['input'])
         expect(inp).to_be_enabled(timeout=10000)
@@ -198,10 +212,35 @@ def run(spec, evidence_dir=None):
         if playwright:
             try: playwright.stop()
             except Exception: pass
-        if not previews.stop(key):
+        if launched and not previews.stop(key):
             report.update(status='error', diagnostic='验收隔离实例清理失败；实例硬期限 30 分钟')
         if evidence_dir: (Path(evidence_dir)/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     return report
+
+
+def run_flow(steps, page, frame, open_page, passed):
+    from playwright.sync_api import expect, TimeoutError as BrowserTimeout
+    for index, step in enumerate(steps):
+        action = step['action']
+        try:
+            if action == 'reopen':
+                page.close()
+                page, frame = open_page()
+            else:
+                target = frame.locator(step['selector'])
+                if action == 'click': target.click()
+                elif action == 'fill': target.fill(step['value'])
+                elif action == 'press': target.press(step['value'])
+                elif action == 'check': target.check()
+                elif action == 'uncheck': target.uncheck()
+                elif action == 'text': expect(target).to_have_text(step['value'])
+                elif action == 'count': expect(target).to_have_count(step['value'])
+                elif action == 'visible': expect(target).to_be_visible()
+                elif action == 'hidden': expect(target).to_be_hidden()
+            passed('步骤 %d · %s' % (index + 1, action))
+        except (AssertionError, BrowserTimeout) as exc:
+            raise AssertionError('网页验收步骤 %d (%s) 失败: %s' % (index + 1, action, str(exc)[:300])) from exc
+    return page, frame
 
 
 def main(spec):
