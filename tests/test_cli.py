@@ -309,11 +309,13 @@ class CliTest(unittest.TestCase):
         git("commit", "-q", "-m", "init", cwd=self.repo)
         self._old = os.environ.get("TIMETRACE_HOME")
         os.environ["TIMETRACE_HOME"] = str(self.home)
+        # Never load host Keychain credentials in CLI fixtures.
         # No real login shell, no real ~/Library/LaunchAgents: tool discovery
         # has its own tests (test_toolpath) with a fake HOME.
         user_home = root / "user"
         user_home.mkdir()
-        for target, value in (("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
+        for target, value in (("timetrace.cli.CredentialStore.load", lambda self, account="default": None),
+                              ("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
                               ("timetrace.cli.Path.home", lambda: user_home),
                               ("builtins.input", lambda prompt: "0000")):
             p = patch(target, new=value)
