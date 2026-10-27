@@ -49,7 +49,7 @@ def validate(spec):
         p = a['path']
         if not isinstance(p, str) or not p or len(p) > 240 or Path(p).is_absolute() or any(x.startswith('.') or not x for x in p.split('/')) or '\\' in p or '\0' in p:
             raise ValueError('invalid_config')
-        if a['kind'] not in ('exists', 'contains', 'json', 'todo_browser') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
+        if a['kind'] not in ('exists', 'contains', 'json', 'python_syntax', 'todo_browser') or not isinstance(a['value'], str) or len(a['value']) > 2000 or (a['kind'] == 'contains' and not a['value'].strip()):
             raise ValueError('invalid_config')
         if a['kind'] == 'todo_browser':
             if a['path'] != 'index.html': raise ValueError('invalid_config')
@@ -62,7 +62,7 @@ def validate(spec):
 
 # Runs under python -I -B, and reads only committed regular files within cwd.
 # No eval, user command, subprocess, imports from the task, or network.
-CHECKER = '''import json, pathlib, subprocess, sys
+CHECKER = '''import ast, json, pathlib, subprocess, sys
 rules = json.loads(RULES)
 root = pathlib.Path.cwd().resolve()
 failed = []
@@ -76,6 +76,8 @@ for a in rules:
         subprocess.run(['git', 'ls-files', '--error-unmatch', '--', a['path']], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if a['kind'] == 'contains' and a['value'] not in p.read_text(encoding='utf-8'):
             raise ValueError('required text missing')
+        if a['kind'] == 'python_syntax':
+            ast.parse(p.read_text(encoding='utf-8'), filename=a['path'])
         if a['kind'] == 'json':
             json.loads(p.read_text(encoding='utf-8'))
         print('PASS', a['path'], a['kind'])

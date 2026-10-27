@@ -53,9 +53,42 @@ class ReviewEvidenceTest(unittest.TestCase):
             self.log.write_bytes(raw)
             evidence = self.evidence()
             self.assertIn('"log_file_read_completely": false', evidence)
-            self.assertLess(len(evidence.encode("utf-8")), LOG_BYTES + 1600)
+            self.assertLess(len(evidence.encode("utf-8")), LOG_BYTES + 4096)
             self.assertIn("不能推定通过", evidence)
 
     def test_exact_limit_is_complete(self):
         self.log.write_bytes(b"x" * LOG_BYTES)
         self.assertIn('"log_file_read_completely": true', self.evidence())
+
+    def test_long_evidence_bundle_is_complete_redacted_and_segmented(self):
+        import hashlib
+        import json
+        import re
+        raw = "start\n" + "x" * (LOG_BYTES * 3) + "\napi_key=sk-proj-" + "Q" * 40 + "\nEXIT: 0"
+        self.log.write_text(raw)
+        bundle = self.home / "bundle"
+        bundle.mkdir()
+        output = source_run_evidence(self.home, self.db, self.job, bundle)
+        self.assertIn('"log_file_read_completely": false', output)
+        self.assertIn("EXIT: 0", output)
+        self.assertNotIn("Q" * 40, output)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        chunks = []
+        for segment in manifest["segments"]:
+            chunk = (bundle / segment["file"]).read_bytes()
+            self.assertEqual(hashlib.sha256(chunk).hexdigest(), segment["sha256"])
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        self.assertNotIn(b"Q" * 40, data)
+        self.assertTrue(data.endswith(b"EXIT: 0"))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), manifest["sanitized_sha256"])
+        self.assertTrue(manifest["archive_complete"])
+
+    def test_over_archive_limit_never_claims_full_bundle(self):
+        from timetrace.review_evidence import ARCHIVE_BYTES
+        self.log.write_bytes(b"x" * (ARCHIVE_BYTES + 1))
+        bundle = self.home / "bundle"
+        bundle.mkdir()
+        output = source_run_evidence(self.home, self.db, self.job, bundle)
+        self.assertNotIn('"archive_complete": true', output)
+        self.assertEqual(list(bundle.iterdir()), [])

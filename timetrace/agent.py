@@ -1580,7 +1580,7 @@ class Agent:
             summary = ("## 差异摘要（git diff --stat %s...%s）\n%s"
                        % (base_name if base else "base", branch, stat or "（无法计算差异摘要）"))
         prompt = "%s\n\n%s\n%s" % (job.get("prompt") or "", summary,
-                                      source_run_evidence(self.home, self.db, job))
+                                      source_run_evidence(self.home, self.db, job) if in_folder else "")
         try:
             slot = self._acquire_slot(job.get("provider"))
         except LockBusy as exc:
@@ -1616,8 +1616,12 @@ class Agent:
                     ws_lock.release()
             try:
                 with self._acceptance_checkout(workspace, "reviews", job_id, detail[1], deadline) as cwd:
-                    return self._run_leased(claim, adapter, None,
-                                            lambda cancel: review(prompt, cwd, log_file, cancel), deadline, finish)
+                    import tempfile
+                    with tempfile.TemporaryDirectory(prefix=".timetrace-review-evidence-", dir=cwd) as evidence_dir:
+                        full_prompt = "%s\n\n%s\n%s" % (job.get("prompt") or "", summary,
+                            source_run_evidence(self.home, self.db, job, evidence_dir))
+                        return self._run_leased(claim, adapter, None,
+                            lambda cancel: review(full_prompt, cwd, log_file, cancel), deadline, finish)
             except LockBusy as exc:
                 return "job %s → deferred (workspace busy)" % job_id + ("; " + str(exc) if isinstance(exc, UnclearedOwner) else "")
             except Exception as exc:
