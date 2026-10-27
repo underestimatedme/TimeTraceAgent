@@ -364,6 +364,28 @@ def _find_workspace(db: Database, ref: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def cmd_release(args):
+    from timetrace import release
+    home, cfg, db = _open(args)
+    try:
+        if args.release_cmd == "prepare":
+            workspace = _find_workspace(db, args.workspace)
+            if workspace is None:
+                raise ValueError("unknown workspace")
+            result = release.prepare(home, db, workspace, args.previous, cfg, args.timeout)
+        elif args.release_cmd == "execute":
+            result = release.execute(home, args.id, args.approve, cfg)
+        else:
+            result = release.status(home, args.id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["state"] in ("prepared", "healthy") else 1
+    except (ValueError, OSError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        db.conn.close()
+
+
 def cmd_workspace_check(args: argparse.Namespace) -> int:
     _, _, db = _open(args)
     if args.check_cmd == "list":
@@ -1424,6 +1446,21 @@ def build_parser() -> argparse.ArgumentParser:
     wcr.add_argument("workspace")
     wcr.add_argument("name")
     wcr.set_defaults(fn=cmd_workspace_check)
+
+    rel = sub.add_parser("release", help="prepare, explicitly authorize, and verify a registered release")
+    rel_sub = rel.add_subparsers(dest="release_cmd", required=True)
+    rp = rel_sub.add_parser("prepare")
+    rp.add_argument("workspace")
+    rp.add_argument("--previous", required=True, help="exact known-good Git revision for rollback")
+    rp.add_argument("--timeout", type=int, default=300)
+    rp.set_defaults(fn=cmd_release)
+    re = rel_sub.add_parser("execute")
+    re.add_argument("id")
+    re.add_argument("--approve", required=True, help="authorization hash from the reviewed prepare receipt, including rollback")
+    re.set_defaults(fn=cmd_release)
+    rs = rel_sub.add_parser("status")
+    rs.add_argument("id")
+    rs.set_defaults(fn=cmd_release)
 
     st = sub.add_parser("setup", help="guided setup: tools, repositories, pairing, LaunchAgent")
     st.add_argument("--repo", action="append", help="register this git repository (repeatable)")

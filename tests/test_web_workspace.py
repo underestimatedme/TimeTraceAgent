@@ -54,3 +54,18 @@ class WebWorkspaceTest(unittest.TestCase):
         self.assertEqual(len(inventory(self.db,row['id'])),2)
         updated['id']='unregistered'
         with self.assertRaisesRegex(ValueError,'workspace_unavailable'):apply(self.home,self.db,updated)
+
+    def test_syntax_template_checks_without_executing_source(self):
+        self.spec.update(objective='Python syntax only', assertions=[dict(path='main.py',kind='python_syntax',value='')])
+        row=apply(self.home,self.db,self.spec);root=Path(row['path'])
+        marker=self.home/'must-not-exist'
+        (root/'main.py').write_text("from pathlib import Path\nPath(%r).write_text('executed')\n" % str(marker))
+        self.git(root,'add','.')
+        self.git(root,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','valid syntax')
+        c=inventory(self.db,row['id'])[0];argv=self.db.get_check(row['id'],c['name'])
+        self.assertEqual(subprocess.run(argv,cwd=root,capture_output=True).returncode,0)
+        self.assertFalse(marker.exists())
+        (root/'main.py').write_text('def broken( :')
+        self.git(root,'add','.')
+        self.git(root,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','broken syntax')
+        self.assertEqual(subprocess.run(argv,cwd=root,capture_output=True).returncode,1)

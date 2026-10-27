@@ -2,8 +2,25 @@
 
 给 Claude Code 和 Codex 排任务的无人值守队列，也是刻迹 iOS App 的电脑端 Runner：手机派任务，这台 Mac 用你已经登录的 `claude` / `codex` 执行。撞到限额就睡到重置时间，再用原会话续接；顺手把两个工具每个限额桶的余量采样进 SQLite。
 
-命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
+命令是 `timetrace`，短名 `tta`，两者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+
+## 0.5.7：首次配置、交付证据与发布闭环
+
+公开安装与线上配置能力对齐。已有配对、项目目录和模型设置在升级后保留：
+
+```sh
+brew update
+brew upgrade timetraceagent
+timetrace agent install
+timetrace agent doctor
+```
+
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.7"`；不要混用两套后台服务。
+
+长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
+
+[固定命令发布与回滚](docs/RELEASE-LIFECYCLE.md) 支持准备、具体方案授权、健康检查、失败回滚和恢复验证。服务端每日项目巡检复用现有开发状态采集，不需要浏览器一直打开。
 
 ## 0.5.1：电脑唯一标识
 
@@ -117,7 +134,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.1"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.7"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
