@@ -30,6 +30,7 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
+OUTBOX_REFUSED_RETRY_SECONDS = 60  # a batch Valley answered 409 is retried this rarely
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
 JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
@@ -224,6 +225,9 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
+        self._outbox_refused = {}  # (job, attempt, epoch) → monotonic time of the next retry
+        self._outbox_refused_logged = set()
+        self._loop_errors = set()
         self._maintain_due = False
         # config `upload_output_tail`: false keeps run logs on this computer.
         self.upload_output_tail = upload_output_tail
@@ -445,7 +449,12 @@ class Agent:
         """A claim, or "revoked" / "unpaired" / "idle" / "paused" (local
         pause, running jobs continue) / "disk_full" (self-check error)."""
         try:
-            self.flush_outbox()
+            try:
+                self.flush_outbox()
+            except CloudError as exc:
+                # Already logged by the flush; a refused batch never stops claiming.
+                if exc.status != 409:
+                    raise
             if self.locally_paused():
                 return "paused"
             if self.disk_blocked():
@@ -1861,6 +1870,7 @@ class Agent:
                 try:
                     outcome = self.run_once()
                     backoff = interval
+                    self._loop_errors.clear()
                     if outcome in ("revoked", "unpaired"):
                         # Wait for `timetrace cloud login`; the access_token callable
                         # picks up new credentials without restarting the service.
@@ -1872,7 +1882,8 @@ class Agent:
                         # recovering and the phone's cards fresh.
                         self.maintain()
                         self._stop.wait(interval)
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
         finally:
@@ -1929,10 +1940,12 @@ class Agent:
                 try:
                     claim = self._next_claim()
                     backoff = interval
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
                     continue
+                self._loop_errors.clear()
                 if claim in ("revoked", "unpaired"):
                     self._stop.wait(60)
                     continue
@@ -2105,10 +2118,43 @@ class Agent:
         # Insertion-ordered groups preserve durable attempt order (UUID lexical
         # order is not chronology). Never split an attempt's terminal batch:
         # Valley may close a cancelled attempt at the end of the first request.
-        for (job, attempt, epoch), rows in batches.items():
+        # Valley may refuse one attempt's events for good (409: the lease was
+        # lost, e.g. across a Valley restart). That batch stays queued, but it
+        # must not hold back the other attempts or the next claim.
+        refused = None
+        for key, rows in batches.items():
+            job, attempt, epoch = key
+            if self._outbox_refused.get(key, 0) > time.monotonic():
+                continue
             rows.sort(key=lambda row: row["seq"])
-            self.cloud.append_events(self.access_token(), job, attempt, epoch,
-                                     [row["payload"] for row in rows])
+            try:
+                self.cloud.append_events(self.access_token(), job, attempt, epoch,
+                                         [row["payload"] for row in rows])
+            except CloudError as exc:
+                if exc.status != 409:
+                    raise
+                self._outbox_refused[key] = time.monotonic() + OUTBOX_REFUSED_RETRY_SECONDS
+                if key not in self._outbox_refused_logged:
+                    self._outbox_refused_logged.add(key)
+                    self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
+                             "事件保留在本机队列，不影响其他回报和领取新任务。" % (job, epoch, attempt))
+                refused = refused or exc
+                continue
+            self._outbox_refused.pop(key, None)
+            self._outbox_refused_logged.discard(key)
             self.db.mark_remote_events_sent([row["id"] for row in rows])
         if batches:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)
+        if refused is not None:
+            raise refused
+
+    def _note_loop_error(self, exc) -> None:
+        """The claim loops retry after any error; say so once per distinct error
+        instead of staying silent for hours."""
+        key = (type(exc).__name__, str(exc)[:200])
+        if key in self._loop_errors:
+            return
+        if len(self._loop_errors) >= 50:
+            self._loop_errors.clear()
+        self._loop_errors.add(key)
+        self.log("领取循环出错，将退避重试：%s: %s" % key)
