@@ -335,6 +335,7 @@ class Agent:
             return
         # `timetrace agent sync`: drop the cached login verdicts and push
         # even an unchanged inventory, so a fresh login reaches Valley now.
+        # Quota keeps its cadence: its upload is slow and unrelated to login.
         for name, adapter in self.adapters.items():
             billing = getattr(adapter, "billing", None)
             try:
@@ -343,8 +344,8 @@ class Agent:
             except Exception as exc:
                 self.log("sync: %s login check failed: %s" % (name, exc.__class__.__name__))
         self._health_due = True
-        self._last_inventory = None
-        self._upkeep(now, True)
+        self._last_inventory_base = self._last_inventory = None
+        self._upkeep(now, force)
         pushed = self._last_inventory is not None
         runner_state.record(self.home, sync_id=sync_id, sync_pushed=pushed, sync_at=int(now))
         self.log("sync: %s" % ("pushed" if pushed else "push failed"))

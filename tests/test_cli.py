@@ -293,6 +293,13 @@ class CliTest(unittest.TestCase):
             code, out, _ = self.run_cli("agent", "sync", "--timeout", "3")
         self.assertEqual(code, 1)
         self.assertIn("还没处理", out)
+        self.assertLess(clock[0], 4)
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=tick), \
+             patch("timetrace.sync.time.monotonic", side_effect=lambda: clock[0]):
+            clock[0] = 0.0
+            self.run_cli("agent", "sync")
+        self.assertGreaterEqual(clock[0], 120)  # default: Valley can take a minute to accept the push
         self.assertIsNotNone(sync.pending(config.home()))
 
     def test_doctor_shows_reset_credits_read_only(self):

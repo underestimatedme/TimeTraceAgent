@@ -261,7 +261,8 @@ class AgentL2Test(unittest.TestCase):
                          "can_enforce_zero_spend": claude.billing.verdict().verified}]
         agent = Agent(self.db, cloud, {"claude": claude}, self.home, lambda: "t", inventory=inventory,
                       report_protocol=True, health_check=check, quota_interval=300)
-        agent.report_quota_counts = lambda now: {}
+        self.quota_rounds = []
+        agent.report_quota_counts = lambda now: self.quota_rounds.append(now) or {}
         return agent, clock
 
     def test_sync_request_rechecks_the_login_and_pushes_at_once(self):
@@ -279,6 +280,9 @@ class AgentL2Test(unittest.TestCase):
         agent.maintain(now=1020.0)
         self.assertEqual(len(cloud.inventories), 2)
         self.assertEqual(cloud.inventories[-1]["health"]["claude_login"], "ok")
+        # Quota keeps its own cadence: its upload is slow on Valley and says
+        # nothing about the login.
+        self.assertEqual(self.quota_rounds, [1000.0])
         state = runner_state.load(self.home)
         self.assertEqual(state["sync_id"], request_id)
         self.assertIs(state["sync_pushed"], True)

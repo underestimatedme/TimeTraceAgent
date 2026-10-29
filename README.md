@@ -71,7 +71,7 @@ Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.time
 - **追加指令**：Claude 任务运行中直接写入会话（stream-json 输入）；Codex 在本轮结束后以 `codex exec resume` 在同一个作业里执行，沙箱参数不变，零付费核验照常。
 - **审批**：Claude 需要权限时先按本机规则判断——工作副本内的读写和只读命令（`git status/diff/log`、`ls`、`cat` 等）自动允许；`git push`、改远端或其他分支、写工作副本以外、读凭据目录一律拒绝（手机批准也不能放行）；其余推到手机，10 分钟没人处理即拒绝。「本任务内同类都允许」只在本作业有效。等待审批不计入任务超时，租约照常续期。
 - **暂停接活**：`timetrace agent pause` / `timetrace agent resume`。本机暂停优先，手机无法解除；正在运行的任务不受影响。
-- **立即同步**：在这台 Mac 上重新登录 Claude / Codex 后运行 `timetrace agent sync`，后台 Runner 会马上重新核验登录、刷新自检并上报工具清单（即使没有变化），不用等 5 分钟的定时上报，也不用重启 Runner；正在运行的任务不受影响。命令最多等 60 秒（`--timeout` 可改）。
+- **立即同步**：在这台 Mac 上重新登录 Claude / Codex 后运行 `timetrace agent sync`，后台 Runner 会在下一轮循环里重新核验登录、刷新自检并上报工具清单（即使没有变化），不用等 5 分钟的定时上报，也不用重启 Runner；正在运行的任务不受影响，额度仍按原节奏上报。命令最多等 120 秒（`--timeout` 可改），通常半分钟左右完成，主要取决于 Valley 接收上报的速度。
 - **防休眠**：有任务运行时启动 `caffeinate -i -w <pid>`（只阻止空闲睡眠，合盖仍会睡），没有任务时结束；配置 `prevent_sleep: false` 关闭。
 - **自检**：启动时、每 10 分钟、任务失败后检查 Claude / Codex 登录、工作区所在磁盘剩余空间（不足 1 GB 时不接新任务）、各工作区状态，随工具清单上报，手机据此显示「为什么不接活」。
 - **Codex 重置机会**：每 10 分钟短时启动 `codex app-server` 读取 `account/rateLimits/read` 里的 `rateLimitResetCredits`（只读，读不到时上报「未知」而不是 0 次）。刻迹从不使用重置（不调用 `account/rateLimitResetCredit/consume`），请在官方客户端里自己操作。

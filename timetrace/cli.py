@@ -1517,7 +1517,7 @@ def build_parser() -> argparse.ArgumentParser:
                          ).set_defaults(fn=cmd_agent_pause)
     agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
     sync_p = agent_sub.add_parser("sync", help="have the running Runner re-check logins and report to Valley now")
-    sync_p.add_argument("--timeout", type=int, default=60, help="seconds to wait for the Runner (default 60)")
+    sync_p.add_argument("--timeout", type=int, default=120, help="seconds to wait for the Runner (default 120)")
     sync_p.set_defaults(fn=cmd_agent_sync)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
     ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
