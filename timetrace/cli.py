@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode
 
 from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
-                       render, runner_state, scheduler, statusline_hook, toolpath, worktree)
+                       render, runner_state, scheduler, statusline_hook, sync, toolpath, worktree)
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
@@ -606,6 +606,30 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
     else:
         print("已恢复接活。")
     return 0
+
+
+def cmd_agent_sync(args: argparse.Namespace) -> int:
+    """Have the running Runner re-check logins and report now, without a restart."""
+    home, _, _ = _open(args)
+    if not toolpath.launch_agent_state()["running"]:
+        print("后台 Runner 没在运行，无法同步 → 运行 timetrace agent doctor 查看原因")
+        return 1
+    request_id = sync.request(home)
+    print("已请求后台 Runner 重新检查登录并上报……")
+    state = sync.wait(home, request_id, args.timeout)
+    if state is None:
+        print("Runner 在 %d 秒内还没处理（可能正在执行任务）。请求已保留，Runner 空出后会自动上报；"
+              "稍后运行 timetrace agent doctor 查看。" % args.timeout)
+        return 1
+    if state.get("sync_pushed"):
+        print("已同步到服务器：%s（%s 个工作区，%s 个工具）" % (
+            _iso_local(state.get("inventory_pushed_at")), state.get("inventory_workspaces", "?"),
+            state.get("inventory_tools", "?")))
+    else:
+        print("Runner 已重新检查登录，但上报失败 → 查看 ~/.timetrace/daemon.log")
+    for line in _health_lines({k: v for k, v in (state.get("health") or {}).items() if k.endswith("_login")}):
+        print(line)
+    return 0 if state.get("sync_pushed") else 1
 
 
 _LOGIN_LABEL = {"ok": "正常", "expired": "已过期 → 在这台 Mac 上重新登录", "missing": "未登录"}
@@ -1492,6 +1516,9 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
                          ).set_defaults(fn=cmd_agent_pause)
     agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
+    sync_p = agent_sub.add_parser("sync", help="have the running Runner re-check logins and report to Valley now")
+    sync_p.add_argument("--timeout", type=int, default=60, help="seconds to wait for the Runner (default 60)")
+    sync_p.set_defaults(fn=cmd_agent_sync)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
     ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                     help="do not register the Claude Code statusLine hook")

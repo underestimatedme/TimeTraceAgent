@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict
 from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import Database
-from timetrace import approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, worktree
+from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
+                       worktree)
 from timetrace.remote_control import RunControl
 from timetrace.process import tail_text
 from timetrace.redact import redact
@@ -328,6 +329,27 @@ class Agent:
             self._maintain_due = True
             return
         now = now if now is not None else time.time()
+        sync_id = sync.pending(self.home)
+        if sync_id is None:
+            self._upkeep(now, force)
+            return
+        # `timetrace agent sync`: drop the cached login verdicts and push
+        # even an unchanged inventory, so a fresh login reaches Valley now.
+        for name, adapter in self.adapters.items():
+            billing = getattr(adapter, "billing", None)
+            try:
+                if billing is not None:
+                    billing.verdict(force=True)
+            except Exception as exc:
+                self.log("sync: %s login check failed: %s" % (name, exc.__class__.__name__))
+        self._health_due = True
+        self._last_inventory = None
+        self._upkeep(now, True)
+        pushed = self._last_inventory is not None
+        runner_state.record(self.home, sync_id=sync_id, sync_pushed=pushed, sync_at=int(now))
+        self.log("sync: %s" % ("pushed" if pushed else "push failed"))
+
+    def _upkeep(self, now: float, force: bool) -> None:
         self._refresh_health(now)
         self._refresh_reset_credits(now)
         due = force or now - self._last_quota >= self.quota_interval
@@ -1928,6 +1950,10 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
+                # Before the remote-config hold: `agent sync` must answer
+                # even while a configuration change waits for idle.
+                if sync.pending(self.home):
+                    self.maintain()
                 if self.remote_config is not None and self.remote_config(self, bool(active)):
                     self._stop.wait(interval)
                     continue

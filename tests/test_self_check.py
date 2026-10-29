@@ -10,11 +10,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from timetrace import health, pause
+from timetrace import health, pause, runner_state, sync
 from timetrace.adapters import codex
 from timetrace.agent import PROTOCOL_VERSION, Agent
 from timetrace import __version__
-from timetrace.billing import BillingVerdict, StaticBilling
+from timetrace.billing import BillingVerdict, BillingVerifier, StaticBilling
 from timetrace.db import Database
 from timetrace.sleepguard import SleepGuard
 from tests.test_parallel import QueueCloud, init_repo
@@ -241,6 +241,104 @@ class AgentL2Test(unittest.TestCase):
         # An unchanged flag keeps the ten-minute cadence.
         agent.maintain(now=1600.0)
         self.assertEqual(self.checks, 2)
+
+    def sync_agent(self, cloud, verified):
+        # A login verdict cached for five minutes, as in production: without
+        # `agent sync` a fresh login only reaches Valley once the cache expires.
+        class Claude:
+            billing = BillingVerifier(lambda now: BillingVerdict(
+                provider="claude", verified=verified[0], reason="" if verified[0] else "not_logged_in",
+                auth_method="oauth", verified_at=now), clock=lambda: clock[0])
+        clock = [1000.0]
+        claude = Claude()
+
+        def check():
+            self.checks += 1
+            return {"claude_login": "ok" if claude.billing.verdict().verified else "missing", "workspaces": []}
+
+        def inventory():
+            return [], [{"id": "claude-default", "provider": "claude",
+                         "can_enforce_zero_spend": claude.billing.verdict().verified}]
+        agent = Agent(self.db, cloud, {"claude": claude}, self.home, lambda: "t", inventory=inventory,
+                      report_protocol=True, health_check=check, quota_interval=300)
+        agent.report_quota_counts = lambda now: {}
+        return agent, clock
+
+    def test_sync_request_rechecks_the_login_and_pushes_at_once(self):
+        cloud = InventoryCloud()
+        verified = [False]
+        agent, clock = self.sync_agent(cloud, verified)
+        agent.maintain(now=1000.0, force=True)
+        self.assertEqual(cloud.inventories[-1]["health"]["claude_login"], "missing")
+        verified[0] = True  # the user logs in again
+        clock[0] = 1010.0
+        agent.maintain(now=1010.0)
+        self.assertEqual(len(cloud.inventories), 1)  # still the cached verdict
+        request_id = sync.request(self.home)
+        self.assertEqual(sync.pending(self.home), request_id)
+        agent.maintain(now=1020.0)
+        self.assertEqual(len(cloud.inventories), 2)
+        self.assertEqual(cloud.inventories[-1]["health"]["claude_login"], "ok")
+        state = runner_state.load(self.home)
+        self.assertEqual(state["sync_id"], request_id)
+        self.assertIs(state["sync_pushed"], True)
+        self.assertEqual(state["inventory_pushed_at"], 1020)
+        self.assertIsNone(sync.pending(self.home))
+        agent.maintain(now=1030.0)  # handled once
+        self.assertEqual(len(cloud.inventories), 2)
+
+    def test_sync_request_pushes_even_an_unchanged_inventory(self):
+        cloud = InventoryCloud()
+        agent, _ = self.sync_agent(cloud, [True])
+        agent.maintain(now=1000.0, force=True)
+        request_id = sync.request(self.home)
+        agent.maintain(now=1005.0)
+        self.assertEqual(len(cloud.inventories), 2)
+        self.assertEqual(runner_state.load(self.home)["sync_id"], request_id)
+
+    def test_failed_sync_push_is_acknowledged_as_not_pushed(self):
+        class Down(InventoryCloud):
+            def update_inventory(self, *a, **k):
+                raise ConnectionError("offline")
+        agent, _ = self.sync_agent(Down(), [True])
+        request_id = sync.request(self.home)
+        agent.maintain(now=1000.0)
+        state = runner_state.load(self.home)
+        self.assertEqual(state["sync_id"], request_id)
+        self.assertIs(state["sync_pushed"], False)
+
+    def test_parallel_loop_handles_a_sync_request_while_every_slot_is_busy(self):
+        cloud = InventoryCloud()
+        agent, _ = self.sync_agent(cloud, [True])
+        agent.max_parallel = 1
+        agent.maintain(force=True)
+        started, release = threading.Event(), threading.Event()
+        agent._next_claim = lambda: {"job": {"id": "j1"}} if not started.is_set() else "idle"
+
+        def handle(claim):
+            started.set()
+            release.wait(10)
+            return "done"
+        agent.handle = handle
+        acknowledged = []
+
+        def user():
+            # `timetrace agent sync` from another process while the one slot is busy.
+            try:
+                if started.wait(5):
+                    request_id = sync.request(self.home)
+                    deadline = time.time() + 5
+                    while sync.pending(self.home) and time.time() < deadline:
+                        time.sleep(0.02)
+                    acknowledged.append(runner_state.load(self.home).get("sync_id") == request_id)
+            finally:
+                release.set()
+                agent.stop()
+        helper = threading.Thread(target=user)
+        helper.start()
+        agent._run_parallel(0.05, lambda m: None)  # the loop runs on the agent's own thread
+        helper.join(10)
+        self.assertEqual(acknowledged, [True])
 
     def test_local_pause_stops_claiming_but_not_upkeep(self):
         cloud = InventoryCloud([{"id": "j1", "plan_id": "p1"}])

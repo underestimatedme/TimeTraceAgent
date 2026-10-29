@@ -237,6 +237,64 @@ class CliTest(unittest.TestCase):
         self.assertFalse(pause.paused(home))
         self.assertEqual([e["event"] for e in audit.read(home)], ["pause", "resume"])
 
+    def test_agent_sync_waits_for_the_runner_and_shows_what_it_pushed(self):
+        from timetrace import config, runner_state, sync
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True)
+
+        def runner(*a, **k):
+            # Stands in for the running Runner picking the request up.
+            request_id = sync.pending(home)
+            if request_id:
+                runner_state.record(home, sync_id=request_id, sync_pushed=True, inventory_pushed_at=1793290701,
+                                    inventory_workspaces=3, inventory_tools=2,
+                                    health={"claude_login": "ok", "codex_login": "ok", "workspaces": []})
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=runner):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 0)
+        self.assertIn("已同步到服务器", out)
+        self.assertIn("claude 登录: 正常", out)
+        self.assertIn("3 个工作区，2 个工具", out)
+        self.assertIsNone(sync.pending(home))
+
+    def test_agent_sync_reports_a_failed_push(self):
+        from timetrace import config, runner_state, sync
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True)
+
+        def runner(*a, **k):
+            request_id = sync.pending(home)
+            if request_id:
+                runner_state.record(home, sync_id=request_id, sync_pushed=False)
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=runner):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 1)
+        self.assertIn("上报失败", out)
+
+    def test_agent_sync_without_a_running_runner_says_so(self):
+        from timetrace import config, sync
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": False, "running": False, "pid": None}):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 1)
+        self.assertIn("后台 Runner 没在运行", out)
+        self.assertIsNone(sync.pending(config.home()))
+
+    def test_agent_sync_times_out_but_leaves_the_request(self):
+        from timetrace import config, sync
+        clock = [0.0]
+
+        def tick(seconds):
+            clock[0] += seconds
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=tick), \
+             patch("timetrace.sync.time.monotonic", side_effect=lambda: clock[0]):
+            code, out, _ = self.run_cli("agent", "sync", "--timeout", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("还没处理", out)
+        self.assertIsNotNone(sync.pending(config.home()))
+
     def test_doctor_shows_reset_credits_read_only(self):
         class CodexLike:
             def capabilities(self):
