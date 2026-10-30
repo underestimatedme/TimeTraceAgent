@@ -807,6 +807,10 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     for line in _reset_credit_lines(adapters):
         print(line)
     diagnostics = lock_diagnostics(home)
+    for pending in db.remote_outbox_diagnostics():
+        print("结果上报待恢复: 任务 %s / 尝试 %s，HTTP %s，%d 条结果完整保留；下次重试 %s" % (
+            pending["job_id"], pending["attempt_id"], pending["status"],
+            pending["pending_events"], _iso_local(pending["retry_at"])))
     for message in diagnostics:
         print("Execution lock: %s" % message)
     return 0 if paired and workspaces and not diagnostics else 1

@@ -411,7 +411,20 @@ Pending events for each `(job_id, attempt_id, lease_epoch)` are sent together,
 ordered by sequence, then acknowledged in one atomic SQLite update. Attempt
 groups follow durable enqueue order, not UUID lexical order. A lost response or
 failed local acknowledgment retries the whole unchanged batch; a 409 is never
-silently discarded. No schema migration is needed for existing outboxes.
+silently discarded. Conflicting attempt batches stay unacknowledged in
+`remote_outbox`, with a durable five-minute retry delay in the additive
+`remote_outbox_retry` table. Other attempts continue uploading and claim polling
+continues. Original payloads, occurrence times, sequences, Plan tombstones and
+execution fences are preserved. Only a successful server response permits a
+local acknowledgment. The retry state survives a restart; `timetrace agent
+doctor` lists outstanding conflicts and their next retry time.
+
+Protocol-2 inventory is also republished at the heartbeat interval (30 seconds
+by default), even when unchanged. Both daemon loops perform upkeep before
+result replay and job polling, including when paused, at capacity, or awaiting
+remote configuration. A result-upload failure therefore does not skip the
+next upkeep round. Network requests and existing backoff can still delay an
+upkeep round; this is not an independent watchdog thread.
 See `tests/integration/README.md` for the real Valley/PostgreSQL cancellation
 regression, including lost-response recovery and the next job claim.
 
