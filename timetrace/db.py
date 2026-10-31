@@ -179,6 +179,8 @@ class Database:
     def remove_workspace(self, workspace_id: str) -> None:
         self.conn.execute("DELETE FROM remote_workspace WHERE id=?", (workspace_id,))
         self.conn.execute("DELETE FROM workspace_check WHERE workspace_id=?", (workspace_id,))
+        # The objective contract is the trusted twin of a registered check; it must not outlive its workspace.
+        self.conn.execute("DELETE FROM objective_check WHERE workspace_id=?", (workspace_id,))
 
     # ---- local check commands (only ever registered on this computer) -----
     def save_check(self, workspace_id: str, name: str, argv: List[str], now: Optional[int] = None) -> None:
