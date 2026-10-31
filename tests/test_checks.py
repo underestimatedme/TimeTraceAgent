@@ -40,6 +40,20 @@ class RegistryTest(unittest.TestCase):
         self.db.remove_workspace("ws1")
         self.assertEqual(self.db.list_checks(), [])
 
+    def test_removing_a_workspace_forgets_its_objective_contracts_too(self):
+        # An objective contract is the trusted, auto-accepting twin of a registered check. `workspace remove`
+        # used to leave it behind, an orphan that pointed at a workspace that no longer exists.
+        self.db.upsert_workspace("ws2", "other", str(self.d / "other"), "main")
+        for workspace in ("ws1", "ws2"):
+            self.db.save_check(workspace, "web-abc", ["python3", "check.py"])
+            self.db.save_objective_check(workspace, "web-abc", {"name": "web-abc", "version": "v1"})
+        self.db.remove_workspace("ws1")
+        self.assertIsNone(self.db.get_objective_check("ws1", "web-abc"))
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM objective_check WHERE workspace_id='ws1'").fetchone()[0], 0)
+        self.assertEqual(self.db.get_objective_check("ws2", "web-abc"), {"name": "web-abc", "version": "v1"},
+                         "another workspace's contract is not touched")
+        self.assertEqual(self.db.get_check("ws2", "web-abc"), ["python3", "check.py"])
+
     def test_migration_adds_the_table_to_an_old_database(self):
         path = self.d / "old.db"
         conn = sqlite3.connect(str(path))

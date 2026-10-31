@@ -248,6 +248,7 @@ class Agent:
         # One line per upkeep round so a silent None from an adapter is visible
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
+        self._log_given = log is not None
         # Called once when Valley says this computer's binding was revoked
         # (unbound from the phone): the caller forgets the local credentials.
         self._on_revoked = on_revoked or (lambda: None)
@@ -1859,7 +1860,8 @@ class Agent:
     def run_forever(self, interval: int = 5, log: Callable[[str], None] = None) -> None:
         """Claim and run until stop() (the SIGTERM/SIGINT handlers call it).
         A KeyboardInterrupt also cancels the running jobs before it returns."""
-        log = log or (lambda message: print(message, flush=True))
+        # The caller's timestamping log wins; a bare print is only the default for an Agent built without one.
+        log = log or (self.log if self._log_given else (lambda message: print(message, flush=True)))
         self.log = log
         if self.max_parallel > 1 or self.remote_config is not None:
             return self._run_parallel(interval, log)

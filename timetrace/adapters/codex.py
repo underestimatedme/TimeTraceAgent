@@ -87,15 +87,20 @@ def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
     done = threading.Event()
 
     def reader():
-        for line in iter(proc.stdout.readline, ""):
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("id") == 2:
-                answer.update(msg)
-                done.set()
-                return
+        # After a timeout the caller kills the process and closes the pipes; a reader still waiting then
+        # finds its stream closed. That is the end of the read, not a crash.
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == 2:
+                    answer.update(msg)
+                    done.set()
+                    return
+        except (ValueError, OSError):
+            return
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()
