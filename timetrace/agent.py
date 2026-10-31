@@ -30,6 +30,9 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
+# A batch whose upload failed (other than 409) waits 5 s, then doubles, up to the cap.
+OUTBOX_ERROR_RETRY_FIRST_SECONDS = 5
+OUTBOX_ERROR_RETRY_SECONDS = 30
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
 JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
@@ -224,6 +227,8 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
+        self._outbox_failures_logged = {}  # (job, attempt, epoch) → the failure last written to the log
+        self._loop_errors = set()
         self._maintain_due = False
         # config `upload_output_tail`: false keeps run logs on this computer.
         self.upload_output_tail = upload_output_tail
@@ -239,9 +244,11 @@ class Agent:
         self.quota_interval = quota_interval
         self._last_quota = 0.0
         self._last_inventory = None
+        self._last_inventory_push = None
         # One line per upkeep round so a silent None from an adapter is visible
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
+        self._log_given = log is not None
         # Called once when Valley says this computer's binding was revoked
         # (unbound from the phone): the caller forgets the local credentials.
         self._on_revoked = on_revoked or (lambda: None)
@@ -356,13 +363,16 @@ class Agent:
         # sleep prevention) are compared, so a pause reaches Valley at once.
         current = self._last_inventory_base
         extras = self.inventory_extras() if self.report_protocol else None
-        if (current, extras) != self._last_inventory:
+        heartbeat_due = self.report_protocol and (self._last_inventory_push is None or
+                                                  now - self._last_inventory_push >= self.heartbeat_interval)
+        if (current, extras) != self._last_inventory or heartbeat_due:
             try:
                 if extras is None:
                     self.cloud.update_inventory(self.access_token(), *current)
                 else:
                     self.cloud.update_inventory(self.access_token(), *current, extras=extras)
                 self._last_inventory = (current, extras)
+                self._last_inventory_push = now
                 runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
                                     inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
@@ -1850,7 +1860,8 @@ class Agent:
     def run_forever(self, interval: int = 5, log: Callable[[str], None] = None) -> None:
         """Claim and run until stop() (the SIGTERM/SIGINT handlers call it).
         A KeyboardInterrupt also cancels the running jobs before it returns."""
-        log = log or (lambda message: print(message, flush=True))
+        # The caller's timestamping log wins; a bare print is only the default for an Agent built without one.
+        log = log or (self.log if self._log_given else (lambda message: print(message, flush=True)))
         self.log = log
         if self.max_parallel > 1 or self.remote_config is not None:
             return self._run_parallel(interval, log)
@@ -1859,8 +1870,12 @@ class Agent:
         try:
             while not self._stop.is_set():
                 try:
+                    # Presence must not depend on successfully replaying old
+                    # results or acquiring another job.
+                    self.maintain()
                     outcome = self.run_once()
                     backoff = interval
+                    self._loop_errors.clear()
                     if outcome in ("revoked", "unpaired"):
                         # Wait for `timetrace cloud login`; the access_token callable
                         # picks up new credentials without restarting the service.
@@ -1872,7 +1887,8 @@ class Agent:
                         # recovering and the phone's cards fresh.
                         self.maintain()
                         self._stop.wait(interval)
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
         finally:
@@ -1917,22 +1933,24 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
+                upkeep_due = self._maintain_due
+                self._maintain_due = False
+                self.maintain(force=upkeep_due)
                 if self.remote_config is not None and self.remote_config(self, bool(active)):
                     self._stop.wait(interval)
                     continue
-                if self._maintain_due:
-                    self._maintain_due = False
-                    self.maintain(force=True)
                 if len(active) >= self.max_parallel:
                     wait(list(active), timeout=max(interval, .05), return_when=FIRST_COMPLETED)
                     continue
                 try:
                     claim = self._next_claim()
                     backoff = interval
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
                     continue
+                self._loop_errors.clear()
                 if claim in ("revoked", "unpaired"):
                     self._stop.wait(60)
                     continue
@@ -2092,6 +2110,35 @@ class Agent:
             counts[provider] = self._post_samples(provider, adapter, samples or [], now)
         return counts
 
+    def _defer_failed_batch(self, key, rows, exc, retry) -> None:
+        """Keep a batch whose upload failed (anything but 409/401) and retry it
+        after 5 s, doubling with each failure up to OUTBOX_ERROR_RETRY_SECONDS:
+        a blip recovers at once, a long outage settles at one try per cap. The
+        failure is written once per batch until it changes; only its type and
+        status, never the exception text."""
+        job, attempt, epoch = key
+        status = exc.status if isinstance(exc, CloudError) else 0
+        failures = (retry["failures"] if retry else 0) + 1
+        delay = min(OUTBOX_ERROR_RETRY_SECONDS, OUTBOX_ERROR_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 8))
+        now = time.time()
+        self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay)
+        failure = "HTTP %d" % status if status else exc.__class__.__name__
+        if self._outbox_failures_logged.get(key) != failure:
+            self._outbox_failures_logged[key] = failure
+            self.log("result upload failed: job %s attempt %s: %s; %d event(s) retained locally; retrying with backoff up to %ds"
+                     % (job, attempt, failure, len(rows), OUTBOX_ERROR_RETRY_SECONDS))
+
+    def _note_loop_error(self, exc) -> None:
+        """The claim loops retry after any error; say so once per distinct
+        error instead of staying silent until a claim succeeds."""
+        key = (exc.__class__.__name__, str(exc)[:200])
+        if key in self._loop_errors:
+            return
+        if len(self._loop_errors) >= 50:
+            self._loop_errors.clear()
+        self._loop_errors.add(key)
+        self.log("领取循环出错，将退避重试：%s: %s" % key)
+
     def flush_outbox(self) -> None:
         # Parallel jobs flush too: one batch is never sent twice at once.
         with self._flush_lock:
@@ -2105,10 +2152,42 @@ class Agent:
         # Insertion-ordered groups preserve durable attempt order (UUID lexical
         # order is not chronology). Never split an attempt's terminal batch:
         # Valley may close a cancelled attempt at the end of the first request.
-        for (job, attempt, epoch), rows in batches.items():
+        for key, rows in batches.items():
+            job, attempt, epoch = key
+            retry = self.db.remote_event_retry(job, attempt, epoch)
+            if retry is not None and time.time() < retry["retry_at"]:
+                continue
             rows.sort(key=lambda row: row["seq"])
-            self.cloud.append_events(self.access_token(), job, attempt, epoch,
-                                     [row["payload"] for row in rows])
+            # Pairing/refresh problems are not this batch's fault: they still
+            # propagate to the claim loop's own handling.
+            token = self.access_token()
+            try:
+                self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+            except CloudError as exc:
+                if exc.status == 401:
+                    raise
+                if exc.status != 409:
+                    # Valley answered, but not with success: this attempt's
+                    # problem, not the other batches' or the claim's.
+                    self._defer_failed_batch(key, rows, exc, retry)
+                    continue
+                # A stale/conflicting attempt must not block presence, claims
+                # or unrelated result batches. Never treat conflict as an ACK.
+                now = time.time()
+                self.db.defer_remote_events(job, attempt, epoch, 409, now, now + 300)
+                if self._outbox_failures_logged.get(key) != "HTTP 409":
+                    self._outbox_failures_logged[key] = "HTTP 409"
+                    self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s"
+                             % (job, attempt, len(rows)))
+                continue
+            except Exception as exc:
+                # No response at all (timeout, network): the next batch would
+                # wait out the same timeout, so this round ends here. The
+                # batch stays queued and is tried again after its delay.
+                self._defer_failed_batch(key, rows, exc, retry)
+                break
             self.db.mark_remote_events_sent([row["id"] for row in rows])
+            self.db.clear_remote_event_retry(job, attempt, epoch)
+            self._outbox_failures_logged.pop(key, None)
         if batches:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from timetrace.agent import Agent
+from timetrace.agent import OUTBOX_ERROR_RETRY_SECONDS, Agent
 from timetrace import worktree
 from timetrace.checkpoints import Checkpoint
 from timetrace.db import Database
@@ -282,7 +282,9 @@ class AgentTest(unittest.TestCase):
             observed = queued_event["observed_at"]
             self.assertLessEqual(datetime.fromisoformat(observed.replace("Z", "+00:00")).timestamp(), time.time())
             cloud.recovered = True
-            agent.flush_outbox()
+            # The failed batch waits out its retry delay before it is sent again.
+            with patch("timetrace.agent.time.time", return_value=time.time() + OUTBOX_ERROR_RETRY_SECONDS):
+                agent.flush_outbox()
             self.assertEqual(db.pending_remote_events(), [])
             self.assertEqual(cloud.events[-1]["type"], "completed")
             self.assertEqual(cloud.events[-1]["observed_at"], observed)
@@ -847,7 +849,12 @@ class RecoveryFenceTest(unittest.TestCase):
             pass
         self.assertTrue(self.db.plan_started("plan-1"))
         self.cloud.append_events = deliver
+        # Still locked while the failed event waits out its retry delay...
         self.agent.flush_outbox()
+        self.assertTrue(self.db.plan_started("plan-1"))
+        # ...and unlocked only once Valley has it.
+        with patch("timetrace.agent.time.time", return_value=time.time() + OUTBOX_ERROR_RETRY_SECONDS):
+            self.agent.flush_outbox()
         self.assertFalse(self.db.plan_started("plan-1"))
 
     def test_an_undelivered_running_event_never_unlocks(self):
