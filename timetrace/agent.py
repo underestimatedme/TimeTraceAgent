@@ -239,6 +239,7 @@ class Agent:
         self.quota_interval = quota_interval
         self._last_quota = 0.0
         self._last_inventory = None
+        self._last_inventory_push = None
         # One line per upkeep round so a silent None from an adapter is visible
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
@@ -356,13 +357,16 @@ class Agent:
         # sleep prevention) are compared, so a pause reaches Valley at once.
         current = self._last_inventory_base
         extras = self.inventory_extras() if self.report_protocol else None
-        if (current, extras) != self._last_inventory:
+        heartbeat_due = self.report_protocol and (self._last_inventory_push is None or
+                                                  now - self._last_inventory_push >= self.heartbeat_interval)
+        if (current, extras) != self._last_inventory or heartbeat_due:
             try:
                 if extras is None:
                     self.cloud.update_inventory(self.access_token(), *current)
                 else:
                     self.cloud.update_inventory(self.access_token(), *current, extras=extras)
                 self._last_inventory = (current, extras)
+                self._last_inventory_push = now
                 runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
                                     inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
@@ -1859,6 +1863,9 @@ class Agent:
         try:
             while not self._stop.is_set():
                 try:
+                    # Presence must not depend on successfully replaying old
+                    # results or acquiring another job.
+                    self.maintain()
                     outcome = self.run_once()
                     backoff = interval
                     if outcome in ("revoked", "unpaired"):
@@ -1917,12 +1924,12 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
+                upkeep_due = self._maintain_due
+                self._maintain_due = False
+                self.maintain(force=upkeep_due)
                 if self.remote_config is not None and self.remote_config(self, bool(active)):
                     self._stop.wait(interval)
                     continue
-                if self._maintain_due:
-                    self._maintain_due = False
-                    self.maintain(force=True)
                 if len(active) >= self.max_parallel:
                     wait(list(active), timeout=max(interval, .05), return_when=FIRST_COMPLETED)
                     continue
@@ -2106,9 +2113,24 @@ class Agent:
         # order is not chronology). Never split an attempt's terminal batch:
         # Valley may close a cancelled attempt at the end of the first request.
         for (job, attempt, epoch), rows in batches.items():
+            retry = self.db.remote_event_retry(job, attempt, epoch)
+            if retry is not None and time.time() < retry["retry_at"]:
+                continue
             rows.sort(key=lambda row: row["seq"])
-            self.cloud.append_events(self.access_token(), job, attempt, epoch,
-                                     [row["payload"] for row in rows])
+            try:
+                self.cloud.append_events(self.access_token(), job, attempt, epoch,
+                                         [row["payload"] for row in rows])
+            except CloudError as exc:
+                if exc.status != 409:
+                    raise
+                # A stale/conflicting attempt must not block presence, claims
+                # or unrelated result batches. Never treat conflict as an ACK.
+                now = time.time()
+                self.db.defer_remote_events(job, attempt, epoch, 409, now, now + 300)
+                self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s"
+                         % (job, attempt, len(rows)))
+                continue
             self.db.mark_remote_events_sent([row["id"] for row in rows])
+            self.db.clear_remote_event_retry(job, attempt, epoch)
         if batches:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)
