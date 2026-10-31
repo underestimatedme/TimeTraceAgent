@@ -237,6 +237,13 @@ class CliTest(unittest.TestCase):
         self.assertFalse(pause.paused(home))
         self.assertEqual([e["event"] for e in audit.read(home)], ["pause", "resume"])
 
+    def test_daemon_log_lines_carry_date_time_and_offset(self):
+        # A line is only useful next to Valley's own logs if it names the day and the zone.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._log("hello")
+        self.assertRegex(out.getvalue(), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} hello\n$")
+
     def test_doctor_shows_reset_credits_read_only(self):
         class CodexLike:
             def capabilities(self):

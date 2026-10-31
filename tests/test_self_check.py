@@ -206,12 +206,20 @@ class AgentL2Test(unittest.TestCase):
         self.assertEqual(extras["health"]["sleep_prevention"], "inactive")
         self.assertEqual(extras["health"]["disk_free_gb"], 42.0)
         self.assertEqual(extras["reset_credits"], [{"pool_id": "pool-codex-ab", "status": "unknown"}])
-        # Within 10 minutes: no new self-check; a local pause is pushed at once.
-        agent.maintain(now=1100.0)
+        # Within 10 minutes: no new self-check. An unchanged inventory is not
+        # pushed again within the 30 s heartbeat interval; after it, it is
+        # repeated as presence only, with the same content and no new self-check.
+        agent.maintain(now=1010.0)
         self.assertEqual(self.checks, 1)
         self.assertEqual(len(cloud.inventories), 1)
+        agent.maintain(now=1100.0)
+        self.assertEqual(self.checks, 1)
+        self.assertEqual(len(cloud.inventories), 2)
+        self.assertEqual(cloud.inventories[-1], extras)
+        # A local pause is pushed at once, not at the next heartbeat.
         pause.set_paused(self.home, True)
         agent.maintain(now=1110.0)
+        self.assertEqual(len(cloud.inventories), 3)
         self.assertIs(cloud.inventories[-1]["accepting_local"], False)
         agent.maintain(now=1700.0)
         self.assertEqual(self.checks, 2)

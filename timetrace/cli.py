@@ -43,7 +43,7 @@ def _adapters(cfg: Dict[str, Any]):
 
 
 def _log(msg: str) -> None:
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
+    print(time.strftime("%Y-%m-%d %H:%M:%S%z"), msg, flush=True)
 
 
 def _cloud(cfg: Dict[str, Any]) -> CloudClient:
@@ -651,6 +651,11 @@ def _reset_credit_lines(adapters: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _outbox_failure_text(status) -> str:
+    """Status 0 in the outbox's retry state means no usable response came back."""
+    return "HTTP %d" % status if status else "无有效响应（网络错误、超时或响应无法解析）"
+
+
 def _iso_local(epoch) -> str:
     try:
         return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M:%S")
@@ -807,6 +812,10 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     for line in _reset_credit_lines(adapters):
         print(line)
     diagnostics = lock_diagnostics(home)
+    for pending in db.remote_outbox_diagnostics():
+        print("结果上报待恢复: 任务 %s / 尝试 %s，%s，%d 条结果完整保留；下次重试 %s" % (
+            pending["job_id"], pending["attempt_id"], _outbox_failure_text(pending["status"]),
+            pending["pending_events"], _iso_local(pending["retry_at"])))
     for message in diagnostics:
         print("Execution lock: %s" % message)
     return 0 if paired and workspaces and not diagnostics else 1
