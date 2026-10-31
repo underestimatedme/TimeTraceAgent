@@ -419,8 +419,8 @@ execution fences are preserved. Only a successful server response permits a
 local acknowledgment. The retry state survives a restart; `timetrace agent
 doctor` lists outstanding conflicts and their next retry time.
 
-Any other upload failure except 401 is isolated the same way, with a 30-second
-delay: an HTTP error (5xx, 4xx other than 409/401) leaves that batch queued and
+Any other upload failure except 401 is isolated the same way, retried after 5
+seconds and then after twice as long each time, up to 30 seconds: an HTTP error (5xx, 4xx other than 409/401) leaves that batch queued and
 moves on to the next one; a failure without any response (timeout, network)
 leaves it queued and ends that round of uploads, so one unreachable server costs
 one timeout, not one per batch. Neither stops the claim loop. 401 still goes to

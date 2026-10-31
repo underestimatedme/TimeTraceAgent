@@ -30,7 +30,9 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
-OUTBOX_ERROR_RETRY_SECONDS = 30  # a batch whose upload failed (other than 409) waits this long
+# A batch whose upload failed (other than 409) waits 5 s, then doubles, up to the cap.
+OUTBOX_ERROR_RETRY_FIRST_SECONDS = 5
+OUTBOX_ERROR_RETRY_SECONDS = 30
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
 JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
@@ -2106,18 +2108,22 @@ class Agent:
             counts[provider] = self._post_samples(provider, adapter, samples or [], now)
         return counts
 
-    def _defer_failed_batch(self, key, rows, exc) -> None:
+    def _defer_failed_batch(self, key, rows, exc, retry) -> None:
         """Keep a batch whose upload failed (anything but 409/401) and retry it
-        after OUTBOX_ERROR_RETRY_SECONDS. The failure is written once per batch
-        until it changes; only its type and status, never the exception text."""
+        after 5 s, doubling with each failure up to OUTBOX_ERROR_RETRY_SECONDS:
+        a blip recovers at once, a long outage settles at one try per cap. The
+        failure is written once per batch until it changes; only its type and
+        status, never the exception text."""
         job, attempt, epoch = key
         status = exc.status if isinstance(exc, CloudError) else 0
+        failures = (retry["failures"] if retry else 0) + 1
+        delay = min(OUTBOX_ERROR_RETRY_SECONDS, OUTBOX_ERROR_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 8))
         now = time.time()
-        self.db.defer_remote_events(job, attempt, epoch, status, now, now + OUTBOX_ERROR_RETRY_SECONDS)
+        self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay)
         failure = "HTTP %d" % status if status else exc.__class__.__name__
         if self._outbox_failures_logged.get(key) != failure:
             self._outbox_failures_logged[key] = failure
-            self.log("result upload failed: job %s attempt %s: %s; %d event(s) retained locally; retry in %ds"
+            self.log("result upload failed: job %s attempt %s: %s; %d event(s) retained locally; retrying with backoff up to %ds"
                      % (job, attempt, failure, len(rows), OUTBOX_ERROR_RETRY_SECONDS))
 
     def _note_loop_error(self, exc) -> None:
@@ -2161,20 +2167,22 @@ class Agent:
                 if exc.status != 409:
                     # Valley answered, but not with success: this attempt's
                     # problem, not the other batches' or the claim's.
-                    self._defer_failed_batch(key, rows, exc)
+                    self._defer_failed_batch(key, rows, exc, retry)
                     continue
                 # A stale/conflicting attempt must not block presence, claims
                 # or unrelated result batches. Never treat conflict as an ACK.
                 now = time.time()
                 self.db.defer_remote_events(job, attempt, epoch, 409, now, now + 300)
-                self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s"
-                         % (job, attempt, len(rows)))
+                if self._outbox_failures_logged.get(key) != "HTTP 409":
+                    self._outbox_failures_logged[key] = "HTTP 409"
+                    self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s"
+                             % (job, attempt, len(rows)))
                 continue
             except Exception as exc:
                 # No response at all (timeout, network): the next batch would
                 # wait out the same timeout, so this round ends here. The
                 # batch stays queued and is tried again after its delay.
-                self._defer_failed_batch(key, rows, exc)
+                self._defer_failed_batch(key, rows, exc, retry)
                 break
             self.db.mark_remote_events_sent([row["id"] for row in rows])
             self.db.clear_remote_event_retry(job, attempt, epoch)

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from timetrace import cli
-from timetrace.agent import OUTBOX_ERROR_RETRY_SECONDS, Agent
+from timetrace.agent import OUTBOX_ERROR_RETRY_FIRST_SECONDS, OUTBOX_ERROR_RETRY_SECONDS, Agent
 from timetrace.cloud import CloudError
 from timetrace.db import Database
 
@@ -109,17 +109,39 @@ class OutboxIsolationTest(OutboxFailureFixture, unittest.TestCase):
         self.assertEqual(self.db.remote_event_retry("old", "old-attempt", 3)["status"], 0)
 
     def test_a_failed_batch_waits_before_its_next_attempt_and_is_cleared_by_success(self):
+        first = OUTBOX_ERROR_RETRY_FIRST_SECONDS
         self.failing["old"] = SERVER_ERROR
         events = self.enqueue("old")
-        for now, tries in [(1000, 1), (1000 + RETRY - 1, 1), (1000 + RETRY, 2)]:
+        for now, tries in [(1000, 1), (1000 + first - 1, 1), (1000 + first, 2)]:
             self.flush_at(now)
             self.assertEqual(len(self.attempts), tries, "at %s" % now)
         self.failing.clear()
-        self.flush_at(1000 + 2 * RETRY)
+        self.flush_at(1000 + first + RETRY)
         self.assertEqual(self.sent, ["old"])
         self.assertEqual(self.pending_jobs(), [])
         self.assertIsNone(self.db.remote_event_retry("old", "old-attempt", 3))
         self.assertEqual(events[-1]["type"], "completed")
+
+    def test_the_retry_delay_doubles_up_to_its_cap(self):
+        # A blip recovers within seconds; a long outage settles at one try per cap.
+        self.failing["old"] = SERVER_ERROR
+        self.enqueue("old")
+        now, delays = 1000, []
+        for _ in range(6):
+            self.flush_at(now)
+            due = self.db.remote_event_retry("old", "old-attempt", 3)["retry_at"]
+            delays.append(due - now)
+            now = due
+        self.assertEqual(delays, [5, 10, 20, 30, 30, 30])
+
+    def test_a_conflict_is_named_once_not_at_every_retry(self):
+        self.failing["old"] = CONFLICT
+        self.enqueue("old")
+        for round_ in range(3):
+            self.flush_at(1000 + round_ * 300)
+        self.assertEqual(len(self.attempts), 3)
+        lines = [line for line in self.logs if "result upload conflict" in line]
+        self.assertEqual(len(lines), 1, self.logs)
 
     def test_a_transport_failure_ends_the_round_instead_of_waiting_out_every_batch(self):
         self.failing["a"] = self.failing["b"] = READ_TIMEOUT
