@@ -98,6 +98,16 @@ CREATE TABLE IF NOT EXISTS checkpoint (
     data       TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS remote_outbox_retry (
+    job_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    lease_epoch INTEGER NOT NULL,
+    status INTEGER NOT NULL,
+    failures INTEGER NOT NULL,
+    last_failed_at REAL NOT NULL,
+    retry_at REAL NOT NULL,
+    PRIMARY KEY (job_id, attempt_id, lease_epoch)
+);
 CREATE TABLE IF NOT EXISTS workspace_check (
     workspace_id TEXT NOT NULL,
     name         TEXT NOT NULL,
@@ -260,6 +270,35 @@ class Database:
     def mark_remote_event_sent(self, event_id: int, now: Optional[int] = None) -> None:
         self.conn.execute("UPDATE remote_outbox SET sent_at=? WHERE id=?", (now or _now(), event_id))
         self._release_failed_plans([event_id])
+
+    def remote_event_retry(self, job: str, attempt: str, epoch: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM remote_outbox_retry WHERE job_id=? AND attempt_id=? AND lease_epoch=?",
+            (job, attempt, epoch)).fetchone()
+        return dict(row) if row else None
+
+    def defer_remote_events(self, job: str, attempt: str, epoch: int, status: int,
+                            now: float, retry_at: float) -> None:
+        # This is retry metadata only. Original payloads, sequences, occurrence
+        # times and sent_at remain untouched, including across process restarts.
+        self.conn.execute(
+            "INSERT INTO remote_outbox_retry VALUES (?,?,?,?,1,?,?)"
+            " ON CONFLICT(job_id,attempt_id,lease_epoch) DO UPDATE SET"
+            " status=excluded.status, failures=failures+1,"
+            " last_failed_at=excluded.last_failed_at, retry_at=excluded.retry_at",
+            (job, attempt, epoch, status, now, retry_at))
+
+    def clear_remote_event_retry(self, job: str, attempt: str, epoch: int) -> None:
+        self.conn.execute(
+            "DELETE FROM remote_outbox_retry WHERE job_id=? AND attempt_id=? AND lease_epoch=?",
+            (job, attempt, epoch))
+
+    def remote_outbox_diagnostics(self) -> List[Dict[str, Any]]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT r.*, COUNT(o.id) AS pending_events FROM remote_outbox_retry r"
+            " JOIN remote_outbox o ON o.job_id=r.job_id AND o.attempt_id=r.attempt_id"
+            " AND o.lease_epoch=r.lease_epoch WHERE o.sent_at IS NULL"
+            " GROUP BY r.job_id,r.attempt_id,r.lease_epoch ORDER BY r.last_failed_at")]
 
     def mark_remote_events_sent(self, event_ids: List[int], now: Optional[int] = None) -> None:
         if not event_ids:
