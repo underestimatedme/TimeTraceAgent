@@ -80,7 +80,8 @@ for a in rules:
             raise ValueError('missing or oversized')
         subprocess.run(['git', 'ls-files', '--error-unmatch', '--', a['path']], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if a['kind'] == 'contains' and a['value'] not in p.read_text(encoding='utf-8'):
-            raise ValueError('required text missing')
+            shown = repr(a['value'])
+            raise ValueError('required text missing: ' + (shown[:160] + '...' if len(shown) > 160 else shown))
         if a['kind'] == 'markdown_sections':
             from timetrace.acceptance_packs import markdown_sections
             markdown_sections(p.read_text(encoding='utf-8'), json.loads(a['value']))
