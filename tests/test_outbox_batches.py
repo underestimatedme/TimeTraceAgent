@@ -1,10 +1,11 @@
 import tempfile
 import sqlite3
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from timetrace.agent import Agent
+from timetrace.agent import OUTBOX_ERROR_RETRY_SECONDS, Agent
 from timetrace.cloud import CloudError
 from timetrace.db import Database
 
@@ -50,13 +51,16 @@ class OutboxBatchTest(unittest.TestCase):
             if job == "b-job":
                 raise OSError("response lost after server commit")
         self.cloud.append_events = fail_second
-        with self.assertRaises(OSError): self.agent.flush_outbox()
+        # The lost response no longer propagates (it would stop the claim loop):
+        # the batch stays queued and is retried once its delay is over.
+        self.agent.flush_outbox()
         self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], second)
         self.db.close()
         self.db = Database(self.path)
         self.agent.db = self.db
         self.cloud.append_events = append
-        self.agent.flush_outbox()
+        with patch("timetrace.agent.time.time", return_value=time.time() + OUTBOX_ERROR_RETRY_SECONDS):
+            self.agent.flush_outbox()
         self.assertEqual(self.sent, [("a-job", "a1", 3, first), ("b-job", "b1", 3, second), ("b-job", "b1", 3, second)])
         self.assertEqual(self.db.pending_remote_events(), [])
 

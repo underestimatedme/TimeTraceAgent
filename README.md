@@ -419,6 +419,16 @@ execution fences are preserved. Only a successful server response permits a
 local acknowledgment. The retry state survives a restart; `timetrace agent
 doctor` lists outstanding conflicts and their next retry time.
 
+Any other upload failure except 401 is isolated the same way, with a 30-second
+delay: an HTTP error (5xx, 4xx other than 409/401) leaves that batch queued and
+moves on to the next one; a failure without any response (timeout, network)
+leaves it queued and ends that round of uploads, so one unreachable server costs
+one timeout, not one per batch. Neither stops the claim loop. 401 still goes to
+the existing authorization recovery. The failure is written once per batch
+(`result upload failed: … HTTP 500` or the exception type, never the exception
+text), and the claim loops write each distinct error once until a claim
+succeeds, instead of retrying silently.
+
 Protocol-2 inventory is also republished at the heartbeat interval (30 seconds
 by default), even when unchanged. Both daemon loops perform upkeep before
 result replay and job polling, including when paused, at capacity, or awaiting
