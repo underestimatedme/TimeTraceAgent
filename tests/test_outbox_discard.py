@@ -225,5 +225,49 @@ class DiscardCommandTest(OutboxFailureFixture, unittest.TestCase):
         self.assertNotIn("被服务器拒收", out)
 
 
+class DiscardKeepsPlanTombstoneTest(unittest.TestCase):
+    """Decided for S3-24: setting a refused result aside does not lift its Plan's 'started' tombstone.
+
+    The tombstone is lifted only once the server holds the job's `failed` event. A discarded batch was
+    never accepted, so as far as the server knows the run has no outcome, and the Plan must not be able to
+    start again on this computer. Lifting it on discard would turn 'stop retrying this result' into
+    'run this Plan again'.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "timetrace.db"
+        self.open()
+        self.db.mark_plan_started("plan-1", "old", "old-attempt")
+        for seq, kind in ((1, "running"), (2, "failed")):
+            self.db.queue_remote_event("old", "old-attempt", 3, {"seq": seq, "type": kind}, now=500)
+
+    def open(self):
+        self.db = Database(self.path)
+        self.addCleanup(self.db.close)
+
+    def set_aside(self):
+        self.db.defer_remote_events("old", "old-attempt", 3, 409, 1000, 1300)
+        self.assertEqual(self.db.discard_conflicted_remote_events("old", "old-attempt", now=2000), 2)
+
+    def test_delivering_the_failed_event_does_lift_it(self):
+        # The control: the same batch accepted by the server releases the Plan, so the cases below cannot pass vacuously.
+        self.assertTrue(self.db.plan_started("plan-1"))
+        self.db.mark_remote_events_sent([row["id"] for row in self.db.pending_remote_events()], now=1000)
+        self.assertFalse(self.db.plan_started("plan-1"))
+
+    def test_setting_a_refused_batch_aside_keeps_it(self):
+        self.set_aside()
+        self.assertTrue(self.db.plan_started("plan-1"))
+
+    def test_it_is_still_held_after_the_agent_restarts(self):
+        # Opening the database lifts tombstones whose `failed` event was delivered; a set-aside batch was not.
+        self.set_aside()
+        self.db.close()
+        self.open()
+        self.assertTrue(self.db.plan_started("plan-1"))
+
+
 if __name__ == "__main__":
     unittest.main()
