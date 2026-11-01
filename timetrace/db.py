@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS remote_outbox (
     payload     TEXT NOT NULL,
     sent_at     INTEGER,
     created_at  INTEGER NOT NULL,
+    abandoned_at INTEGER,
     UNIQUE(job_id, attempt_id, seq)
 );
 CREATE TABLE IF NOT EXISTS checkpoint (
@@ -153,6 +154,10 @@ class Database:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(remote_workspace)")}
         if "kind" not in columns:
             self.conn.execute("ALTER TABLE remote_workspace ADD COLUMN kind TEXT NOT NULL DEFAULT 'git'")
+        # Results a person set aside after the server refused them for good.
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(remote_outbox)")}
+        if "abandoned_at" not in columns:
+            self.conn.execute("ALTER TABLE remote_outbox ADD COLUMN abandoned_at INTEGER")
 
     def close(self) -> None:
         self.conn.close()
@@ -260,7 +265,7 @@ class Database:
 
     def pending_remote_events(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT * FROM remote_outbox WHERE sent_at IS NULL ORDER BY id"
+            "SELECT * FROM remote_outbox WHERE sent_at IS NULL AND abandoned_at IS NULL ORDER BY id"
         ).fetchall()
         result = []
         for row in rows:
@@ -297,10 +302,32 @@ class Database:
 
     def remote_outbox_diagnostics(self) -> List[Dict[str, Any]]:
         return [dict(row) for row in self.conn.execute(
-            "SELECT r.*, COUNT(o.id) AS pending_events FROM remote_outbox_retry r"
+            "SELECT r.*, COUNT(o.id) AS pending_events, MIN(o.created_at) AS oldest_event_at"
+            " FROM remote_outbox_retry r"
             " JOIN remote_outbox o ON o.job_id=r.job_id AND o.attempt_id=r.attempt_id"
-            " AND o.lease_epoch=r.lease_epoch WHERE o.sent_at IS NULL"
+            " AND o.lease_epoch=r.lease_epoch WHERE o.sent_at IS NULL AND o.abandoned_at IS NULL"
             " GROUP BY r.job_id,r.attempt_id,r.lease_epoch ORDER BY r.last_failed_at")]
+
+    def discard_conflicted_remote_events(self, job: str, attempt: str, now: Optional[int] = None) -> int:
+        """Set aside the unsent results of an attempt the server refused (409), by hand only.
+
+        They stay in the database, are never uploaded again and are never marked sent: setting
+        a result aside is not delivering it. A batch that failed any other way may still
+        succeed, so it is left alone. Returns how many results were set aside."""
+        cursor = self.conn.execute(
+            "UPDATE remote_outbox SET abandoned_at=? WHERE job_id=? AND attempt_id=?"
+            " AND sent_at IS NULL AND abandoned_at IS NULL AND EXISTS ("
+            "SELECT 1 FROM remote_outbox_retry r WHERE r.job_id=remote_outbox.job_id"
+            " AND r.attempt_id=remote_outbox.attempt_id AND r.lease_epoch=remote_outbox.lease_epoch"
+            " AND r.status=409)", (now or _now(), job, attempt))
+        if cursor.rowcount:
+            self.conn.execute("DELETE FROM remote_outbox_retry WHERE job_id=? AND attempt_id=? AND status=409",
+                              (job, attempt))
+        return cursor.rowcount
+
+    def abandoned_remote_event_count(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM remote_outbox WHERE abandoned_at IS NOT NULL AND sent_at IS NULL").fetchone()[0]
 
     def mark_remote_events_sent(self, event_ids: List[int], now: Optional[int] = None) -> None:
         if not event_ids:
