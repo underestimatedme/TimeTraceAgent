@@ -11,7 +11,7 @@
 
 同一账号下同一设备只允许一个有效绑定，重复绑定会明确提示使用现有绑定或先在手机解绑；同名的不同电脑仍可分别绑定。已有绑定通过新版 Runner 的已登录库存上报登记设备标识，不需重新配对。旧记录缺少可靠标识，不能按名称自动合并，请在手机确认后解绑多余记录。
 
-服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。0.5.1 已发布到 GitHub Release 与 Homebrew；升级用 `brew upgrade timetraceagent`。
+服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。推荐使用已发布的 [0.5.2](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)。Homebrew 0.5.2 公式更新暂缓；需要本版请使用下方 pipx 安装方式。
 
 ## 0.5.0 起：手机数字确认绑定
 
@@ -25,8 +25,11 @@ AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里�
 
 ## 快速开始
 
+首次使用请看 [安装、绑定与第一个任务](docs/getting-started.md)。以下使用已有的 pipx（尚未安装可先 `brew install pipx`、`pipx ensurepath` 并重开终端）：
+
 ```sh
-brew install underestimatedme/timetrace/timetraceagent
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.2"
+tta --version
 tta setup                          # 检查工具 → 登记仓库 → 扫码绑定手机 → 安装后台 Runner
 ```
 
@@ -42,7 +45,7 @@ timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
 
-`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
+`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=2`：包含本次配对码与电脑展示信息，不包含长期凭据。手机核对电脑后显示 4 位数字，需在电脑输入并完成服务端确认才会生效。配对码也应保密。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
 
 二维码用半块字符绘制（两行模块占一行文字，约 49×25 字符，80 列终端放得下），四周留 4 个模块的静区。彩色终端里强制白底黑码，与终端主题无关；设置了 `NO_COLOR`、`TERM=dumb` 或输出不是终端时改为不带颜色的反相字符（适合深色背景的终端）。上方框内的「2 分钟内有效（剩余 1:45）」每秒原地刷新，不会重印二维码；过期后自动换新码，最多 5 轮。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
 
@@ -102,22 +105,22 @@ timetrace workspace check remove TimeTrace build
 
 `timetrace agent doctor` 会打印每个工具的套餐等级和实时额度，和手机「你的 AI」页应显示的一致，用来现场对照。
 
-## 0.5.2 发布准备
+## 0.5.2 已发布
 
 0.5.2 包含只读开发状态采集、Git 读取失败时的正确报告，以及多电脑时间偏差导致事件回执失败的修复。先部署包含 `server_now` 的 Valley 服务端，再升级 Agent。旧服务端缺少该字段时仍使用本地时间；已持久化的事件保持原时间戳，系统时钟仍应同步。
 
-此版本正在准备发布；下面的安装命令仍指向已发布的 0.5.1。发布和 Homebrew 更新完成后再切换安装指引。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
+[0.5.2 已发布](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)，可从发布 tag 安装。Homebrew 0.5.2 更新暂缓，`brew upgrade` 目前不提供本版。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
 
 ## 安装
 
 三种方式，任选其一：
 
 ```sh
-# 1) Homebrew（推荐）；升级用 brew upgrade timetraceagent
+# 1) Homebrew：当前尚未提供 0.5.2；需要新版使用下方 pipx 方式
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.1"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.2"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
