@@ -191,3 +191,48 @@ class UploadJobFileTest(unittest.TestCase):
         self.assertIn(b'name="file"; filename="pkg.zip"', body)
         self.assertIn(b"\r\n\r\nPK\x03\x04\r\n--", body)
         self.assertGreaterEqual(timeout, 120)
+
+
+class RawResponse:
+    """A reply that is not Valley's JSON envelope, as a gateway answers when the service is away."""
+
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def read(self, n=-1):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class NonJsonReplyTest(unittest.TestCase):
+    def error_for(self, status, body=b"<html>bad gateway</html>"):
+        client = CloudClient("https://v", opener=lambda req, timeout: RawResponse(status, body))
+        with self.assertRaises(CloudError) as caught:
+            client.request("POST", "/runner/jobs/claim", {})
+        return caught.exception
+
+    def test_the_log_line_names_the_http_status(self):
+        error = self.error_for(502)
+        self.assertEqual(error.status, 502)
+        self.assertIn("HTTP 502", str(error))
+        self.assertIn("invalid Valley response", str(error))
+
+    def test_gateway_statuses_say_the_service_is_temporarily_away(self):
+        for status in (502, 503, 504):
+            self.assertIn("网关暂时不可用", str(self.error_for(status)), status)
+
+    def test_other_statuses_do_not_claim_a_gateway_problem(self):
+        self.assertNotIn("网关", str(self.error_for(200, b"not json")))
+        self.assertIn("HTTP 200", str(self.error_for(200, b"not json")))
+
+    def test_the_reply_body_never_reaches_the_message(self):
+        self.assertNotIn("secret-page", str(self.error_for(502, b"<html>secret-page</html>")))
+
+    def test_a_json_value_that_is_not_an_envelope_is_reported_the_same_way(self):
+        error = self.error_for(200, b"[1, 2]")
+        self.assertIn("HTTP 200", str(error))

@@ -292,6 +292,14 @@ class ClaudeAdapter(ToolAdapter):
         login is missing, expired, or the endpoint refuses."""
         return claude_usage.usage_samples(self._credentials(), now=time.time())
 
+    def quota_unavailable_reason(self) -> str:
+        """Why `can_read_quota` is false, in words the person can act on."""
+        oauth = self._credentials() or {}
+        if not oauth.get("accessToken"):
+            return ("本机的 Claude Code 未登录（钥匙串里没有可用令牌），读不到额度；"
+                    "请在本机运行 claude auth login")
+        return "本机的 Claude Code 登录已过期；请在本机运行 claude auth login"
+
     def capabilities(self) -> Dict[str, bool]:
         # Implemented surface: records runs, reads quota on demand through the
         # OAuth usage endpoint when a local login exists, dispatches headless,

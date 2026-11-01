@@ -20,6 +20,16 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 LOOPBACK_HOSTS = ("localhost",)
 
 
+def _invalid_reply(status: int) -> str:
+    """Valley's own answers are always a JSON envelope; anything else is a gateway or proxy page.
+    Say which HTTP status it was (never what the page contained) so a log line can tell a restart
+    or an overloaded gateway from a real fault."""
+    text = "invalid Valley response (HTTP %d)" % status
+    if status in (502, 503, 504):
+        text += "：网关暂时不可用，稍后自动重试"
+    return text
+
+
 class CloudError(RuntimeError):
     def __init__(self, message: str, status: int = 0, code: int = 0):
         super().__init__(message)
@@ -138,9 +148,9 @@ class CloudClient:
         try:
             envelope = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise CloudError("invalid Valley response", status=status) from exc
+            raise CloudError(_invalid_reply(status), status=status) from exc
         if not isinstance(envelope, dict):
-            raise CloudError("invalid Valley response", status=status)
+            raise CloudError(_invalid_reply(status), status=status)
         if status >= 400 or envelope.get("code") != 0:
             raise CloudError(str(envelope.get("message") or "Valley request failed")[:300], status,
                              _int(envelope.get("code")))
