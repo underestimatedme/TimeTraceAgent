@@ -118,6 +118,18 @@ class ClaudeAdapterQuotaTest(unittest.TestCase):
                          [("claude:five_hour", 41.0), ("claude:seven_day", 60.0)])
         self.assertTrue(adapter.capabilities()["can_read_quota"])
 
+    def test_says_why_quota_cannot_be_read_and_how_to_fix_it(self):
+        from timetrace.adapters.claude import ClaudeAdapter
+        from timetrace.billing import StaticBilling
+        signed_out = ClaudeAdapter({}, billing=StaticBilling(True, "test"),
+                                   # What a logged-out Claude Code leaves in the Keychain: the shell of the object, no tokens.
+                                   credentials=lambda: {"accessToken": "", "refreshToken": "", "expiresAt": 0,
+                                                        "subscriptionType": "max"})
+        self.assertFalse(signed_out.capabilities()["can_read_quota"])
+        self.assertIn("claude auth login", signed_out.quota_unavailable_reason())
+        self.assertIn("claude auth login", ClaudeAdapter(
+            {}, billing=StaticBilling(True, "test"), credentials=lambda: {}).quota_unavailable_reason())
+
     def test_utilization_is_always_a_percent(self):
         # The live endpoint reports percent (41.0, 60.0 observed on 2026-09-25); a
         # fraction-scaling heuristic would turn 0.5% into 50% and 1.0 into 1%.
