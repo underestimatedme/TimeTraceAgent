@@ -249,6 +249,9 @@ class Agent:
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
         self._log_given = log is not None
+        # Why a provider's quota is not being read, as last logged: a tool that
+        # silently drops out of the quota round looks identical to "nothing to report".
+        self._quota_skipped: Dict[str, str] = {}
         # Called once when Valley says this computer's binding was revoked
         # (unbound from the phone): the caller forgets the local credentials.
         self._on_revoked = on_revoked or (lambda: None)
@@ -2088,6 +2091,17 @@ class Agent:
             return 0
         return len(payloads)
 
+    def _note_quota_skipped(self, provider: str, adapter: Any) -> None:
+        """Log that `provider` is not being read, and why, once per distinct reason."""
+        try:
+            reason = str(adapter.quota_unavailable_reason())
+        except Exception:
+            reason = "本机读不到该工具的额度"
+        if self._quota_skipped.get(provider) == reason:
+            return
+        self._quota_skipped[provider] = reason
+        self.log("quota: %s skipped（%s）" % (provider, reason))
+
     def report_quota(self, now: float = None) -> int:
         """Read on-demand quota from adapters that support it and report it to
         Valley. This is what lets a parked (waiting_quota) Plan be re-queued when
@@ -2101,7 +2115,9 @@ class Agent:
         for provider, adapter in self.adapters.items():
             caps = getattr(adapter, "capabilities", lambda: {})()
             if not caps.get("can_read_quota"):
+                self._note_quota_skipped(provider, adapter)
                 continue
+            self._quota_skipped.pop(provider, None)
             try:
                 samples = adapter.read_limits()
             except Exception:

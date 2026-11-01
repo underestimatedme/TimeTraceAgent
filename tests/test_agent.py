@@ -729,6 +729,68 @@ class MaintenanceLoggingTest(unittest.TestCase):
         self.assertFalse(any("valley unreachable" in l and "t" == l for l in lines))
 
 
+class QuotaSkipReasonTest(unittest.TestCase):
+    """A provider whose quota cannot be read must be named in the log, not silently absent."""
+
+    class Reading(Adapter):
+        def read_limits(self):
+            return [Sample(bucket_key="codex:codex:primary", tool="codex", used_pct=42.0, reset_at=2000, window_mins=300)]
+
+    class SignedOut(Adapter):
+        def capabilities(self):
+            caps = super().capabilities()
+            caps["can_read_quota"] = False
+            return caps
+
+        def quota_unavailable_reason(self):
+            return "未登录或登录已过期，请在本机运行 claude auth login"
+
+    def agent(self, d, adapters, lines):
+        return Agent(Database(Path(d) / "timetrace.db"), FakeCloud(), adapters, Path(d), lambda: "t",
+                     inventory=lambda: ([], [{"id": "codex-default"}]), log=lines.append)
+
+    def test_names_the_provider_and_the_reason_once(self):
+        lines = []
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"codex": self.Reading(), "claude": self.SignedOut()}, lines)
+            agent.maintain(now=1000.0, force=True)
+            agent.maintain(now=1400.0, force=True)
+        skipped = [l for l in lines if "claude" in l and "claude auth login" in l]
+        self.assertEqual(len(skipped), 1, lines)
+        self.assertIn("quota", skipped[0])
+
+    def test_adapter_without_a_reason_still_gets_a_generic_line(self):
+        class Blind(Adapter):
+            def capabilities(self):
+                caps = super().capabilities()
+                caps["can_read_quota"] = False
+                return caps
+
+        lines = []
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"codex": self.Reading(), "claude": Blind()}, lines)
+            agent.maintain(now=1000.0, force=True)
+        self.assertTrue(any("claude" in l and "skipped" in l for l in lines), lines)
+
+    def test_logs_again_when_the_reason_changes_or_comes_back(self):
+        lines = []
+        signed_out = self.SignedOut()
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"claude": signed_out}, lines)
+            agent.maintain(now=1000.0, force=True)
+            signed_out.quota_unavailable_reason = lambda: "令牌已过期"
+            agent.maintain(now=1400.0, force=True)
+            signed_out.capabilities = lambda: {"can_record": True, "can_read_quota": True, "can_dispatch": True,
+                                               "can_resume": True, "can_enforce_zero_spend": True}
+            signed_out.read_limits = lambda: []
+            agent.maintain(now=1800.0, force=True)
+            signed_out.capabilities = lambda: {"can_record": True, "can_read_quota": False, "can_dispatch": True,
+                                               "can_resume": True, "can_enforce_zero_spend": True}
+            agent.maintain(now=2200.0, force=True)
+        reasons = [l for l in lines if "skipped" in l]
+        self.assertEqual(len(reasons), 3, lines)
+
+
 class AccountPoolTest(unittest.TestCase):
     def test_pool_id_follows_the_tool_account(self):
         class Keyed(Adapter):
