@@ -2177,7 +2177,8 @@ class Agent:
                 self.db.defer_remote_events(job, attempt, epoch, 409, now, now + 300)
                 if self._outbox_failures_logged.get(key) != "HTTP 409":
                     self._outbox_failures_logged[key] = "HTTP 409"
-                    self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s"
+                    self.log("result upload conflict: job %s attempt %s; %d event(s) retained locally; retry in 300s;"
+                             " never discarded automatically, see `timetrace agent doctor`"
                              % (job, attempt, len(rows)))
                 continue
             except Exception as exc:

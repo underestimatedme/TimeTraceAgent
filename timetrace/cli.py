@@ -608,6 +608,26 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_discard_results(args: argparse.Namespace) -> int:
+    """Set aside the results of one attempt the server refused (409). By hand only, never counted as delivered."""
+    home, _, db = _open(args)
+    refused = [p for p in db.remote_outbox_diagnostics()
+               if p["job_id"] == args.job and p["attempt_id"] == args.attempt and p["status"] == 409]
+    if not refused:
+        print("没有任务 %s / 尝试 %s 这个被服务器拒收（HTTP 409）的待上传批次。只有被拒收的批次可以丢弃；"
+              "其它失败会自己恢复，见 timetrace agent doctor。" % (args.job, args.attempt))
+        return 2
+    count = sum(p["pending_events"] for p in refused)
+    if not args.yes:
+        print("将丢弃任务 %s / 尝试 %s 的 %d 条结果（服务器已拒收）。它们仍保留在本机数据库，但不会再上传，也不算已送达。"
+              "确认请加 --yes。" % (args.job, args.attempt, count))
+        return 1
+    count = db.discard_conflicted_remote_events(args.job, args.attempt)
+    audit.record(home, "outbox_discard", job_id=args.job, attempt_id=args.attempt, events=count, source="local")
+    print("已丢弃 %d 条结果：仍保留在本机数据库，不再上传，也不算已送达。" % count)
+    return 0
+
+
 _LOGIN_LABEL = {"ok": "正常", "expired": "已过期 → 在这台 Mac 上重新登录", "missing": "未登录"}
 
 
@@ -813,9 +833,18 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
         print(line)
     diagnostics = lock_diagnostics(home)
     for pending in db.remote_outbox_diagnostics():
+        if pending["status"] == 409:
+            print("结果上报被服务器拒收: 任务 %s / 尝试 %s，HTTP 409，%d 条结果保留在本机，最早一条产生于 %s，已重试 %d 次；不会自动丢弃。" % (
+                pending["job_id"], pending["attempt_id"], pending["pending_events"],
+                _iso_local(pending["oldest_event_at"]), pending["failures"]))
+            print("  确认不再需要这些结果后运行: timetrace agent discard-results %s %s --yes" % (
+                pending["job_id"], pending["attempt_id"]))
+            continue
         print("结果上报待恢复: 任务 %s / 尝试 %s，%s，%d 条结果完整保留；下次重试 %s" % (
             pending["job_id"], pending["attempt_id"], _outbox_failure_text(pending["status"]),
             pending["pending_events"], _iso_local(pending["retry_at"])))
+    if db.abandoned_remote_event_count():
+        print("已手动丢弃的结果: %d 条（保留在本机数据库，不再上传，也不算已送达）" % db.abandoned_remote_event_count())
     for message in diagnostics:
         print("Execution lock: %s" % message)
     return 0 if paired and workspaces and not diagnostics else 1
@@ -1501,6 +1530,11 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
                          ).set_defaults(fn=cmd_agent_pause)
     agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
+    ad = agent_sub.add_parser("discard-results", help="set aside the results of an attempt the server refused (HTTP 409)")
+    ad.add_argument("job")
+    ad.add_argument("attempt")
+    ad.add_argument("--yes", action="store_true", help="really set them aside (without it only shows what would be)")
+    ad.set_defaults(fn=cmd_agent_discard_results)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
     ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                     help="do not register the Claude Code statusLine hook")
