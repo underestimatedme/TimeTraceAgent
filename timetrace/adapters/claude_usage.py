@@ -58,7 +58,7 @@ def _percent(value: Any) -> Optional[float]:
 
 def read_usage(credentials_path: Path, opener: Optional[Callable] = None,
                now: Optional[float] = None,
-               keychain: Callable[[], Optional[str]] = tiers.keychain_secret) -> Optional[List[Sample]]:
+               keychain: Callable[[], Optional[str]] = tiers.claude_keychain) -> Optional[List[Sample]]:
     return usage_samples(tiers.claude_oauth(credentials_path, keychain), opener=opener, now=now)
 
 

@@ -68,3 +68,57 @@ class AccountKeyTest(unittest.TestCase):
             other.write_text(json.dumps({"oauthAccount": {"accountUuid": "u-2"}}))
             self.assertNotEqual(tiers.claude_account_key(p), tiers.claude_account_key(other))
 
+
+class ClaudeKeychainTest(unittest.TestCase):
+    """The Keychain may hold several `Claude Code-credentials` items (one per account).
+    The one Claude Code is logged in with is the item named after the login user."""
+
+    GOOD = json.dumps({"claudeAiOauth": {"accessToken": "tok", "refreshToken": "ref", "expiresAt": 4102444800000, "subscriptionType": "max"}})
+    STALE = json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionType": "pro"}})
+
+    def fake_security(self, items, calls=None):
+        """`items` maps account -> secret; a lookup without -a answers like Keychain does: the first item."""
+        class Result:
+            def __init__(self, code, out=""):
+                self.returncode, self.stdout, self.stderr = code, out, ""
+
+        def run(command, **kwargs):
+            if calls is not None:
+                calls.append(command)
+            account = command[command.index("-a") + 1] if "-a" in command else None
+            if account is None:
+                return Result(0, next(iter(items.values()))) if items else Result(44)
+            return Result(0, items[account]) if account in items else Result(44)
+        return run
+
+    def test_prefers_the_item_named_after_the_login_user_over_a_stale_first_item(self):
+        import unittest.mock as mock
+        items = {"root": self.STALE, "joeyserver": self.GOOD}  # `root` is what an unscoped lookup returns first
+        with mock.patch.object(tiers.subprocess, "run", self.fake_security(items)), \
+                mock.patch.object(tiers, "_login_name", lambda: "joeyserver"):
+            oauth = tiers.claude_oauth(Path("/nonexistent"))
+        self.assertEqual(oauth.get("accessToken"), "tok")
+        self.assertEqual(oauth.get("subscriptionType"), "max")
+
+    def test_falls_back_to_an_unscoped_lookup_when_no_item_has_the_user_name(self):
+        import unittest.mock as mock
+        with mock.patch.object(tiers.subprocess, "run", self.fake_security({"someone": self.GOOD})), \
+                mock.patch.object(tiers, "_login_name", lambda: "joeyserver"):
+            self.assertEqual(tiers.claude_oauth(Path("/nonexistent")).get("accessToken"), "tok")
+
+    def test_when_every_item_is_blank_the_blank_one_still_gives_the_tier(self):
+        import unittest.mock as mock
+        with mock.patch.object(tiers.subprocess, "run", self.fake_security({"root": self.STALE})), \
+                mock.patch.object(tiers, "_login_name", lambda: "joeyserver"):
+            oauth = tiers.claude_oauth(Path("/nonexistent"))
+        self.assertFalse(oauth.get("accessToken"))
+        self.assertEqual(oauth.get("subscriptionType"), "pro")
+
+    def test_asks_for_the_secret_only_with_the_user_scoped_command_first(self):
+        import unittest.mock as mock
+        calls = []
+        with mock.patch.object(tiers.subprocess, "run", self.fake_security({"joeyserver": self.GOOD}, calls)), \
+                mock.patch.object(tiers, "_login_name", lambda: "joeyserver"):
+            tiers.claude_oauth(Path("/nonexistent"))
+        self.assertEqual(calls[0][:6], ["security", "find-generic-password", "-s", tiers.CLAUDE_KEYCHAIN_SERVICE, "-a", "joeyserver"])
+        self.assertEqual(len(calls), 1)  # a usable token stops the search
