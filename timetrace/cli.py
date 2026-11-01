@@ -43,7 +43,7 @@ def _adapters(cfg: Dict[str, Any]):
 
 
 def _log(msg: str) -> None:
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
+    print(time.strftime("%Y-%m-%d %H:%M:%S%z"), msg, flush=True)
 
 
 def _cloud(cfg: Dict[str, Any]) -> CloudClient:
