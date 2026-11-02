@@ -248,6 +248,7 @@ class Agent:
         self.quota_interval = quota_interval
         self._last_quota = 0.0
         self._last_inventory = None
+        self._last_inventory_push = None  # when the last inventory reached Valley (the heartbeat clock)
         # One line per upkeep round so a silent None from an adapter is visible
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
@@ -391,13 +392,17 @@ class Agent:
         # sleep prevention) are compared, so a pause reaches Valley at once.
         current = self._last_inventory_base
         extras = self.inventory_extras() if self.report_protocol else None
-        if (current, extras) != self._last_inventory:
+        # An unchanged protocol-2 inventory is still presence: Valley judges a computer alive by it.
+        heartbeat_due = self.report_protocol and (self._last_inventory_push is None or
+                                                  now - self._last_inventory_push >= self.heartbeat_interval)
+        if (current, extras) != self._last_inventory or heartbeat_due:
             try:
                 if extras is None:
                     self.cloud.update_inventory(self.access_token(), *current)
                 else:
                     self.cloud.update_inventory(self.access_token(), *current, extras=extras)
                 self._last_inventory = (current, extras)
+                self._last_inventory_push = now
                 runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
                                     inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
@@ -1900,6 +1905,9 @@ class Agent:
         try:
             while not self._stop.is_set():
                 try:
+                    # Presence must not depend on successfully replaying old
+                    # results or acquiring another job.
+                    self.maintain()
                     outcome = self.run_once()
                     backoff = interval
                     self._loop_errors.clear()
@@ -1960,16 +1968,14 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
-                # Before the remote-config hold: `agent sync` must answer
-                # even while a configuration change waits for idle.
-                if sync.pending(self.home):
-                    self.maintain()
+                # Upkeep first, every round: before the remote-config hold (so `agent sync` answers even while a configuration
+                # change waits for idle) and before waiting for a free slot (a full agent is still present).
+                upkeep_due = self._maintain_due
+                self._maintain_due = False
+                self.maintain(force=upkeep_due)
                 if self.remote_config is not None and self.remote_config(self, bool(active)):
                     self._stop.wait(interval)
                     continue
-                if self._maintain_due:
-                    self._maintain_due = False
-                    self.maintain(force=True)
                 if len(active) >= self.max_parallel:
                     wait(list(active), timeout=max(interval, .05), return_when=FIRST_COMPLETED)
                     continue
