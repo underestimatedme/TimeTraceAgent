@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -622,8 +623,32 @@ def cmd_agent_discard_results(args: argparse.Namespace) -> int:
         print("将丢弃任务 %s / 尝试 %s 的 %d 条结果（服务器已拒收）。它们仍保留在本机数据库，但不会再上传，也不算已送达。"
               "确认请加 --yes。" % (args.job, args.attempt, count))
         return 1
-    count = db.discard_conflicted_remote_events(args.job, args.attempt)
-    audit.record(home, "outbox_discard", job_id=args.job, attempt_id=args.attempt, events=count, source="local")
+    # The person's decision is written - and forced to disk - before anything is changed. If the audit log cannot take
+    # it, nothing is discarded; if the process ends after the commit, the request entry is what tells the truth.
+    discard_id = uuid.uuid4().hex[:12]
+    ids = {"discard_id": discard_id, "job_id": args.job, "attempt_id": args.attempt, "source": "local"}
+    try:
+        audit.record_durable(home, "discard_requested", events=count, **ids)
+    except OSError as exc:
+        print("审计日志写不进去（%s），为了不留下没有记录的处置，没有丢弃任何结果；它们仍等着上传结果的处理。"
+              "先让 %s 可写，再重新运行。" % (exc, audit.path(home)))
+        return 3
+    try:
+        count = db.discard_conflicted_remote_events(args.job, args.attempt)
+    except Exception as exc:
+        # Whether the statement or its follow-up reached the file is not known, so the entry says exactly that.
+        audit.record(home, "discard_failed", error=type(exc).__name__, database_change="unknown", **ids)
+        raise
+    if not count:
+        audit.record(home, "discard_unchanged", reason="nothing was left to set aside", **ids)
+        print("没有可丢弃的结果：这个批次刚被处理过，或已不是被拒收的状态。")
+        return 2
+    try:
+        audit.record_durable(home, "outbox_discard", events=count, **ids)
+    except OSError as exc:
+        print("已丢弃 %d 条结果（仍保留在本机数据库，不再上传，也不算已送达），但完成记录没能写进审计日志（%s）。"
+              "丢弃前的请求记录（discard_requested，编号 %s）已在审计日志里。" % (count, exc, discard_id))
+        return 4
     print("已丢弃 %d 条结果：仍保留在本机数据库，不再上传，也不算已送达。" % count)
     return 0
 
