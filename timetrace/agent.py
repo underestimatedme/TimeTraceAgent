@@ -32,6 +32,9 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
 OUTBOX_REFUSED_RETRY_SECONDS = 60  # a batch Valley answered 409 is retried this rarely
+# A batch whose upload failed (other than 409) waits 5 s, then doubles, up to the cap.
+OUTBOX_ERROR_RETRY_FIRST_SECONDS = 5
+OUTBOX_ERROR_RETRY_SECONDS = 30
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
 JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
@@ -226,8 +229,9 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
-        self._outbox_refused = {}  # (job, attempt, epoch) → monotonic time of the next retry
-        self._outbox_refused_logged = set()
+        # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
+        # (remote_outbox_retry), so a restart keeps every batch's waiting time.
+        self._outbox_failures_logged = {}
         self._loop_errors = set()
         self._maintain_due = False
         # config `upload_output_tail`: false keeps run logs on this computer.
@@ -2169,29 +2173,65 @@ class Agent:
         refused = None
         for key, rows in batches.items():
             job, attempt, epoch = key
-            if self._outbox_refused.get(key, 0) > time.monotonic():
+            retry = self.db.remote_event_retry(job, attempt, epoch)
+            if retry is not None and time.time() < retry["retry_at"]:
                 continue
             rows.sort(key=lambda row: row["seq"])
+            # Pairing/refresh problems are not this batch's fault: they still
+            # propagate to the claim loop's own handling.
+            token = self.access_token()
             try:
-                self.cloud.append_events(self.access_token(), job, attempt, epoch,
-                                         [row["payload"] for row in rows])
+                self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
             except CloudError as exc:
-                if exc.status != 409:
+                if exc.status == 401:
                     raise
-                self._outbox_refused[key] = time.monotonic() + OUTBOX_REFUSED_RETRY_SECONDS
-                if key not in self._outbox_refused_logged:
-                    self._outbox_refused_logged.add(key)
+                if exc.status != 409:
+                    # Valley answered, but not with success: this attempt's
+                    # problem, not the other batches' or the claim's.
+                    self._defer_failed_batch(key, rows, exc, retry)
+                    continue
+                # A stale/conflicting attempt must not block presence, claims
+                # or unrelated result batches. Never treat conflict as an ACK.
+                now = time.time()
+                self.db.defer_remote_events(job, attempt, epoch, 409, now, now + OUTBOX_REFUSED_RETRY_SECONDS)
+                if self._outbox_failures_logged.get(key) != "HTTP 409":
+                    self._outbox_failures_logged[key] = "HTTP 409"
                     self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
-                             "事件保留在本机队列，不影响其他回报和领取新任务。" % (job, epoch, attempt))
+                             "事件保留在本机队列，不影响其他回报和领取新任务；不会自动丢弃，见 `timetrace agent doctor`。"
+                             % (job, epoch, attempt))
                 refused = refused or exc
                 continue
-            self._outbox_refused.pop(key, None)
-            self._outbox_refused_logged.discard(key)
+            except Exception as exc:
+                # No response at all (timeout, network): the next batch would
+                # wait out the same timeout, so this round ends here. The
+                # batch stays queued and is tried again after its delay.
+                self._defer_failed_batch(key, rows, exc, retry)
+                break
             self.db.mark_remote_events_sent([row["id"] for row in rows])
+            self.db.clear_remote_event_retry(job, attempt, epoch)
+            self._outbox_failures_logged.pop(key, None)
         if batches:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)
         if refused is not None:
             raise refused
+
+    def _defer_failed_batch(self, key, rows, exc, retry) -> None:
+        """Keep a batch whose upload failed (anything but 409/401) and retry it
+        after 5 s, doubling with each failure up to OUTBOX_ERROR_RETRY_SECONDS:
+        a blip recovers at once, a long outage settles at one try per cap. The
+        failure is written once per batch until it changes; only its type and
+        status, never the exception text."""
+        job, attempt, epoch = key
+        status = exc.status if isinstance(exc, CloudError) else 0
+        failures = (retry["failures"] if retry else 0) + 1
+        delay = min(OUTBOX_ERROR_RETRY_SECONDS, OUTBOX_ERROR_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 8))
+        now = time.time()
+        self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay)
+        failure = "HTTP %d" % status if status else exc.__class__.__name__
+        if self._outbox_failures_logged.get(key) != failure:
+            self._outbox_failures_logged[key] = failure
+            self.log("result upload failed: job %s attempt %s: %s; %d event(s) retained locally; retrying with backoff up to %ds"
+                     % (job, attempt, failure, len(rows), OUTBOX_ERROR_RETRY_SECONDS))
 
     def _note_loop_error(self, exc) -> None:
         """The claim loops retry after any error; say so once per distinct error

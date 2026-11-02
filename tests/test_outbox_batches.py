@@ -51,12 +51,16 @@ class OutboxBatchTest(OutboxFixture, unittest.TestCase):
             if job == "b-job":
                 raise OSError("response lost after server commit")
         self.cloud.append_events = fail_second
-        with self.assertRaises(OSError): self.agent.flush_outbox()
+        self.agent.flush_outbox()  # a lost response no longer aborts the flush: the batch is kept with a stored retry time
         self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], second)
+        retry_at = self.db.remote_event_retry("b-job", "b1", 3)["retry_at"]
         self.db.close()
         self.db = Database(self.path)
         self.agent.db = self.db
         self.cloud.append_events = append
+        self.agent.flush_outbox()
+        self.assertEqual(len(self.sent), 2, "the stored waiting time survives the reopen: nothing is resent yet")
+        self.db.conn.execute("UPDATE remote_outbox_retry SET retry_at=?", (retry_at - 3600,))
         self.agent.flush_outbox()
         self.assertEqual(self.sent, [("a-job", "a1", 3, first), ("b-job", "b1", 3, second), ("b-job", "b1", 3, second)])
         self.assertEqual(self.db.pending_remote_events(), [])
@@ -98,13 +102,19 @@ class OutboxConflictIsolationTest(OutboxFixture, unittest.TestCase):
         # The refused batch is kept durably, never discarded.
         self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], dead)
 
-    def test_non_conflict_failure_still_stops_the_flush(self):
+    def test_a_failure_without_a_response_ends_the_round_without_raising(self):
         self.enqueue("a-job", "a1")
         self.enqueue("b-job", "b1")
         def down(*args): raise OSError("network down")
-        self.cloud.append_events = down
-        with self.assertRaises(OSError): self.agent.flush_outbox()
+        calls = []
+        def down_once(*args):
+            calls.append(args[1])
+            raise OSError("network down")
+        self.cloud.append_events = down_once
+        self.agent.flush_outbox()  # no longer raises: the failed batch waits (stored), and this round ends at it
+        self.assertEqual(calls, ["a-job"], "the next batch would wait out the same timeout")
         self.assertEqual(len(self.db.pending_remote_events()), 4)
+        self.assertEqual(self.db.remote_event_retry("a-job", "a1", 3)["status"], 0)
 
     def test_refused_batch_is_not_resent_on_every_tick(self):
         self.enqueue("dead-job", "dead-attempt")
