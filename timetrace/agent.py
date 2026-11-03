@@ -20,6 +20,7 @@ from timetrace.db import Database
 from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
                        worktree)
 from timetrace.remote_control import RunControl
+from timetrace.mcp_access import parse_claim, skip_note
 from timetrace.process import tail_text
 from timetrace.redact import redact
 from timetrace.review_evidence import source_run_evidence
@@ -854,6 +855,20 @@ class Agent:
             return RESUME_PROMPT + (RESUME_NOTE + note if note else "")
         return job["prompt"]
 
+    def _mcp_access(self, claim, adapter, in_folder):
+        """The TimeTrace MCP access this claim carries, for an execution run in a worktree whose tool can use it; None
+        otherwise (and one line in the log saying why, with neither the token nor any part of the address). Folder runs
+        never get it: they run with no MCP server at all."""
+        if in_folder or not isinstance(claim, dict) or claim.get("mcp") is None:
+            return None
+        if getattr(adapter, "supports_mcp", False) is not True:
+            self.log(skip_note("this tool's adapter does not take it"))
+            return None
+        access, reason = parse_claim(claim, cloud_base_url=getattr(self.cloud, "base_url", None))
+        if access is None:
+            self.log(skip_note(reason))
+        return access
+
     def _execute_tracked(self, claim, workspace, adapter, checkpoint, plan_key, log_file, deadline,
                          ws_lock, cancel_event, resuming, session_id, execution_job, local_id, control=None):
         job = claim["job"]
@@ -1032,6 +1047,9 @@ class Agent:
                 # A fresh run never inherits an earlier run's result.json.
                 results.prepare_out_dir(execution_path, fresh=not resuming)
                 extra_kw = {"control": control} if interactive else {}
+                mcp = self._mcp_access(claim, adapter, in_folder)
+                if mcp is not None:
+                    extra_kw["mcp"] = mcp
                 if in_folder:
                     folder_run = adapter.resume_folder if resuming else adapter.start_folder
                     def run(prompt, cwd, session, log, cancel):
