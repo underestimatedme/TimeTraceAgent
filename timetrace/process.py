@@ -8,6 +8,7 @@ import time
 from typing import IO, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
+from timetrace.redact import mask_timetrace_tokens
 
 MAX_CAPTURED_LINES = 10_000
 MAX_LOG_BYTES = 10 * 1024 * 1024
@@ -99,6 +100,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 def _tee(stream: IO[str], log: IO[str], lines: Optional[List[str]], lock: threading.Lock, prefix: str) -> None:
     for line in iter(stream.readline, ""):
+        line = mask_timetrace_tokens(line)
         if lines is not None:
             lines.append(line.rstrip("\n"))
             if len(lines) > MAX_CAPTURED_LINES:

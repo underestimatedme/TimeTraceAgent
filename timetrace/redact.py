@@ -36,6 +36,8 @@ _TOKEN_RULES = [
     ("aliyun", re.compile(_B + r"LTAI[0-9A-Za-z]{12,30}" + _E)),
     ("npm", re.compile(_B + r"npm_[A-Za-z0-9]{36}" + _E)),
     ("jwt", re.compile(_B + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")),
+    # TimeTrace's own MCP tokens: the access token a dispatched run is given (ttm_) and the refresh token (ttr_).
+    ("timetrace", re.compile(_B + r"tt[mr]_[A-Za-z0-9_-]{20,}")),
 ]
 
 # "Authorization: Bearer <x>" / "Basic <x>" (Basic only after Authorization,
@@ -76,6 +78,16 @@ def _assignment(match: Match) -> str:
     if keep:
         return match.group(0)
     return match.group("key") + match.group("sep") + match.group("quote") + MASK
+
+
+_TIMETRACE_TOKEN = next(pattern for kind, pattern in _TOKEN_RULES if kind == "timetrace")
+
+
+def mask_timetrace_tokens(text: str) -> str:
+    """`text` with TimeTrace MCP tokens masked and nothing else changed. A dispatched run's token is in the tool's
+    environment, so whatever the tool prints (a model running `env`) is masked as it is written to the run's log, before
+    anything reads that log."""
+    return _TIMETRACE_TOKEN.sub("[REDACTED:timetrace]", text) if "tt" in text else text
 
 
 def redact(text: Optional[str]) -> str:

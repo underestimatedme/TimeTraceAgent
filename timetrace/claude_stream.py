@@ -43,6 +43,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
+from timetrace.redact import mask_timetrace_tokens
 from timetrace.process import MAX_CAPTURED_LINES, MAX_LOG_BYTES, _kill_group, _shell_quote, child_env
 
 INIT_REQUEST_ID = "timetrace-init"
@@ -149,6 +150,7 @@ class StreamSession:
 
     def _read_stdout(self, stream, log) -> None:
         for line in iter(stream.readline, ""):
+            line = mask_timetrace_tokens(line)  # a run's token is in its environment: whatever it prints is masked first
             raw = line.rstrip("\n")
             self._log(log, line)
             msg = None
@@ -184,7 +186,7 @@ class StreamSession:
 
     def _read_stderr(self, stream, log) -> None:
         for line in iter(stream.readline, ""):
-            self._log(log, "[stderr] " + line)
+            self._log(log, "[stderr] " + mask_timetrace_tokens(line))
 
     def _on_control_request(self, msg: Dict[str, Any]) -> None:
         request_id = str(msg.get("request_id") or "")

@@ -153,5 +153,32 @@ class RedactNoFalsePositiveTest(unittest.TestCase):
         self.assertEqual(redact(once), once)
 
 
+
+class TimeTraceTokenTest(unittest.TestCase):
+    """The access token of a dispatched run (ttm_) and TimeTrace's refresh token (ttr_) are masked wherever they appear."""
+
+    def test_an_access_token_in_an_environment_line_is_masked(self):
+        text = "TIMETRACE_MCP_TOKEN=ttm_" + "a" * 43
+        self.assertNotIn("ttm_" + "a" * 20, redact(text))
+        self.assertIn("REDACTED", redact(text))
+
+    def test_a_refresh_token_is_masked_too(self):
+        self.assertNotIn("B" * 30, redact("refresh ttr_" + "B" * 30))
+
+    def test_the_token_is_masked_in_json_headers_and_prose(self):
+        for text in ('{"token": "ttm_%s"}' % ("c" * 40), "Authorization: Bearer ttm_%s" % ("d" * 40),
+                     "the token is ttm_%s, right?" % ("e" * 40), "x=ttm_%s;y" % ("f" * 40)):
+            self.assertNotRegex(redact(text), r"ttm_[A-Za-z0-9_-]{20,}")
+
+    def test_what_is_not_a_token_is_left_alone(self):
+        for text in ("ttm_short", "attm_" + "a" * 30, "see ttm_ for details", "git commit -m 'ttr_ prefix' main"):
+            self.assertEqual(redact(text), text)
+
+    def test_the_masking_used_for_logs_changes_only_tokens(self):
+        from timetrace.redact import mask_timetrace_tokens
+        self.assertEqual(mask_timetrace_tokens("password = hunter2hunter2 and ttm_" + "g" * 30), "password = hunter2hunter2 and [REDACTED:timetrace]")
+        self.assertEqual(mask_timetrace_tokens("nothing to see"), "nothing to see")
+
+
 if __name__ == "__main__":
     unittest.main()
