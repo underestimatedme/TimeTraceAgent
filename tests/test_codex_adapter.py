@@ -224,6 +224,15 @@ class McpInjectionTest(unittest.TestCase):
             self.assertEqual([o for o in overrides if "approval_mode" in o], ['mcp_servers.timetrace.default_tools_approval_mode="approve"'])
         self.assertFalse([o for o in config_overrides(codex.build_cmd(self.cfg, "do it", "/wt")) if "approval" in o])
 
+    def test_codex_is_not_left_to_write_its_environment_to_disk_while_it_holds_the_token(self):
+        # Found with the real codex 0.165: its shell snapshot (a .sh under CODEX_HOME/shell_snapshots that is written for the
+        # model's commands) holds `export TIMETRACE_MCP_TOKEN=...`, a file that outlives the run. A run with the access
+        # does not write one.
+        for resume in (None, "tid"):
+            overrides = config_overrides(codex.build_cmd(self.cfg, "do it", "/wt", resume=resume, mcp=self.access()))
+            self.assertIn("features.shell_snapshot=false", overrides)
+        self.assertFalse([o for o in config_overrides(codex.build_cmd(self.cfg, "do it", "/wt")) if "shell_snapshot" in o])
+
     def test_without_it_the_command_is_what_it_was(self):
         for resume in (None, "tid"):
             plain = codex.build_cmd(self.cfg, "do it", "/wt", resume=resume)

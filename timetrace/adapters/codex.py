@@ -201,7 +201,10 @@ def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] 
                 "-c", "mcp_servers.timetrace.bearer_token_env_var=%s" % json.dumps(ENV_NAME),
                 # `codex exec` has approval policy "never", which fails every MCP tool call that is not pre-approved. This
                 # server only: the tools a dispatched run may call are limited by Valley (the run's fixed policy), not here.
-                "-c", 'mcp_servers.timetrace.default_tools_approval_mode="approve"']
+                "-c", 'mcp_servers.timetrace.default_tools_approval_mode="approve"',
+                # Codex writes the environment of its shell (this token included) to CODEX_HOME/shell_snapshots/*.sh for the
+                # model's commands, and the file stays after the run: a run that holds the token does not write one.
+                "-c", "features.shell_snapshot=false"]
     cmd += list(cfg.get("extra_args") or [])
     cmd += [SAFETY_RULES + "\n" + prompt]
     return cmd
