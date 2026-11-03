@@ -55,10 +55,11 @@ def build_cmd(
     # content, and -p mode skips the trust dialog that would guard them.
     if cfg.get("setting_sources", "user"):
         cmd += ["--setting-sources", str(cfg.get("setting_sources", "user"))]
-    cmd += ["--append-system-prompt", SAFETY_RULES]
     if mcp_config:
-        # Added to the user's own MCP servers, never replacing them: no --strict-mcp-config here.
+        # Added to the user's own MCP servers, never replacing them: no --strict-mcp-config here. `--mcp-config` takes every
+        # plain word after it as one more config file (the prompt included), so another option must come right after it.
         cmd += ["--mcp-config", mcp_config]
+    cmd += ["--append-system-prompt", SAFETY_RULES]
     cmd += list(cfg.get("extra_args") or [])
     cmd += [safe_positional(prompt)]
     return cmd
@@ -171,9 +172,9 @@ def build_stream_cmd(cfg: Dict[str, Any], session_id: Optional[str] = None,
     # H-5: project settings are worktree content.
     if cfg.get("setting_sources", "user"):
         cmd += ["--setting-sources", str(cfg.get("setting_sources", "user"))]
-    cmd += ["--append-system-prompt", SAFETY_RULES]
     if mcp_config:
-        cmd += ["--mcp-config", mcp_config]
+        cmd += ["--mcp-config", mcp_config]  # (an option comes right after it: see build_cmd)
+    cmd += ["--append-system-prompt", SAFETY_RULES]
     cmd += list(cfg.get("extra_args") or [])
     return cmd
 
@@ -303,7 +304,11 @@ def remove_mcp_config(path: Optional[str]) -> None:
     """Delete the config and the directory made for it; whatever happened to the run."""
     if not path:
         return
-    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    parent = os.path.dirname(path)
+    # Only what write_mcp_config made (a directory "mcp-…" holding "mcp-….json"): never a directory that merely holds a file.
+    if not (os.path.basename(parent).startswith("mcp-") and os.path.basename(path).startswith("mcp-") and path.endswith(".json")):
+        return
+    shutil.rmtree(parent, ignore_errors=True)
 
 
 class ClaudeAdapter(ToolAdapter):

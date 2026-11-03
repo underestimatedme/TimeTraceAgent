@@ -215,8 +215,6 @@ class StreamAdapterTest(unittest.TestCase):
         self.assertEqual([e["type"] for e in seen], ["approval_requested", "approval_resolved"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class McpInjectionTest(unittest.TestCase):
@@ -256,10 +254,8 @@ class McpInjectionTest(unittest.TestCase):
         with patch.dict(os.environ, env):
             run = adapter.resume if resume else adapter.start
             result = run("build it", str(self.d), "11111111-2222-3333-4444-555555555555", str(self.d / log), cancel, control=ctl, mcp=mcp)
-        after = dict(os.environ)
-        for key in env:
-            before.pop(key, None); after.pop(key, None)
-        self.assertEqual(before, after, "the process's own environment changed")
+            during = dict(os.environ)  # (read while the patch is still in: after it, the environment is always restored)
+        self.assertEqual(dict(before, **env), during, "the process's own environment changed")
         return result
 
     def transcript_records(self):
@@ -282,6 +278,39 @@ class McpInjectionTest(unittest.TestCase):
         self.assertEqual(plain[plain.index("--mcp-config") + 1], "/x/mcp.json")
         self.assertEqual(plain[plain.index("--allowedTools") + 1], "mcp__timetrace")
         self.assertNotIn("--strict-mcp-config", plain)
+
+    def test_the_config_is_followed_by_an_option_so_it_can_never_swallow_the_prompt(self):
+        # `--mcp-config <configs...>` and `--allowedTools <tools...>` take every plain word after them: a real Claude Code read
+        # the prompt that came right after the config path as a second config file and refused to start (found with the real
+        # `claude`, which the fake stream cannot catch). Whatever follows a path of ours must be an option.
+        for cfg in ({"bin": "claude"}, {"bin": "claude", "allowed_tools": ["Bash(npm test)"], "model": "opus", "setting_sources": ""},
+                    {"bin": "claude", "extra_args": ["--max-turns", "3"]}):
+            for cmd in (claude.build_stream_cmd(cfg, session_id="abc", mcp_config="/x/mcp.json"),
+                        claude.build_cmd(cfg, "do the task", session_id="abc", mcp_config="/x/mcp.json")):
+                at = cmd.index("--mcp-config")
+                self.assertTrue(all(word.startswith("-") for word in cmd[at + 2:at + 3]), cmd[at:at + 3])
+                self.assertEqual(len(cmd) > at + 2, True)
+                tools = cmd.index("--allowedTools")
+                words = []
+                for word in cmd[tools + 1:]:
+                    if word.startswith("-"):
+                        break
+                    words.append(word)
+                self.assertNotIn("do the task", words)
+            self.assertEqual(claude.build_cmd(cfg, "do the task", session_id="abc", mcp_config="/x/mcp.json")[-1], "do the task")
+
+    def test_only_the_directory_write_mcp_config_made_is_ever_removed(self):
+        victim = self.d / "victim"
+        victim.mkdir()
+        (victim / "mcp.json").write_text("{}")
+        (victim / "keep.txt").write_text("x")
+        claude.remove_mcp_config(str(victim / "mcp.json"))
+        claude.remove_mcp_config(str(victim / "mcp-x.json"))
+        self.assertTrue((victim / "keep.txt").exists())
+        path = claude.write_mcp_config(str(self.d), self.access())
+        claude.remove_mcp_config(path)
+        self.assertFalse(Path(path).parent.exists())
+        claude.remove_mcp_config(None)
 
     def test_without_it_the_command_is_what_it_was(self):
         cfg = {"bin": "claude", "allowed_tools": ["Bash(npm test)"], "model": "opus"}
@@ -401,3 +430,7 @@ class McpInjectionTest(unittest.TestCase):
             adapter.start("x", str(self.d), "s", str(self.d / "no-such-dir" / "run.log"), None, control=None, mcp=self.access())
         self.assertNotIn(self.TOKEN, str(caught.exception))
         self.assertNotIn(self.TOKEN[4:], repr(caught.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

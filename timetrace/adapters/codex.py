@@ -198,7 +198,10 @@ def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] 
         # TimeTrace's MCP server for this run. The address is in the command (it is not a secret); the token is not: Codex
         # reads it from the environment variable named here, which only this process is given.
         cmd += ["-c", "mcp_servers.timetrace.url=%s" % json.dumps(mcp.url),
-                "-c", "mcp_servers.timetrace.bearer_token_env_var=%s" % json.dumps(ENV_NAME)]
+                "-c", "mcp_servers.timetrace.bearer_token_env_var=%s" % json.dumps(ENV_NAME),
+                # `codex exec` has approval policy "never", which fails every MCP tool call that is not pre-approved. This
+                # server only: the tools a dispatched run may call are limited by Valley (the run's fixed policy), not here.
+                "-c", 'mcp_servers.timetrace.default_tools_approval_mode="approve"']
     cmd += list(cfg.get("extra_args") or [])
     cmd += [SAFETY_RULES + "\n" + prompt]
     return cmd

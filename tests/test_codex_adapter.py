@@ -189,8 +189,6 @@ class AdapterBlockedResetTest(unittest.TestCase):
         self.assertEqual(len(res.samples), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class McpInjectionTest(unittest.TestCase):
@@ -215,6 +213,16 @@ class McpInjectionTest(unittest.TestCase):
             self.assertTrue(cmd[-1].endswith("do it"))
             # before the configured extra arguments and the prompt
             self.assertLess(cmd.index('mcp_servers.timetrace.url="%s"' % self.URL), len(cmd) - 1)
+
+    def test_codex_is_told_not_to_stop_at_a_confirmation_for_timetrace_tools(self):
+        # `codex exec` runs with approval policy "never": without this a call of any MCP tool fails with "MCP tool call
+        # requires approval, but approval policy is never" (found with the real codex 0.165; the fake cannot show it). It is
+        # the one TimeTrace server only, and what its tools may do is decided by Valley's fixed policy of the run.
+        for resume in (None, "tid"):
+            overrides = config_overrides(codex.build_cmd(self.cfg, "do it", "/wt", resume=resume, mcp=self.access()))
+            self.assertIn('mcp_servers.timetrace.default_tools_approval_mode="approve"', overrides)
+            self.assertEqual([o for o in overrides if "approval_mode" in o], ['mcp_servers.timetrace.default_tools_approval_mode="approve"'])
+        self.assertFalse([o for o in config_overrides(codex.build_cmd(self.cfg, "do it", "/wt")) if "approval" in o])
 
     def test_without_it_the_command_is_what_it_was(self):
         for resume in (None, "tid"):
@@ -257,7 +265,8 @@ sys.exit(int(os.environ.get("TT_FAKE_EXIT", "0")))
             transcript = Path(d) / "t.jsonl"
             adapter = codex.CodexAdapter({"bin": self.fake_codex(d), "sandbox": "workspace-write"}, billing=StaticBilling(True))
             before = dict(os.environ)
-            with patch.dict(os.environ, dict({"TT_FAKE_TRANSCRIPT": str(transcript)}, **(extra_env or {}))):
+            patched = dict({"TT_FAKE_TRANSCRIPT": str(transcript)}, **(extra_env or {}))
+            with patch.dict(os.environ, patched):
                 with patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
                     run = adapter.resume if resume else adapter.start
                     try:
@@ -265,14 +274,13 @@ sys.exit(int(os.environ.get("TT_FAKE_EXIT", "0")))
                     except Exception:
                         result = None
                         self.raised = True
+                during = dict(os.environ)  # (read while the patch is still in: after it, the environment is always restored)
             records = [json.loads(line) for line in transcript.read_text().splitlines()]
             log = (Path(d) / "run.log").read_text()
             last = Path(d) / "run.log.last.md"
             if keep is not None:
                 keep.append(last.read_text() if last.exists() else None)
-            after = dict(os.environ)
-            before.pop("TT_FAKE_TRANSCRIPT", None); after.pop("TT_FAKE_TRANSCRIPT", None)
-            self.assertEqual(before, after, "the process's own environment changed")
+            self.assertEqual(dict(before, **patched), during, "the process's own environment changed")
         return result, records, log
 
     def test_a_run_has_the_token_only_in_its_environment(self):
@@ -351,3 +359,7 @@ sys.exit(int(os.environ.get("TT_FAKE_EXIT", "0")))
         _, first, _ = self.run_adapter(False, self.access())
         _, second, _ = self.run_adapter(True, self.access("ttm_SENTINEL_" + "Q1w2E3r4T5" * 4))
         self.assertNotEqual(first[0]["token_in_env"], second[0]["token_in_env"])
+
+
+if __name__ == "__main__":
+    unittest.main()
