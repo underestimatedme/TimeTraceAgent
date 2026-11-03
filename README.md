@@ -2,7 +2,15 @@
 
 给 Claude Code 和 Codex 排任务的无人值守队列，也是刻迹 iOS App 的电脑端 Runner：手机派任务，这台 Mac 用你已经登录的 `claude` / `codex` 执行。撞到限额就睡到重置时间，再用原会话续接；顺手把两个工具每个限额桶的余量采样进 SQLite。
 
-命令是 `timetrace`，短名 `tta`，两者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
+命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
+
+## 0.6.0：MCP 接入与正式 Runner 修复
+
+包含已安装正式版本的心跳恢复、成果上传隔离、手动放弃成果的持久审计，以及 Claude Code / Codex 派活中的 MCP 接入。任务访问随 attempt 和 lease 失效；临时配置使用 0600 权限并在运行结束后清理。MCP 令牌不放进命令参数，运行日志与上传成果会脱敏；持有 MCP 访问的 Codex 任务关闭 shell snapshot，避免环境令牌被持久化。
+
+在 [TimeTrace 用户控制台的 AI 连接](https://timetrace.atlaspaces.com/workspace/connections) 查看客户端接入指引。派活任务自动绑定对应访问；成果仍由用户验收，AI 没有验收工具。完整验证范围和局限见 [0.6.0 发布说明](docs/releases/0.6.0.md) 与 [真实 MCP 联调记录](docs/mcp-e2e-2026-11.md)。用户配置的其他 Claude MCP 服务器仍会加载，大型工具目录可能消耗较多上下文。
+
+先升级配套服务端，再更新已有安装并重启同一个 Runner：`brew update && brew upgrade timetraceagent`，然后执行 `timetrace agent install` 和 `timetrace agent doctor`。已有配对与数据保留；首次安装使用 `brew install underestimatedme/timetrace/timetraceagent`。历史版本说明保留在下方。
 
 
 ## 0.5.7：首次配置、交付证据与发布闭环
