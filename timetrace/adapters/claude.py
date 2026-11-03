@@ -8,6 +8,9 @@ Facts this relies on (verified 2026-09-02 on Claude Code 2.1.258):
 - there is NO on-demand quota query, so read_limits() returns None.
 """
 import json
+import os
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -18,15 +21,22 @@ from timetrace.billing import billing_env_keys, claude_verifier
 from timetrace import tiers
 from timetrace.adapters import claude_usage
 from timetrace.claude_stream import run_stream
+from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.models import CLAUDE, RunResult, Sample
 from timetrace.quota import merge_capabilities
 
 LIMIT_TEXT_MARKERS = ("hit your limit", "usage limit", "rate limit")
 
 
+# TimeTrace's own MCP tools are the run's to use without a permission prompt each time: they only read TimeTrace
+# and report progress (the server refuses anything else for a dispatched run).
+MCP_SERVER = "timetrace"
+MCP_ALLOWED_TOOLS = "mcp__" + MCP_SERVER
+
+
 def build_cmd(
     cfg: Dict[str, Any], prompt: str, session_id: Optional[str] = None,
-    resume: Optional[str] = None,
+    resume: Optional[str] = None, mcp_config: Optional[str] = None,
 ) -> List[str]:
     cmd = [cfg.get("bin", "claude"), "-p", "--output-format", "stream-json", "--verbose"]
     if resume:
@@ -35,7 +45,7 @@ def build_cmd(
         cmd += ["--session-id", session_id]
     cmd += ["--permission-mode", cfg.get("permission_mode", "acceptEdits")]
     cmd += ["--disallowedTools", "Bash(git push*)"]
-    allowed = list(cfg.get("allowed_tools") or [])
+    allowed = list(cfg.get("allowed_tools") or []) + ([MCP_ALLOWED_TOOLS] if mcp_config else [])
     if allowed:
         cmd += ["--allowedTools"] + allowed
     if cfg.get("model"):
@@ -45,6 +55,9 @@ def build_cmd(
     if cfg.get("setting_sources", "user"):
         cmd += ["--setting-sources", str(cfg.get("setting_sources", "user"))]
     cmd += ["--append-system-prompt", SAFETY_RULES]
+    if mcp_config:
+        # Added to the user's own MCP servers, never replacing them: no --strict-mcp-config here.
+        cmd += ["--mcp-config", mcp_config]
     cmd += list(cfg.get("extra_args") or [])
     cmd += [safe_positional(prompt)]
     return cmd
@@ -138,7 +151,7 @@ def stream_permission_mode(cfg: Dict[str, Any]) -> str:
 
 
 def build_stream_cmd(cfg: Dict[str, Any], session_id: Optional[str] = None,
-                     resume: Optional[str] = None) -> List[str]:
+                     resume: Optional[str] = None, mcp_config: Optional[str] = None) -> List[str]:
     """A remote task run in its worktree: stream-json both ways, permission
     prompts answered by the runner (local rules, then the phone)."""
     cmd = [cfg.get("bin", "claude"), "-p"] + STREAM_IO
@@ -149,7 +162,7 @@ def build_stream_cmd(cfg: Dict[str, Any], session_id: Optional[str] = None,
     cmd += ["--permission-mode", stream_permission_mode(cfg)]
     cmd += HOST_PROMPTS
     cmd += ["--disallowedTools"] + PUSH_DENIED
-    allowed = list(cfg.get("allowed_tools") or [])
+    allowed = list(cfg.get("allowed_tools") or []) + ([MCP_ALLOWED_TOOLS] if mcp_config else [])
     if allowed:
         cmd += ["--allowedTools"] + allowed
     if cfg.get("model"):
@@ -158,6 +171,8 @@ def build_stream_cmd(cfg: Dict[str, Any], session_id: Optional[str] = None,
     if cfg.get("setting_sources", "user"):
         cmd += ["--setting-sources", str(cfg.get("setting_sources", "user"))]
     cmd += ["--append-system-prompt", SAFETY_RULES]
+    if mcp_config:
+        cmd += ["--mcp-config", mcp_config]
     cmd += list(cfg.get("extra_args") or [])
     return cmd
 
@@ -258,12 +273,46 @@ def _int_or_none(v: Any) -> Optional[int]:
         return None
 
 
+# ---- the MCP config of one run -----------------------------------------------------------------------------------
+
+def mcp_config_document(access: McpAccess) -> Dict[str, Any]:
+    """What Claude Code reads to reach TimeTrace's MCP server. The token is not in it: the header names the
+    environment variable the process is given, so the file holds nothing worth stealing."""
+    return {"mcpServers": {MCP_SERVER: {"type": "http", "url": access.url,
+                                        "headers": {"Authorization": "Bearer ${%s}" % ENV_NAME}}}}
+
+
+def write_mcp_config(directory: str, access: McpAccess) -> str:
+    """Write the run's MCP config and return its path. The file is made owner-only from the moment it exists (mkstemp
+    opens it 0600), has a name nobody can guess, and lives in a directory of its own made for this run (0700), so two
+    runs never share one and a directory that is wider than that is never used."""
+    parent = tempfile.mkdtemp(prefix="mcp-", dir=directory)  # 0700
+    try:
+        os.chmod(parent, 0o700)
+        fd, path = tempfile.mkstemp(prefix="mcp-", suffix=".json", dir=parent)  # 0600 from the start
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(mcp_config_document(access), fh)
+        return path
+    except Exception:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise
+
+
+def remove_mcp_config(path: Optional[str]) -> None:
+    """Delete the config and the directory made for it; whatever happened to the run."""
+    if not path:
+        return
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+
 class ClaudeAdapter(ToolAdapter):
     name = CLAUDE
     adapter_version = "claude-code/0.5"
     # Runs accept a RunControl (`control=`): stream-json input, appended
     # instructions while running, permission prompts answered by the host.
     interactive_runs = True
+    # Execution runs in a worktree take the job's TimeTrace MCP access (`mcp=`).
+    supports_mcp = True
 
     def __init__(self, cfg: Dict[str, Any], billing=None, credentials=None):
         self.cfg = cfg
@@ -315,20 +364,30 @@ class ClaudeAdapter(ToolAdapter):
 
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
-              control=None) -> RunResult:
-        if control is not None:
-            return self._run_stream(build_stream_cmd(self.cfg, session_id=session_id), cwd, log_file, prompt,
-                                    session_id, cancel_event, control)
-        return self._run(build_cmd(self.cfg, prompt, session_id=session_id), cwd, log_file,
-                         session_id, cancel_event)
+              control=None, mcp: Optional[McpAccess] = None) -> RunResult:
+        return self._worktree_run(prompt, cwd, session_id, log_file, cancel_event, control, mcp, resume=False)
 
     def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
-               control=None) -> RunResult:
-        if control is not None:
-            return self._run_stream(build_stream_cmd(self.cfg, resume=session_id), cwd, log_file, prompt,
-                                    session_id, cancel_event, control)
-        return self._run(build_cmd(self.cfg, prompt, resume=session_id), cwd, log_file,
-                         session_id, cancel_event)
+               control=None, mcp: Optional[McpAccess] = None) -> RunResult:
+        return self._worktree_run(prompt, cwd, session_id, log_file, cancel_event, control, mcp, resume=True)
+
+    def _worktree_run(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp, resume) -> RunResult:
+        """One execution run (or the continuation of one). With `mcp` the run is given TimeTrace's MCP server: a config
+        file of its own (deleted however the run ends) that refers to the token by the name of an environment variable,
+        and the token itself in the environment of this one process, never anywhere else."""
+        config = None
+        try:
+            if mcp is not None:
+                config = write_mcp_config(os.path.dirname(os.path.abspath(log_file)), mcp)
+            env = mcp.env() if mcp is not None else None
+            kwargs = {"resume": session_id} if resume else {"session_id": session_id}
+            if control is not None:
+                return self._run_stream(build_stream_cmd(self.cfg, mcp_config=config, **kwargs), cwd, log_file, prompt,
+                                        session_id, cancel_event, control, env=env)
+            return self._run(build_cmd(self.cfg, prompt, mcp_config=config, **kwargs), cwd, log_file,
+                             session_id, cancel_event, env=env)
+        finally:
+            remove_mcp_config(config)
 
     def start_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
                      cancel_event=None, control=None) -> RunResult:
@@ -381,17 +440,18 @@ class ClaudeAdapter(ToolAdapter):
         return self._run(cmd, cwd, log_file, session_id, cancel_event)
 
     def _run_stream(self, cmd: List[str], cwd: str, log_file: str, prompt: str, session_id: str,
-                    cancel_event, control) -> RunResult:
+                    cancel_event, control, env: Optional[Dict[str, str]] = None) -> RunResult:
         # Time spent waiting for a permission decision does not count
         # toward timeout_seconds (the session pauses its clock).
         code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                  timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                 cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE))
+                                 cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env)
         return self._result(code, lines, session_id)
 
-    def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None) -> RunResult:
+    def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None,
+             env: Optional[Dict[str, str]] = None) -> RunResult:
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE))
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env)
         return self._result(code, lines, session_id)
 
     @staticmethod

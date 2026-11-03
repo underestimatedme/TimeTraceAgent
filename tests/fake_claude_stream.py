@@ -52,6 +52,17 @@ def record(obj):
 def main():
     argv = sys.argv[1:]
     record({"argv": argv})
+    # What an MCP run is given (for tests: the transcript is the test's own file, and the token a sentinel).
+    config = {}
+    if "--mcp-config" in argv:
+        path = argv[argv.index("--mcp-config") + 1]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                config = {"path": path, "json": json.load(fh), "mode": os.stat(path).st_mode & 0o777,
+                          "dir_mode": os.stat(os.path.dirname(path)).st_mode & 0o777}
+        except OSError as exc:
+            config = {"path": path, "error": exc.__class__.__name__}
+    record({"mcp": {"token_in_env": os.environ.get("TIMETRACE_MCP_TOKEN"), "config": config}})
     with open(os.environ["TT_FAKE_SCENARIO"], encoding="utf-8") as fh:
         scenario = json.load(fh)
     session = None
