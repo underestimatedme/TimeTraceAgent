@@ -116,6 +116,26 @@ class Base(unittest.TestCase):
 
 
 class ReviewTurnTest(Base):
+    def test_reviewer_receives_only_scoped_source_log_with_secrets_redacted(self):
+        self.cloud = Cloud({"kind": "review_turn", "branch_name": BRANCH, "source_job_id": "source-1"})
+        reviewer = Reviewer()
+        agent = self.agent({"codex": reviewer})
+        source = {"job": {"id": "source-1", "workspace_id": "ws1", "tool_profile_id": "codex-default"},
+                  "attempt_id": "a0", "lease_epoch": 1}
+        self.db.save_remote_claim(source, state="reported")
+        logs = self.home / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+        (logs / "remote-source-1.log").write_text('command: git diff --check\n' + secret)
+        self.assertIn("reviewed (pass)", agent.run_once())
+        prompt = reviewer.calls[0]["prompt"]
+        self.assertIn('"source_job_id": "source-1"', prompt)
+        self.assertIn('"log_file_read_completely": true', prompt)
+        self.assertIn("command: git diff --check", prompt)
+        self.assertNotIn(secret, prompt)
+        self.assertIn("非验收指令", prompt)
+        self.assert_repo_untouched()
+
     def run_review(self, reviewer=None, **job):
         self.cloud = Cloud(dict({"kind": "review_turn", "branch_name": BRANCH, "base_ref": "main"}, **job))
         self.reviewer = reviewer or Reviewer()
@@ -511,3 +531,51 @@ class TaskBranchReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class OperationsProbeTest(Base):
+    def register(self):
+        import sys
+        from timetrace import objective_checks
+        checker = self.d / 'objective.py'
+        checker.write_text("from pathlib import Path\nraise SystemExit(0 if Path('app.py').exists() else 1)\n")
+        argv = [sys.executable, '-B', str(checker)]
+        contract = objective_checks.register(str(self.repo), 'objective', argv, 'app.py exists', checker)
+        self.db.save_check('ws1', 'objective', argv)
+        self.db.save_objective_check('ws1', 'objective', contract)
+        return contract
+
+    def probe(self, **fields):
+        contract = self.register()
+        self.cloud = Cloud(dict(kind='operations_check', check_name='objective',
+                                check_contract_version=contract['version'], **fields))
+        outcome = self.agent().run_once()
+        return outcome, self.cloud.events[-1]
+
+    def test_discovers_failure_on_default_branch_without_model_or_task(self):
+        _, event = self.probe()
+        self.assertEqual(event['type'], 'completed')
+        self.assertEqual(event['check_result']['exit_code'], 1)
+        self.assertTrue(event['check_result']['integrity_valid'])
+        self.assertEqual(event['checked_commit'], git('rev-parse', 'main', cwd=self.repo))
+        self.assertEqual(event['input_head'], event['checked_commit'])
+        self.assert_repo_untouched()
+
+    def test_rechecks_received_commit_until_default_branch_changes(self):
+        head = git('rev-parse', 'main', cwd=self.repo)
+        _, event = self.probe(input_head=head, input_commit=self.step_commit)
+        self.assertEqual(event['check_result']['exit_code'], 0)
+        self.assertEqual(event['checked_commit'], self.step_commit)
+        (self.repo / 'README.md').write_text('new revision\n')
+        git('add', '.', cwd=self.repo); git('commit', '-qm', 'new baseline', cwd=self.repo)
+        _, event = self.probe(input_head=head, input_commit=self.step_commit)
+        self.assertEqual(event['check_result']['exit_code'], 1)
+        self.assertEqual(event['checked_commit'], git('rev-parse', 'main', cwd=self.repo))
+        self.assert_repo_untouched()
+
+    def test_missing_receipt_and_missing_contract_fail_closed(self):
+        _, event = self.probe(input_head=git('rev-parse', 'main', cwd=self.repo), input_commit='f'*40)
+        self.assertEqual(event['type'], 'failed')
+        self.cloud = Cloud(dict(kind='operations_check', check_name='objective'))
+        self.agent().run_once()
+        self.assertEqual(self.cloud.events[-1]['type'], 'failed')
+        self.assert_repo_untouched()

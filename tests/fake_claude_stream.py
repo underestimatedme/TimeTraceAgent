@@ -52,6 +52,17 @@ def record(obj):
 def main():
     argv = sys.argv[1:]
     record({"argv": argv})
+    # What an MCP run is given (for tests: the transcript is the test's own file, and the token a sentinel).
+    config = {}
+    if "--mcp-config" in argv:
+        path = argv[argv.index("--mcp-config") + 1]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                config = {"path": path, "json": json.load(fh), "mode": os.stat(path).st_mode & 0o777,
+                          "dir_mode": os.stat(os.path.dirname(path)).st_mode & 0o777}
+        except OSError as exc:
+            config = {"path": path, "error": exc.__class__.__name__}
+    record({"mcp": {"token_in_env": os.environ.get("TIMETRACE_MCP_TOKEN"), "config": config}})
     with open(os.environ["TT_FAKE_SCENARIO"], encoding="utf-8") as fh:
         scenario = json.load(fh)
     session = None
@@ -96,6 +107,20 @@ def main():
         for step in steps:
             if "sleep" in step:
                 time.sleep(float(step["sleep"]))
+            elif "stderr" in step:
+                sys.stderr.write(step["stderr"] + "\n")
+                sys.stderr.flush()
+            elif "raw" in step:  # a line that is not protocol (what a tool prints)
+                sys.stdout.write(step["raw"] + "\n")
+                sys.stdout.flush()
+            elif "echo_env" in step:  # a model that runs `env`: the value of a variable, raw, on stdout, stderr and in a message
+                value = os.environ.get(step["echo_env"], "")
+                sys.stdout.write("%s=%s\n" % (step["echo_env"], value))
+                sys.stdout.flush()
+                sys.stderr.write("%s=%s\n" % (step["echo_env"], value))
+                sys.stderr.flush()
+                emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
+                    {"type": "tool_result", "content": "%s=%s" % (step["echo_env"], value)}]}})
             elif "permission" in step or "cancel_permission" in step:
                 ask = step.get("permission") or step.get("cancel_permission")
                 request_id = str(uuid.uuid4())

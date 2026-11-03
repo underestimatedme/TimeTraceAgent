@@ -10,7 +10,7 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from timetrace.agent import Agent
+from timetrace.agent import OUTBOX_ERROR_RETRY_SECONDS, Agent
 from timetrace import worktree
 from timetrace.checkpoints import Checkpoint
 from timetrace.db import Database
@@ -282,7 +282,9 @@ class AgentTest(unittest.TestCase):
             observed = queued_event["observed_at"]
             self.assertLessEqual(datetime.fromisoformat(observed.replace("Z", "+00:00")).timestamp(), time.time())
             cloud.recovered = True
-            agent.flush_outbox()
+            # The failed batch waits out its retry delay before it is sent again.
+            with patch("timetrace.agent.time.time", return_value=time.time() + OUTBOX_ERROR_RETRY_SECONDS):
+                agent.flush_outbox()
             self.assertEqual(db.pending_remote_events(), [])
             self.assertEqual(cloud.events[-1]["type"], "completed")
             self.assertEqual(cloud.events[-1]["observed_at"], observed)
@@ -727,6 +729,68 @@ class MaintenanceLoggingTest(unittest.TestCase):
         self.assertFalse(any("valley unreachable" in l and "t" == l for l in lines))
 
 
+class QuotaSkipReasonTest(unittest.TestCase):
+    """A provider whose quota cannot be read must be named in the log, not silently absent."""
+
+    class Reading(Adapter):
+        def read_limits(self):
+            return [Sample(bucket_key="codex:codex:primary", tool="codex", used_pct=42.0, reset_at=2000, window_mins=300)]
+
+    class SignedOut(Adapter):
+        def capabilities(self):
+            caps = super().capabilities()
+            caps["can_read_quota"] = False
+            return caps
+
+        def quota_unavailable_reason(self):
+            return "未登录或登录已过期，请在本机运行 claude auth login"
+
+    def agent(self, d, adapters, lines):
+        return Agent(Database(Path(d) / "timetrace.db"), FakeCloud(), adapters, Path(d), lambda: "t",
+                     inventory=lambda: ([], [{"id": "codex-default"}]), log=lines.append)
+
+    def test_names_the_provider_and_the_reason_once(self):
+        lines = []
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"codex": self.Reading(), "claude": self.SignedOut()}, lines)
+            agent.maintain(now=1000.0, force=True)
+            agent.maintain(now=1400.0, force=True)
+        skipped = [l for l in lines if "claude" in l and "claude auth login" in l]
+        self.assertEqual(len(skipped), 1, lines)
+        self.assertIn("quota", skipped[0])
+
+    def test_adapter_without_a_reason_still_gets_a_generic_line(self):
+        class Blind(Adapter):
+            def capabilities(self):
+                caps = super().capabilities()
+                caps["can_read_quota"] = False
+                return caps
+
+        lines = []
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"codex": self.Reading(), "claude": Blind()}, lines)
+            agent.maintain(now=1000.0, force=True)
+        self.assertTrue(any("claude" in l and "skipped" in l for l in lines), lines)
+
+    def test_logs_again_when_the_reason_changes_or_comes_back(self):
+        lines = []
+        signed_out = self.SignedOut()
+        with tempfile.TemporaryDirectory() as d:
+            agent = self.agent(d, {"claude": signed_out}, lines)
+            agent.maintain(now=1000.0, force=True)
+            signed_out.quota_unavailable_reason = lambda: "令牌已过期"
+            agent.maintain(now=1400.0, force=True)
+            signed_out.capabilities = lambda: {"can_record": True, "can_read_quota": True, "can_dispatch": True,
+                                               "can_resume": True, "can_enforce_zero_spend": True}
+            signed_out.read_limits = lambda: []
+            agent.maintain(now=1800.0, force=True)
+            signed_out.capabilities = lambda: {"can_record": True, "can_read_quota": False, "can_dispatch": True,
+                                               "can_resume": True, "can_enforce_zero_spend": True}
+            agent.maintain(now=2200.0, force=True)
+        reasons = [l for l in lines if "skipped" in l]
+        self.assertEqual(len(reasons), 3, lines)
+
+
 class AccountPoolTest(unittest.TestCase):
     def test_pool_id_follows_the_tool_account(self):
         class Keyed(Adapter):
@@ -744,7 +808,7 @@ class AccountPoolTest(unittest.TestCase):
 
 
 class RevokedRunnerTest(unittest.TestCase):
-    def test_revoked_credentials_are_cleared_and_the_loop_waits_for_repairing(self):
+    def test_auth_failure_invalidates_access_without_claiming_credentials_were_deleted(self):
         from timetrace.cloud import CloudError
         cleared, lines = [], []
 
@@ -760,7 +824,8 @@ class RevokedRunnerTest(unittest.TestCase):
                           on_revoked=lambda: cleared.append(True), log=lines.append)
             self.assertEqual(agent.run_once(), "revoked")
         self.assertEqual(cleared, [True])
-        self.assertTrue(any("解绑" in l for l in lines), lines)
+        self.assertTrue(any("保留本机凭据" in l for l in lines), lines)
+        self.assertFalse(any("凭据已清除" in l for l in lines), lines)
 
 
 class RecoveryFenceTest(unittest.TestCase):
@@ -846,7 +911,12 @@ class RecoveryFenceTest(unittest.TestCase):
             pass
         self.assertTrue(self.db.plan_started("plan-1"))
         self.cloud.append_events = deliver
+        # Still locked while the failed event waits out its retry delay...
         self.agent.flush_outbox()
+        self.assertTrue(self.db.plan_started("plan-1"))
+        # ...and unlocked only once Valley has it.
+        with patch("timetrace.agent.time.time", return_value=time.time() + OUTBOX_ERROR_RETRY_SECONDS):
+            self.agent.flush_outbox()
         self.assertFalse(self.db.plan_started("plan-1"))
 
     def test_an_undelivered_running_event_never_unlocks(self):

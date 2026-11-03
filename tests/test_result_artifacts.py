@@ -372,6 +372,24 @@ class FileArtifactTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_text_file_goes_up_without_a_timetrace_token_and_a_binary_one_as_it_is(self):
+        token = "ttm_" + "Qw3rTy" * 5
+        (self.root / "dist" / "run.log").write_text("TIMETRACE_MCP_TOKEN=" + token + "\nrest\n")
+        data = results.read_file_artifact(str(self.root), "dist/run.log")
+        self.assertNotIn(token.encode(), data)
+        self.assertIn(b"rest", data)
+        clean = b"\xff\xfe\x00\x01 harmless bytes ttm_short"
+        (self.root / "dist" / "clean.bin").write_bytes(clean)
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/clean.bin"), clean)
+        # A file that is not text cannot be rewritten; one that holds a token is not uploaded, in any way it writes it.
+        for name, blob in {"raw.bin": b"\xff\xfe" + token.encode() + b"\x00",
+                           "utf16le.bin": b"\xff\xfe" + token.encode("utf-16-le"), "utf16be.bin": b"\xfe\xff" + token.encode("utf-16-be"),
+                           "odd.bin": b"\x00" + token.encode("utf-16-le"), "shifted.bin": b"\xff" + token.encode("utf-16-le"), "run-in.bin": b"\xff" + b"prefix" + token.encode()}.items():
+            (self.root / "dist" / name).write_bytes(blob)
+            self.assertIsNone(results.read_file_artifact(str(self.root), "dist/" + name), name)
+        (self.root / "dist" / "plain.txt").write_text("nothing to mask\n")
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/plain.txt"), b"nothing to mask\n")
+
     def test_only_a_bounded_regular_file_inside_the_worktree_is_read(self):
         (self.root / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04data")
         self.assertEqual(results.read_file_artifact(str(self.root), "dist/pkg.zip"), b"PK\x03\x04data")

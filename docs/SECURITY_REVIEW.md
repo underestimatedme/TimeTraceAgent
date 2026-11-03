@@ -697,6 +697,11 @@ override a deny.
 - `timetrace agent pause|resume` writes `~/.timetrace/local_pause.json`
   (0600, separate from runner_state.json so the agent cannot overwrite it);
   Valley cannot lift it.
+- `timetrace agent sync` writes `~/.timetrace/sync_request.json` (0600,
+  a random id only). The running agent forces its cached zero-spend
+  verdicts, the self-check and an inventory push on its own thread, then
+  acknowledges with `sync_id` / `sync_pushed` in runner_state.json. Nothing
+  else is read from the file and nothing new leaves the computer.
 - `caffeinate -i -w <agent pid>` (fixed argv, `/usr/bin/caffeinate`) while
   any job runs; it exits by itself with the agent.
 - Reset credits: a short-lived `codex app-server` (sanitized environment,

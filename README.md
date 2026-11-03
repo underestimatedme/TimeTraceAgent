@@ -2,8 +2,25 @@
 
 给 Claude Code 和 Codex 排任务的无人值守队列，也是刻迹 iOS App 的电脑端 Runner：手机派任务，这台 Mac 用你已经登录的 `claude` / `codex` 执行。撞到限额就睡到重置时间，再用原会话续接；顺手把两个工具每个限额桶的余量采样进 SQLite。
 
-命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
+命令是 `timetrace`，短名 `tta`，两者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+
+## 0.5.7：首次配置、交付证据与发布闭环
+
+公开安装与线上配置能力对齐。已有配对、项目目录和模型设置在升级后保留：
+
+```sh
+brew update
+brew upgrade timetraceagent
+timetrace agent install
+timetrace agent doctor
+```
+
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.0"`；不要混用两套后台服务。
+
+长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
+
+[固定命令发布与回滚](docs/RELEASE-LIFECYCLE.md) 支持准备、具体方案授权、健康检查、失败回滚和恢复验证。服务端每日项目巡检复用现有开发状态采集，不需要浏览器一直打开。
 
 ## 0.5.1：电脑唯一标识
 
@@ -54,6 +71,7 @@ Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.time
 - **追加指令**：Claude 任务运行中直接写入会话（stream-json 输入）；Codex 在本轮结束后以 `codex exec resume` 在同一个作业里执行，沙箱参数不变，零付费核验照常。
 - **审批**：Claude 需要权限时先按本机规则判断——工作副本内的读写和只读命令（`git status/diff/log`、`ls`、`cat` 等）自动允许；`git push`、改远端或其他分支、写工作副本以外、读凭据目录一律拒绝（手机批准也不能放行）；其余推到手机，10 分钟没人处理即拒绝。「本任务内同类都允许」只在本作业有效。等待审批不计入任务超时，租约照常续期。
 - **暂停接活**：`timetrace agent pause` / `timetrace agent resume`。本机暂停优先，手机无法解除；正在运行的任务不受影响。
+- **立即同步**：在这台 Mac 上重新登录 Claude / Codex 后运行 `timetrace agent sync`，后台 Runner 会在下一轮循环里重新核验登录、刷新自检并上报工具清单（即使没有变化），不用等 5 分钟的定时上报，也不用重启 Runner；正在运行的任务不受影响，额度仍按原节奏上报。命令最多等 120 秒（`--timeout` 可改），通常半分钟左右完成，主要取决于 Valley 接收上报的速度。
 - **防休眠**：有任务运行时启动 `caffeinate -i -w <pid>`（只阻止空闲睡眠，合盖仍会睡），没有任务时结束；配置 `prevent_sleep: false` 关闭。
 - **自检**：启动时、每 10 分钟、任务失败后检查 Claude / Codex 登录、工作区所在磁盘剩余空间（不足 1 GB 时不接新任务）、各工作区状态，随工具清单上报，手机据此显示「为什么不接活」。
 - **Codex 重置机会**：每 10 分钟短时启动 `codex app-server` 读取 `account/rateLimits/read` 里的 `rateLimitResetCredits`（只读，读不到时上报「未知」而不是 0 次）。刻迹从不使用重置（不调用 `account/rateLimitResetCredit/consume`），请在官方客户端里自己操作。
@@ -117,7 +135,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.1"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.0"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
@@ -415,3 +433,24 @@ uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
 当前同一供应商在一台电脑上仍使用其默认终端配置；多个账号可分布于已绑定的不同电脑。此分支尚未发布为 Homebrew 版本，不能把当前稳定版的安装成功当作协议已支持。
 
 模型需显式配置，例如 `tta config set claude.model sonnet`。Codex 使用该账号 `model/list` 返回的模型 ID：`tta config set codex.model <模型ID>`。修改后按命令提示重启 Runner，网页刷新「AI 账号与模型」即可看到上报结果。
+
+### P0 acceptance packs (0.5.8rc1 candidate)
+
+Workspace configuration protocol 3 adds `regression`, `markdown_sections` and
+`web_flow` contracts. Upgrade the backend to accept config protocol 3 **before**
+installing this candidate. The execution protocol stays at 2.
+
+Regression reuses a locally registered check, freezes tracked tests/configuration
+and every file outside an explicit repair scope, and pins the executable/checker.
+It proves the registered tests only, not test coverage or an OS sandbox. Markdown
+checks require real headings and non-placeholder section bodies; factual accuracy
+is outside their scope. Web flow uses at most 20 declarative browser actions with
+explicit assertions on the exact commit in the trusted preview renderer; static
+pages do not require Docker, stateful previews do. No arbitrary remote command,
+JavaScript or external URL is accepted as a contract.
+
+`TIMETRACE_WEB_FLOW_LIVE=1 python3 -m unittest tests.test_web_flow_live` runs the
+actual Chromium negative/positive fixture. `tests/live_acceptance_packs.py` is
+an opt-in loopback Valley harness with real model calls; it records three task
+categories and optionally a same-task feedback/re-receipt round. These are
+assistant-operated acceptance samples, never independent new-user research.

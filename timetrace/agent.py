@@ -17,10 +17,13 @@ from typing import Any, Callable, Dict
 from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import Database
-from timetrace import approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, worktree
+from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
+                       worktree)
 from timetrace.remote_control import RunControl
+from timetrace.mcp_access import parse_claim, skip_note, still_usable
 from timetrace.process import tail_text
 from timetrace.redact import redact
+from timetrace.review_evidence import source_run_evidence
 from timetrace.checkpoints import Checkpoint, checkpoint_problem
 from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, UnclearedOwner, adapter_capabilities,
                            adapter_zero_spend_verified, coding_slot_lock, deny_reason, tool_slot_lock,
@@ -29,8 +32,12 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
+OUTBOX_REFUSED_RETRY_SECONDS = 60  # a batch Valley answered 409 is retried this rarely
+# A batch whose upload failed (other than 409) waits 5 s, then doubles, up to the cap.
+OUTBOX_ERROR_RETRY_FIRST_SECONDS = 5
+OUTBOX_ERROR_RETRY_SECONDS = 30
 REPLY_BYTES = 32 * 1024  # chat_turn reply bound, UTF-8 bytes (Valley rejects more)
-JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "dev_status")
+JOB_KINDS = ("task", "chat_turn", "review_turn", "check", "import_parse", "planning", "dev_status", "operations_check")
 # The import record an import_parse job belongs to (Valley's id alphabet).
 IMPORT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # A provider session id goes into argv after --resume / `exec resume`: it must
@@ -181,8 +188,9 @@ class Agent:
                  health_interval: float = HEALTH_INTERVAL_SECONDS,
                  reset_credits: Callable[[], list] = None,
                  reset_credits_interval: float = RESET_CREDITS_INTERVAL_SECONDS,
-                 sleep_guard: Any = None, user_home: str = None):
+                 sleep_guard: Any = None, user_home: str = None, remote_config=None):
         self.db, self.cloud, self.adapters = db, cloud, adapters
+        self.remote_config = remote_config
         # Protocol 2: the inventory carries protocol/agent version, the local
         # pause, the self-check and the reset credits.
         self.report_protocol = report_protocol
@@ -222,6 +230,10 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
+        # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
+        # (remote_outbox_retry), so a restart keeps every batch's waiting time.
+        self._outbox_failures_logged = {}
+        self._loop_errors = set()
         self._maintain_due = False
         # config `upload_output_tail`: false keeps run logs on this computer.
         self.upload_output_tail = upload_output_tail
@@ -237,9 +249,14 @@ class Agent:
         self.quota_interval = quota_interval
         self._last_quota = 0.0
         self._last_inventory = None
+        self._last_inventory_push = None  # when the last inventory reached Valley (the heartbeat clock)
         # One line per upkeep round so a silent None from an adapter is visible
         # in daemon.log; never includes tokens or exception text with paths.
         self.log = log or (lambda message: None)
+        self._log_given = log is not None
+        # Why a provider's quota is not being read, as last logged: a tool that
+        # silently drops out of the quota round looks identical to "nothing to report".
+        self._quota_skipped: Dict[str, str] = {}
         # Called once when Valley says this computer's binding was revoked
         # (unbound from the phone): the caller forgets the local credentials.
         self._on_revoked = on_revoked or (lambda: None)
@@ -322,6 +339,28 @@ class Agent:
             self._maintain_due = True
             return
         now = now if now is not None else time.time()
+        sync_id = sync.pending(self.home)
+        if sync_id is None:
+            self._upkeep(now, force)
+            return
+        # `timetrace agent sync`: drop the cached login verdicts and push
+        # even an unchanged inventory, so a fresh login reaches Valley now.
+        # Quota keeps its cadence: its upload is slow and unrelated to login.
+        for name, adapter in self.adapters.items():
+            billing = getattr(adapter, "billing", None)
+            try:
+                if billing is not None:
+                    billing.verdict(force=True)
+            except Exception as exc:
+                self.log("sync: %s login check failed: %s" % (name, exc.__class__.__name__))
+        self._health_due = True
+        self._last_inventory_base = self._last_inventory = None
+        self._upkeep(now, force)
+        pushed = self._last_inventory is not None
+        runner_state.record(self.home, sync_id=sync_id, sync_pushed=pushed, sync_at=int(now))
+        self.log("sync: %s" % ("pushed" if pushed else "push failed"))
+
+    def _upkeep(self, now: float, force: bool) -> None:
         self._refresh_health(now)
         self._refresh_reset_credits(now)
         due = force or now - self._last_quota >= self.quota_interval
@@ -354,13 +393,17 @@ class Agent:
         # sleep prevention) are compared, so a pause reaches Valley at once.
         current = self._last_inventory_base
         extras = self.inventory_extras() if self.report_protocol else None
-        if (current, extras) != self._last_inventory:
+        # An unchanged protocol-2 inventory is still presence: Valley judges a computer alive by it.
+        heartbeat_due = self.report_protocol and (self._last_inventory_push is None or
+                                                  now - self._last_inventory_push >= self.heartbeat_interval)
+        if (current, extras) != self._last_inventory or heartbeat_due:
             try:
                 if extras is None:
                     self.cloud.update_inventory(self.access_token(), *current)
                 else:
                     self.cloud.update_inventory(self.access_token(), *current, extras=extras)
                 self._last_inventory = (current, extras)
+                self._last_inventory_push = now
                 runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
                                     inventory_tools=len(current[1]))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
@@ -372,6 +415,11 @@ class Agent:
         """The protocol-2 inventory fields (docs/remote-control-protocol.md §3/§4)."""
         extras = {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
                   "accepting_local": not self.locally_paused(), "project_directories_version": 1}
+        if self.remote_config is not None:
+            extras["config_version"] = 3
+            extras["config_receipt"] = (self.remote_config.cfg.get("_remote_configuration") or {}).get("operation_id", "")
+            from timetrace.web_workspace import candidates
+            extras["workspace_candidates"] = candidates(self.db)
         if self._health is not None:
             health = dict(self._health)
             health["sleep_prevention"] = self.sleep_state()
@@ -427,6 +475,8 @@ class Agent:
             audit.record(self.home, "version_rejected", where=where, message=str(exc)[:200])
 
     def run_once(self) -> str:
+        if self.remote_config is not None and self.remote_config(self, False):
+            return "idle"
         claim = self._next_claim()
         if isinstance(claim, str):
             return claim
@@ -436,7 +486,12 @@ class Agent:
         """A claim, or "revoked" / "unpaired" / "idle" / "paused" (local
         pause, running jobs continue) / "disk_full" (self-check error)."""
         try:
-            self.flush_outbox()
+            try:
+                self.flush_outbox()
+            except CloudError as exc:
+                # Already logged by the flush; a refused batch never stops claiming.
+                if exc.status != 409:
+                    raise
             if self.locally_paused():
                 return "paused"
             if self.disk_blocked():
@@ -446,13 +501,16 @@ class Agent:
         except CloudError as exc:
             if exc.status == 401:
                 self._on_revoked()
-                self.log("此电脑已在手机上解绑（或授权失效）；本机凭据已清除。重新运行 `timetrace cloud login` 即可再次绑定。")
+                if not getattr(self, "_auth_failure_reported", False):
+                    self.log("刻迹连接授权失败，已暂停领取任务；保留本机凭据并尝试刷新登录。此状态不代表电脑断网或已解绑。")
+                    self._auth_failure_reported = True
                 return "revoked"
             raise
         except RuntimeError as exc:
             if "not paired" in str(exc):
                 return "unpaired"
             raise
+        self._auth_failure_reported = False
         return claim or "idle"
 
     @staticmethod
@@ -524,7 +582,7 @@ class Agent:
                 and existing["state"] in ("launching", "running", "reported")):
             return "job %s → duplicate ignored" % job_id
         self.db.save_remote_claim(claim)  # durable before any local process starts
-        if job.get("kind") == "import_parse":
+        if job.get("kind") in ("import_parse", "planning"):
             # No workspace: the run reads nothing on this computer.
             return self._import_parse(claim)
         workspace = self.db.get_workspace(job.get("workspace_id"))
@@ -563,7 +621,7 @@ class Agent:
         self.home.joinpath("logs").mkdir(parents=True, exist_ok=True)
         # The job id comes from the server: keep it from naming a path.
         log_file = str(self.home / "logs" / ("remote-%s.log" % _safe_id(job_id)))
-        if kind == "check":
+        if kind in ("check", "operations_check"):
             # A locally registered command; no AI tool is involved.
             return self._check_job(claim, workspace, log_file)
         if kind == "dev_status":
@@ -655,7 +713,11 @@ class Agent:
             value = re.sub(r"\.(\d{1,9})(?=Z$|[+-]\d{2}:\d{2}$)",
                            lambda match: "." + match.group(1)[:6].ljust(6, "0"),
                            lease["lease_expires_at"])
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            deadline = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            policy_end = lease.get("job", {}).get("autonomy_deadline")
+            if policy_end:
+                deadline = min(deadline, Agent._deadline({"lease_expires_at": policy_end}))
+            return deadline
         except (KeyError, TypeError, ValueError, AttributeError):
             return 0.0
 
@@ -705,7 +767,7 @@ class Agent:
             claim["job"]["desired_action"] = "cancel"
         if control is not None:
             control.apply_lease(lease)
-        renewed = self._deadline(lease)
+        renewed = self._deadline(dict(lease, job=claim["job"]))
         # Include time spent in the renewal request: a late response cannot
         # bridge an interval in which this owner no longer held a lease.
         if time.time() >= deadline and claim["job"].get("desired_action") != "cancel":
@@ -792,6 +854,20 @@ class Agent:
             note = note.strip() if isinstance(note, str) else ""
             return RESUME_PROMPT + (RESUME_NOTE + note if note else "")
         return job["prompt"]
+
+    def _mcp_access(self, claim, adapter, in_folder):
+        """The TimeTrace MCP access this claim carries, for an execution run in a worktree whose tool can use it; None
+        otherwise (and one line in the log saying why, with neither the token nor any part of the address). Folder runs
+        never get it: they run with no MCP server at all."""
+        if in_folder or not isinstance(claim, dict) or claim.get("mcp") is None:
+            return None
+        if getattr(adapter, "supports_mcp", False) is not True:
+            self.log(skip_note("this tool's adapter does not take it"))
+            return None
+        access, reason = parse_claim(claim, cloud_base_url=getattr(self.cloud, "base_url", None))
+        if access is None:
+            self.log(skip_note(reason))
+        return access
 
     def _execute_tracked(self, claim, workspace, adapter, checkpoint, plan_key, log_file, deadline,
                          ws_lock, cancel_event, resuming, session_id, execution_job, local_id, control=None):
@@ -971,18 +1047,28 @@ class Agent:
                 # A fresh run never inherits an earlier run's result.json.
                 results.prepare_out_dir(execution_path, fresh=not resuming)
                 extra_kw = {"control": control} if interactive else {}
+                mcp = self._mcp_access(claim, adapter, in_folder)
+                def turn_kw():
+                    """What a turn is started with: the MCP access only while it has time left (a follow-up may come long after the claim)."""
+                    kw = dict(extra_kw)
+                    if mcp is not None:
+                        if still_usable(mcp):
+                            kw["mcp"] = mcp
+                        else:
+                            self.log(skip_note("the access had run out by this turn"))
+                    return kw
                 if in_folder:
                     folder_run = adapter.resume_folder if resuming else adapter.start_folder
                     def run(prompt, cwd, session, log, cancel):
-                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
+                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel, **turn_kw())
                     def followup_run(prompt, cwd, session, log, cancel):
-                        return adapter.resume_folder(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
+                        return adapter.resume_folder(prompt, cwd, workspace["path"], session, log, cancel, **turn_kw())
                 else:
                     first = adapter.resume if resuming else adapter.start
                     def run(prompt, cwd, session, log, cancel):
-                        return first(prompt, cwd, session, log, cancel, **extra_kw)
+                        return first(prompt, cwd, session, log, cancel, **turn_kw())
                     def followup_run(prompt, cwd, session, log, cancel):
-                        return adapter.resume(prompt, cwd, session, log, cancel, **extra_kw)
+                        return adapter.resume(prompt, cwd, session, log, cancel, **turn_kw())
                 prompt = self._run_prompt(job, resuming)
                 observed_start = None
                 adapter_entered = threading.Event()
@@ -1183,6 +1269,23 @@ class Agent:
                     event["artifacts"], failed = self._upload_files(job["id"], execution_path, event["artifacts"])
                     if failed:
                         event["message"] += "; " + results.FILE_DROPPED_NOTE % failed
+            if not in_folder and job.get("stage_iteration"):
+                from .review_artifacts import collect as collect_review
+                event["artifacts"] = collect_review(execution_path, workflow_input.get("head"), workflow_output, event.get("artifacts") or [])
+                from .app_preview import collect as collect_app, MARKER as PREVIEW_MARKER
+                bundle, diagnostic = collect_app(execution_path, workflow_output)
+                if bundle:
+                    try:
+                        stored = self.cloud.upload_job_file(self.access_token(), job["id"], "keji-app-preview.json", bundle)
+                        if not stored or not stored.get("id"):
+                            raise ValueError("missing upload receipt")
+                        event["artifacts"].insert(0, {"kind": "file", "ref": stored["id"], "commit_sha": workflow_output,
+                                                    "content": PREVIEW_MARKER + "\n可运行前端应用，版本 " + workflow_output})
+                    except Exception:
+                        diagnostic = "应用预览上传失败，原成果已保留。可发送修改要求让 AI 重新交付预览。"
+                if diagnostic:
+                    event["artifacts"].append({"kind": "note", "ref": "review/preview-diagnostic", "commit_sha": workflow_output, "content": diagnostic})
+
             if not in_folder and prepared_branch:
                 # The branch review and check jobs name (`branch_name`).
                 event["branch"] = prepared_branch
@@ -1546,7 +1649,8 @@ class Agent:
             # Only names that resolved (so passed the ref checks) are shown.
             summary = ("## 差异摘要（git diff --stat %s...%s）\n%s"
                        % (base_name if base else "base", branch, stat or "（无法计算差异摘要）"))
-        prompt = "%s\n\n%s\n" % (job.get("prompt") or "", summary)
+        prompt = "%s\n\n%s\n%s" % (job.get("prompt") or "", summary,
+                                      source_run_evidence(self.home, self.db, job) if in_folder else "")
         try:
             slot = self._acquire_slot(job.get("provider"))
         except LockBusy as exc:
@@ -1582,8 +1686,12 @@ class Agent:
                     ws_lock.release()
             try:
                 with self._acceptance_checkout(workspace, "reviews", job_id, detail[1], deadline) as cwd:
-                    return self._run_leased(claim, adapter, None,
-                                            lambda cancel: review(prompt, cwd, log_file, cancel), deadline, finish)
+                    import tempfile
+                    with tempfile.TemporaryDirectory(prefix=".timetrace-review-evidence-", dir=cwd) as evidence_dir:
+                        full_prompt = "%s\n\n%s\n%s" % (job.get("prompt") or "", summary,
+                            source_run_evidence(self.home, self.db, job, evidence_dir))
+                        return self._run_leased(claim, adapter, None,
+                            lambda cancel: review(full_prompt, cwd, log_file, cancel), deadline, finish)
             except LockBusy as exc:
                 return "job %s → deferred (workspace busy)" % job_id + ("; " + str(exc) if isinstance(exc, UnclearedOwner) else "")
             except Exception as exc:
@@ -1591,26 +1699,28 @@ class Agent:
         finally:
             slot.release()
 
-    # ---- import_parse: a shared conversation → import proposal -------------
+    # ---- isolated text jobs: import proposal or project planning ----------
     def _import_parse(self, claim):
-        """Turn a shared conversation (all of it in the prompt) into the JSON
-        import proposal: the local AI runs read-only (chat_turn argv, always a
+        """Turn scoped input into an import proposal or project plan: the local AI runs read-only (chat_turn argv, always a
         new session) in a fresh empty directory ~/.timetrace/imports/<job>,
         removed afterwards. No workspace, worktree or checkpoint; the same
         zero-spend gate, lease and fencing as a chat turn, one slot of its
         tool plus an overall slot."""
         job = claim["job"]
         job_id = job["id"]
-        import_id = job.get("import_id")
+        is_planning = job.get("kind") == "planning"
+        import_id = job.get("planning_job_id" if is_planning else "import_id")
         if not isinstance(import_id, str) or not IMPORT_ID.fullmatch(import_id):
-            return self._fail(claim, "invalid import", "rejected (invalid import)")
+            reason = "invalid planning job" if is_planning else "invalid import"
+            return self._fail(claim, reason, "rejected (%s)" % reason)
         provider = job.get("provider")
         adapter = self.adapters.get(provider)
         if adapter is None:
             return self._fail(claim, "tool unavailable", "rejected (tool unavailable)")
-        parse = getattr(adapter, "parse_import", None)
+        parse = getattr(adapter, "plan" if is_planning else "parse_import", None)
         if not callable(parse):
-            return self._fail(claim, "import unsupported", "rejected (import unsupported)")
+            reason = "planning unsupported" if is_planning else "import unsupported"
+            return self._fail(claim, reason, "rejected (%s)" % reason)
         prompt = job.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return self._fail(claim, "invalid prompt", "rejected (invalid prompt)")
@@ -1635,7 +1745,7 @@ class Agent:
                 if found is None:
                     event["message"] += "; " + results.INVALID_IMPORT_NOTE
                     return "parsed (invalid)", event
-                event["import_result"] = found
+                event["planning_result" if is_planning else "import_result"] = found
                 return "parsed", event
 
             Path(log_file).touch(exist_ok=True)
@@ -1677,6 +1787,27 @@ class Agent:
         except OSError:
             pass
 
+    def _operations_target(self, claim, workspace):
+        """Inspect a committed snapshot only. A previous receipt is a candidate,
+        not a merge: use it only while the registered default branch is unchanged.
+        Missing receipt commits fail closed, never silently check a different tree.
+        """
+        job = claim["job"]
+        if (workspace.get("kind") or folder.GIT) != folder.GIT or not job.get("check_contract_version"):
+            return self._fail(claim, "巡检需要已登记的 Git 客观检查", "rejected (operations contract)")
+        branch = workspace.get("default_branch") or "main"
+        head = worktree.resolve_commit(workspace["path"], branch)
+        if not head:
+            return self._fail(claim, "巡检基线分支不存在", "failed (operations baseline)")
+        commit = head
+        if job.get("input_head") == head and job.get("input_commit"):
+            candidate = job["input_commit"]
+            if not re.fullmatch(r"[a-f0-9]{40}", candidate) or not worktree.resolve_commit(workspace["path"], candidate):
+                return self._fail(claim, "上次收件提交在本机不可用", "failed (operations receipt missing)")
+            commit = candidate
+        job["operations_observed_head"] = head
+        return None, (branch, commit)
+
     def _check_job(self, claim, workspace, log_file):
         """An automatic check: the command registered on this computer under
         (workspace, check_name) runs in a fresh detached checkout of the step
@@ -1688,12 +1819,21 @@ class Agent:
         argv = self.db.get_check(workspace["id"], name) if checks.valid_name(name) else None
         if argv is None:
             return self._fail(claim, checks.UNKNOWN, "rejected (unknown check)")
+        from . import objective_checks
+        contract = None
+        if job.get("check_contract_version"):
+            contract = self.db.get_objective_check(workspace["id"], name)
+            if (not contract or contract["version"] != job["check_contract_version"]
+                    or not objective_checks.valid(contract, argv)
+                    or not objective_checks.workflow_valid(self.db, workspace["id"], contract)):
+                return self._fail(claim, "客观检查器版本已变化，需要人工核对", "rejected (contract changed)")
         deadline = self._deadline(claim)
         gate = lambda at: self._check_gate(job, at)
         reason = self._stop_reason() or gate(deadline)
         if reason:
             return self._blocked(claim, job_id, reason)
-        target = self._acceptance_target(claim, workspace, "检查")
+        target = (self._operations_target(claim, workspace) if job.get("kind") == "operations_check"
+                  else self._acceptance_target(claim, workspace, "检查"))
         if isinstance(target, str):
             return target
         out_dir, detail = target
@@ -1703,6 +1843,9 @@ class Agent:
             return self._busy(job_id, exc)
 
         def work(cwd):
+            if contract:
+                return lambda cancel: objective_checks.run(contract, argv, cwd, log_file, cancel,
+                                                           extra_drop=self.check_env_drop, keep=self.check_env_keep)
             return lambda cancel: checks.run(name, argv, cwd, log_file, cancel,
                                              extra_drop=self.check_env_drop, keep=self.check_env_keep)
 
@@ -1716,8 +1859,12 @@ class Agent:
                 message = "检查未通过（退出码 %d）" % result.exit_code
             event = {"seq": 2, "type": "completed", "message": message, "result_summary": message,
                      "verdict": verdict, "check_result": result.as_event()}
+            if contract:
+                event["check_result"].update(result.objective_evidence)
             if out_dir is None:
                 event["checked_branch"], event["checked_commit"] = detail
+                if job.get("kind") == "operations_check":
+                    event["input_head"] = job["operations_observed_head"]
             else:
                 event["checked_output"] = "%s/%s" % (folder.OUTPUT_ROOT, detail)
             return "check %s" % ("passed" if result.passed else "failed"), event
@@ -1773,17 +1920,22 @@ class Agent:
     def run_forever(self, interval: int = 5, log: Callable[[str], None] = None) -> None:
         """Claim and run until stop() (the SIGTERM/SIGINT handlers call it).
         A KeyboardInterrupt also cancels the running jobs before it returns."""
-        log = log or (lambda message: print(message, flush=True))
+        # The caller's timestamping log wins; a bare print is only the default for an Agent built without one.
+        log = log or (self.log if self._log_given else (lambda message: print(message, flush=True)))
         self.log = log
-        if self.max_parallel > 1:
+        if self.max_parallel > 1 or self.remote_config is not None:
             return self._run_parallel(interval, log)
         backoff = interval
         manual_diagnostics = set()
         try:
             while not self._stop.is_set():
                 try:
+                    # Presence must not depend on successfully replaying old
+                    # results or acquiring another job.
+                    self.maintain()
                     outcome = self.run_once()
                     backoff = interval
+                    self._loop_errors.clear()
                     if outcome in ("revoked", "unpaired"):
                         # Wait for `timetrace cloud login`; the access_token callable
                         # picks up new credentials without restarting the service.
@@ -1795,7 +1947,8 @@ class Agent:
                         # recovering and the phone's cards fresh.
                         self.maintain()
                         self._stop.wait(interval)
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
         finally:
@@ -1823,8 +1976,11 @@ class Agent:
         running job cancelled, and at most SHUTDOWN_GRACE_SECONDS of waiting."""
         backoff = interval
         manual_diagnostics = set()
+        from timetrace.runtime_preview import RuntimePreviews
+        previews = RuntimePreviews(self)
+        previews.start()
         active = {}  # future → job id
-        pool = ThreadPoolExecutor(max_workers=self.max_parallel, thread_name_prefix="timetrace-job")
+        pool = ThreadPoolExecutor(max_workers=8 if self.remote_config is not None else self.max_parallel, thread_name_prefix="timetrace-job")
 
         def reap(futures):
             for future in futures:
@@ -1837,19 +1993,26 @@ class Agent:
         try:
             while not self._stop.is_set():
                 reap({f for f in active if f.done()})
-                if self._maintain_due:
-                    self._maintain_due = False
-                    self.maintain(force=True)
+                # Upkeep first, every round: before the remote-config hold (so `agent sync` answers even while a configuration
+                # change waits for idle) and before waiting for a free slot (a full agent is still present).
+                upkeep_due = self._maintain_due
+                self._maintain_due = False
+                self.maintain(force=upkeep_due)
+                if self.remote_config is not None and self.remote_config(self, bool(active)):
+                    self._stop.wait(interval)
+                    continue
                 if len(active) >= self.max_parallel:
                     wait(list(active), timeout=max(interval, .05), return_when=FIRST_COMPLETED)
                     continue
                 try:
                     claim = self._next_claim()
                     backoff = interval
-                except Exception:
+                except Exception as exc:
+                    self._note_loop_error(exc)
                     self._stop.wait(backoff)
                     backoff = min(60, max(interval, backoff * 2))
                     continue
+                self._loop_errors.clear()
                 if claim in ("revoked", "unpaired"):
                     self._stop.wait(60)
                     continue
@@ -1987,6 +2150,17 @@ class Agent:
             return 0
         return len(payloads)
 
+    def _note_quota_skipped(self, provider: str, adapter: Any) -> None:
+        """Log that `provider` is not being read, and why, once per distinct reason."""
+        try:
+            reason = str(adapter.quota_unavailable_reason())
+        except Exception:
+            reason = "本机读不到该工具的额度"
+        if self._quota_skipped.get(provider) == reason:
+            return
+        self._quota_skipped[provider] = reason
+        self.log("quota: %s skipped（%s）" % (provider, reason))
+
     def report_quota(self, now: float = None) -> int:
         """Read on-demand quota from adapters that support it and report it to
         Valley. This is what lets a parked (waiting_quota) Plan be re-queued when
@@ -2000,7 +2174,9 @@ class Agent:
         for provider, adapter in self.adapters.items():
             caps = getattr(adapter, "capabilities", lambda: {})()
             if not caps.get("can_read_quota"):
+                self._note_quota_skipped(provider, adapter)
                 continue
+            self._quota_skipped.pop(provider, None)
             try:
                 samples = adapter.read_limits()
             except Exception:
@@ -2022,10 +2198,79 @@ class Agent:
         # Insertion-ordered groups preserve durable attempt order (UUID lexical
         # order is not chronology). Never split an attempt's terminal batch:
         # Valley may close a cancelled attempt at the end of the first request.
-        for (job, attempt, epoch), rows in batches.items():
+        # Valley may refuse one attempt's events for good (409: the lease was
+        # lost, e.g. across a Valley restart). That batch stays queued, but it
+        # must not hold back the other attempts or the next claim.
+        refused = None
+        for key, rows in batches.items():
+            job, attempt, epoch = key
+            retry = self.db.remote_event_retry(job, attempt, epoch)
+            if retry is not None and time.time() < retry["retry_at"]:
+                continue
             rows.sort(key=lambda row: row["seq"])
-            self.cloud.append_events(self.access_token(), job, attempt, epoch,
-                                     [row["payload"] for row in rows])
+            # Pairing/refresh problems are not this batch's fault: they still
+            # propagate to the claim loop's own handling.
+            token = self.access_token()
+            try:
+                self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+            except CloudError as exc:
+                if exc.status == 401:
+                    raise
+                if exc.status != 409:
+                    # Valley answered, but not with success: this attempt's
+                    # problem, not the other batches' or the claim's.
+                    self._defer_failed_batch(key, rows, exc, retry)
+                    continue
+                # A stale/conflicting attempt must not block presence, claims
+                # or unrelated result batches. Never treat conflict as an ACK.
+                now = time.time()
+                self.db.defer_remote_events(job, attempt, epoch, 409, now, now + OUTBOX_REFUSED_RETRY_SECONDS)
+                if self._outbox_failures_logged.get(key) != "HTTP 409":
+                    self._outbox_failures_logged[key] = "HTTP 409"
+                    self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
+                             "事件保留在本机队列，不影响其他回报和领取新任务；不会自动丢弃，见 `timetrace agent doctor`。"
+                             % (job, epoch, attempt))
+                refused = refused or exc
+                continue
+            except Exception as exc:
+                # No response at all (timeout, network): the next batch would
+                # wait out the same timeout, so this round ends here. The
+                # batch stays queued and is tried again after its delay.
+                self._defer_failed_batch(key, rows, exc, retry)
+                break
             self.db.mark_remote_events_sent([row["id"] for row in rows])
+            self.db.clear_remote_event_retry(job, attempt, epoch)
+            self._outbox_failures_logged.pop(key, None)
         if batches:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)
+        if refused is not None:
+            raise refused
+
+    def _defer_failed_batch(self, key, rows, exc, retry) -> None:
+        """Keep a batch whose upload failed (anything but 409/401) and retry it
+        after 5 s, doubling with each failure up to OUTBOX_ERROR_RETRY_SECONDS:
+        a blip recovers at once, a long outage settles at one try per cap. The
+        failure is written once per batch until it changes; only its type and
+        status, never the exception text."""
+        job, attempt, epoch = key
+        status = exc.status if isinstance(exc, CloudError) else 0
+        failures = (retry["failures"] if retry else 0) + 1
+        delay = min(OUTBOX_ERROR_RETRY_SECONDS, OUTBOX_ERROR_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 8))
+        now = time.time()
+        self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay)
+        failure = "HTTP %d" % status if status else exc.__class__.__name__
+        if self._outbox_failures_logged.get(key) != failure:
+            self._outbox_failures_logged[key] = failure
+            self.log("result upload failed: job %s attempt %s: %s; %d event(s) retained locally; retrying with backoff up to %ds"
+                     % (job, attempt, failure, len(rows), OUTBOX_ERROR_RETRY_SECONDS))
+
+    def _note_loop_error(self, exc) -> None:
+        """The claim loops retry after any error; say so once per distinct error
+        instead of staying silent for hours."""
+        key = (type(exc).__name__, str(exc)[:200])
+        if key in self._loop_errors:
+            return
+        if len(self._loop_errors) >= 50:
+            self._loop_errors.clear()
+        self._loop_errors.add(key)
+        self.log("领取循环出错，将退避重试：%s: %s" % key)
