@@ -20,7 +20,7 @@ from timetrace.db import Database
 from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
                        worktree)
 from timetrace.remote_control import RunControl
-from timetrace.mcp_access import parse_claim, skip_note
+from timetrace.mcp_access import parse_claim, skip_note, still_usable
 from timetrace.process import tail_text
 from timetrace.redact import redact
 from timetrace.review_evidence import source_run_evidence
@@ -1048,20 +1048,27 @@ class Agent:
                 results.prepare_out_dir(execution_path, fresh=not resuming)
                 extra_kw = {"control": control} if interactive else {}
                 mcp = self._mcp_access(claim, adapter, in_folder)
-                if mcp is not None:
-                    extra_kw["mcp"] = mcp
+                def turn_kw():
+                    """What a turn is started with: the MCP access only while it has time left (a follow-up may come long after the claim)."""
+                    kw = dict(extra_kw)
+                    if mcp is not None:
+                        if still_usable(mcp):
+                            kw["mcp"] = mcp
+                        else:
+                            self.log(skip_note("the access had run out by this turn"))
+                    return kw
                 if in_folder:
                     folder_run = adapter.resume_folder if resuming else adapter.start_folder
                     def run(prompt, cwd, session, log, cancel):
-                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
+                        return folder_run(prompt, cwd, workspace["path"], session, log, cancel, **turn_kw())
                     def followup_run(prompt, cwd, session, log, cancel):
-                        return adapter.resume_folder(prompt, cwd, workspace["path"], session, log, cancel, **extra_kw)
+                        return adapter.resume_folder(prompt, cwd, workspace["path"], session, log, cancel, **turn_kw())
                 else:
                     first = adapter.resume if resuming else adapter.start
                     def run(prompt, cwd, session, log, cancel):
-                        return first(prompt, cwd, session, log, cancel, **extra_kw)
+                        return first(prompt, cwd, session, log, cancel, **turn_kw())
                     def followup_run(prompt, cwd, session, log, cancel):
-                        return adapter.resume(prompt, cwd, session, log, cancel, **extra_kw)
+                        return adapter.resume(prompt, cwd, session, log, cancel, **turn_kw())
                 prompt = self._run_prompt(job, resuming)
                 observed_start = None
                 adapter_entered = threading.Event()

@@ -13,7 +13,7 @@ import os
 import re
 import tempfile
 import threading
-from typing import Iterable, Iterator, Match, Optional
+from typing import Any, Iterable, Iterator, Match, Optional
 
 MASK = "[REDACTED]"
 
@@ -130,6 +130,18 @@ def mask_timetrace_tokens(text: str) -> str:
     return _mask_active(text) if _ACTIVE else text
 
 
+def mask_structure(value: Any) -> Any:
+    """A decoded JSON value with every string in it (and every key) masked: a copy for the log, for the lines kept and for a
+    person to read. What is sent back to the process that produced it is the original, never this."""
+    if isinstance(value, str):
+        return mask_timetrace_tokens(value)
+    if isinstance(value, list):
+        return [mask_structure(item) for item in value]
+    if isinstance(value, dict):
+        return {(mask_timetrace_tokens(key) if isinstance(key, str) else key): mask_structure(item) for key, item in value.items()}
+    return value
+
+
 def mask_file(path: Optional[str]) -> bool:
     """Mask TimeTrace tokens in a file a tool wrote (Codex's `-o` final-message file is one: it is written by the tool
     itself, outside the streams that are masked as they are read). Rewritten in place, atomically, keeping its mode;
@@ -156,6 +168,21 @@ def mask_file(path: Optional[str]) -> bool:
             except OSError:
                 pass
             raise
+        return True
+    except OSError:
+        # The file could not be rewritten (a directory that cannot be written, a disk that is full): it is not left with
+        # what it holds. It is removed, or, where that is not allowed either, emptied.
+        return _drop_file(path)
+
+
+def _drop_file(path: str) -> bool:
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        pass
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)))  # (never creates a file)
         return True
     except OSError:
         return False

@@ -224,6 +224,27 @@ class TimeTraceTokenTest(unittest.TestCase):
             self.assertFalse(mask_file(link), "a symbolic link is never followed")
             self.assertIn("yyyy", open(target).read())
 
+    def test_a_file_that_cannot_be_rewritten_is_not_left_holding_the_token(self):
+        import os, stat, tempfile
+        from timetrace.redact import mask_file
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "ro")
+            os.mkdir(sub)
+            path = os.path.join(sub, "last.md")
+            with open(path, "w") as fh:
+                fh.write("the token is ttm_" + "z" * 40)
+            os.chmod(sub, 0o500)  # no temporary file can be made here, and the file cannot be removed
+            try:
+                self.assertTrue(mask_file(path))
+                with open(path) as fh:
+                    self.assertNotIn("zzzz", fh.read())
+            finally:
+                os.chmod(sub, 0o700)
+            # and a file that vanished is not made again
+            gone = os.path.join(d, "gone.md")
+            self.assertFalse(mask_file(gone))
+            self.assertFalse(os.path.exists(gone))
+
     def test_the_masking_used_for_logs_changes_only_tokens(self):
         from timetrace.redact import mask_timetrace_tokens
         self.assertEqual(mask_timetrace_tokens("password = hunter2hunter2 and ttm_" + "g" * 30), "password = hunter2hunter2 and [REDACTED:timetrace]")

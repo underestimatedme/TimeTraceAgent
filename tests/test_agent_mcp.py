@@ -91,6 +91,15 @@ class ClaimCarriesMcpTest(unittest.TestCase):
             for secret in (SENTINEL, "evil.example", "token="):
                 self.assertNotIn(secret, " ".join(logs), name)
 
+    def test_an_access_that_is_about_to_run_out_is_not_handed_to_the_tool(self):
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        adapter = TakesMcp()
+        logs = self.run_job(adapter, CloudWithMcp(mcp_claim(expires=soon)))
+        self.assertIsNone(adapter.mcp)
+        self.assertEqual(len([line for line in logs if line.startswith("mcp: skipped")]), 1)
+        self.assertNotIn(SENTINEL, " ".join(logs))
+
     def test_a_tool_whose_adapter_does_not_take_it_is_run_as_before(self):
         logs = self.run_job(LacksMcp(), CloudWithMcp(mcp_claim()))
         self.assertTrue(any(line.startswith("mcp: skipped") for line in logs))

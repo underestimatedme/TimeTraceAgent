@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from timetrace.redact import redact
+from timetrace.redact import mask_timetrace_tokens, redact
 
 OUT_DIR = (".timetrace", "out")
 RESULT_NAME = "result.json"
@@ -213,6 +213,16 @@ def read_file_artifact(root: str, ref: str) -> Optional[bytes]:
         data = _read_bounded(target, FILE_BYTES)
     except Invalid:
         return None
+    if data:
+        # A file the run produced may hold what it printed or was given, a TimeTrace token among it: text files go up
+        # with those masked (binary files are not touched; they are not text a token can be read from).
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        masked = mask_timetrace_tokens(text)
+        if masked != text:
+            data = masked.encode("utf-8")
     return data or None
 
 

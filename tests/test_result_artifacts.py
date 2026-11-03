@@ -372,6 +372,18 @@ class FileArtifactTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_text_file_goes_up_without_a_timetrace_token_and_a_binary_one_as_it_is(self):
+        token = "ttm_" + "Qw3rTy" * 5
+        (self.root / "dist" / "run.log").write_text("TIMETRACE_MCP_TOKEN=" + token + "\nrest\n")
+        data = results.read_file_artifact(str(self.root), "dist/run.log")
+        self.assertNotIn(token.encode(), data)
+        self.assertIn(b"rest", data)
+        binary = b"\xff\xfe" + token.encode()
+        (self.root / "dist" / "blob.bin").write_bytes(binary)
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/blob.bin"), binary)
+        (self.root / "dist" / "plain.txt").write_text("nothing to mask\n")
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/plain.txt"), b"nothing to mask\n")
+
     def test_only_a_bounded_regular_file_inside_the_worktree_is_read(self):
         (self.root / "dist" / "pkg.zip").write_bytes(b"PK\x03\x04data")
         self.assertEqual(results.read_file_artifact(str(self.root), "dist/pkg.zip"), b"PK\x03\x04data")

@@ -38,6 +38,10 @@ class ParsingTests(unittest.TestCase):
             "token without the prefix": claim(token="abc_" + "x" * 40),
             "token with a space": claim(token="ttm_" + "x" * 20 + " " + "y" * 5),
             "token too long": claim(token="ttm_" + "x" * 600),
+            "token with a newline at the end": claim(token=SENTINEL + "\n"),
+            "token that is only the prefix": claim(token="ttm_"),
+            "token too short to be one of ours": claim(token="ttm_abc"),
+            "token with characters ours never have": claim(token="ttm_" + "A" * 20 + ".~+/=" + "B" * 5),
             "expired": claim(expires=iso(-60)),
             "expiry that is not a time": claim(expires="soon"),
             "url that is not text": {"mcp": {"url": 7, "token": SENTINEL, "expires_at": iso()}},
@@ -60,8 +64,28 @@ class ParsingTests(unittest.TestCase):
             "the path is a longer one": CLOUD + "/mcp/oauth",
             "a port that is not one": "https://apis.atlaspaces.com:99999/timetrace/api/v1/mcp",
             "not an address": "not a url",
+            "a tab inside the host": "https://apis.atlas\tpaces.com/timetrace/api/v1/mcp",
+            "a newline at the end": CLOUD + "/mcp\n",
+            "a control character first": "\x01" + CLOUD + "/mcp",
+            "a character that is not ASCII": "https://apis.atlaspaces.com/timetrace/api/v1/m\u00e7p/mcp",
+            "port zero": "https://apis.atlaspaces.com:0/timetrace/api/v1/mcp",
         }.items():
             self.assertIsNone(McpAccess.from_claim(claim(url=url), cloud_base_url=CLOUD), name)
+
+    def test_any_fraction_of_a_second_in_the_expiry_is_read(self):
+        # (Go writes as many digits as are not zero; Python 3.9's fromisoformat takes 3 or 6 only.)
+        for fraction in ("", ".5", ".12", ".1234", ".12345", ".1234567", ".123456789"):
+            value = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S") + fraction + "Z"
+            self.assertIsNotNone(McpAccess.from_claim(claim(expires=value), cloud_base_url=CLOUD), value)
+        value = (datetime.now(timezone.utc) + timedelta(hours=1)).astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S.1234567+08:00")
+        self.assertIsNotNone(McpAccess.from_claim(claim(expires=value), cloud_base_url=CLOUD))
+
+    def test_an_access_with_hardly_any_time_left_is_not_handed_to_a_tool(self):
+        from timetrace.mcp_access import still_usable
+        access = McpAccess(CLOUD + "/mcp", SENTINEL, 1000.0)
+        self.assertTrue(still_usable(access, now=900.0))
+        self.assertFalse(still_usable(access, now=980.0))
+        self.assertFalse(still_usable(access, now=1001.0))
 
     def test_the_host_is_compared_without_regard_to_case_and_the_default_port(self):
         self.assertIsNotNone(McpAccess.from_claim(claim(url="https://APIS.atlaspaces.com:443/timetrace/api/v1/mcp"), cloud_base_url=CLOUD))

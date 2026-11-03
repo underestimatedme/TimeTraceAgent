@@ -208,5 +208,50 @@ class StreamSessionTest(FakeClaudeCase):
         self.assertEqual(written[0]["response"]["request_id"], "r9")
 
 
+class TokenShapedTextTest(FakeClaudeCase):
+    """The masking of a TimeTrace token is of what the run prints (the log, the lines kept, what the host is shown), never of
+    what is sent back to Claude: an approved command is echoed as Claude sent it, and a line whose text happens to look like a
+    token is still the JSON line it was."""
+
+    LOOKALIKE = "getattr_with_default_value_helper_function(x)"          # `attr_` and 20 more identifier characters
+    TAB_THEN_TOKEN = "\tx\n\ttr_" + "a" * 24                           # (a JSON \t escape directly before a `tr_` token shape)
+
+    def test_the_approved_input_goes_back_unchanged_while_the_host_is_shown_it_masked(self):
+        host = Recorder()
+        self.run_session([[{"permission": {"tool": "Bash", "input": {"command": self.LOOKALIKE}}}, {"result": "done"}]], host=host)
+        sent_back = [r["decision"] for r in self.records() if "decision" in r][0]["reply"]["response"]["updatedInput"]
+        self.assertEqual(sent_back, {"command": self.LOOKALIKE})
+        self.assertIn("[REDACTED", host.requests[0]["input"]["command"])
+
+    def test_a_request_and_a_result_whose_text_looks_like_a_token_are_still_answered_and_read(self):
+        host = Recorder()
+        code, lines = self.run_session([[{"permission": {"tool": "Write", "input": {"file_path": "a.txt", "content": self.TAB_THEN_TOKEN}}},
+                                         {"result": self.TAB_THEN_TOKEN}]], host=host, timeout=15)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(host.requests), 1)
+        decision = [r["decision"] for r in self.records() if "decision" in r]
+        self.assertEqual(decision[0]["reply"]["response"]["updatedInput"]["content"], self.TAB_THEN_TOKEN)
+        for line in lines:
+            json.loads(line)  # every line that is kept is still JSON
+        result = claude.parse_stream(lines)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output, self.TAB_THEN_TOKEN)  # (not a token: `tr_` is nothing of ours, so it is not touched)
+        self.assertNotIn("[REDACTED", Path(self.log).read_text())
+
+    def test_a_real_token_is_masked_in_the_log_the_lines_and_what_the_host_is_shown_and_nowhere_else_is_touched(self):
+        token = "ttm_" + "Qw3rTy" * 5
+        host = Recorder()
+        code, lines = self.run_session([[{"permission": {"tool": "Bash", "input": {"command": "echo " + token + " && ls"}}},
+                                         {"result": "the token was " + token}]], host=host)
+        self.assertEqual(code, 0)
+        self.assertNotIn(token, host.requests[0]["input"]["command"])
+        self.assertNotIn(token, "\n".join(lines))
+        self.assertNotIn(token, Path(self.log).read_text())
+        self.assertNotIn(token, claude.parse_stream(lines).output)
+        # what Claude asked to run is what is answered
+        sent_back = [r["decision"] for r in self.records() if "decision" in r][0]["reply"]["response"]["updatedInput"]
+        self.assertEqual(sent_back, {"command": "echo " + token + " && ls"})
+
+
 if __name__ == "__main__":
     unittest.main()
