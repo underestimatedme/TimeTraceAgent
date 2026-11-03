@@ -22,6 +22,7 @@ from timetrace import tiers
 from timetrace.adapters import claude_usage
 from timetrace.claude_stream import run_stream
 from timetrace.mcp_access import ENV_NAME, McpAccess
+from timetrace.redact import masking
 from timetrace.models import CLAUDE, RunResult, Sample
 from timetrace.quota import merge_capabilities
 
@@ -375,6 +376,11 @@ class ClaudeAdapter(ToolAdapter):
         """One execution run (or the continuation of one). With `mcp` the run is given TimeTrace's MCP server: a config
         file of its own (deleted however the run ends) that refers to the token by the name of an environment variable,
         and the token itself in the environment of this one process, never anywhere else."""
+        config = None
+        with masking([mcp.token] if mcp is not None else []):
+            return self._worktree_run_masked(prompt, cwd, session_id, log_file, cancel_event, control, mcp, resume)
+
+    def _worktree_run_masked(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp, resume) -> RunResult:
         config = None
         try:
             if mcp is not None:

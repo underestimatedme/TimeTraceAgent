@@ -171,8 +171,58 @@ class TimeTraceTokenTest(unittest.TestCase):
             self.assertNotRegex(redact(text), r"ttm_[A-Za-z0-9_-]{20,}")
 
     def test_what_is_not_a_token_is_left_alone(self):
-        for text in ("ttm_short", "attm_" + "a" * 30, "see ttm_ for details", "git commit -m 'ttr_ prefix' main"):
+        for text in ("ttm_short", "ttm_" + "a" * 19, "see ttm_ for details", "git commit -m 'ttr_ prefix' main", "mattm_ and ttr_x"):
             self.assertEqual(redact(text), text)
+
+    def test_a_token_run_into_other_text_is_masked_whatever_stands_before_or_after_it(self):
+        token = "ttm_" + "Lk7Jh6Gf5D" * 4
+        for text in ("diagnosticprefix" + token, token + "suffix", "x=" + token + ";", "/path/" + token + "/more", "a" + token + "b",
+                     "ttm_" + token, token + token):
+            masked = redact(text)
+            self.assertNotIn("Lk7Jh6Gf5D", masked, text)
+
+    def test_the_exact_value_a_run_was_given_is_masked_even_in_a_shape_the_rule_does_not_know(self):
+        from timetrace.redact import masking
+        odd = "ttm_#odd shape"  # not a token the rules would match
+        self.assertEqual(redact("before " + odd + " after"), "before " + odd + " after")
+        with masking([odd]):
+            self.assertNotIn(odd, redact("before " + odd + " after"))
+            from timetrace.redact import mask_timetrace_tokens
+            self.assertNotIn(odd, mask_timetrace_tokens("log line " + odd))
+        self.assertEqual(redact("before " + odd + " after"), "before " + odd + " after")  # only while the run lasts
+
+    def test_masking_nests_and_ignores_values_too_short_to_be_credentials(self):
+        from timetrace.redact import masking
+        with masking(["abc", "", None]):
+            self.assertEqual(redact("abc stays"), "abc stays")
+        with masking(["secretvalue-1234"]):
+            with masking(["secretvalue-1234"]):
+                pass
+            self.assertNotIn("secretvalue-1234", redact("x secretvalue-1234"))
+
+    def test_a_file_a_tool_wrote_is_masked_in_place_and_keeps_its_mode(self):
+        import os, stat, tempfile
+        from timetrace.redact import mask_file
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "last.md")
+            with open(path, "w") as fh:
+                fh.write("the token is ttm_" + "z" * 40 + "\nand more")
+            os.chmod(path, 0o640)
+            self.assertTrue(mask_file(path))
+            text = open(path).read()
+            self.assertNotIn("zzzz", text)
+            self.assertIn("and more", text)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+            self.assertFalse(mask_file(path), "nothing left to mask")
+            self.assertFalse(mask_file(os.path.join(d, "missing")))
+            self.assertEqual(os.listdir(d), ["last.md"], "no temporary file is left")
+            link = os.path.join(d, "link.md")
+            target = os.path.join(d, "target.md")
+            with open(target, "w") as fh:
+                fh.write("ttm_" + "y" * 40)
+            os.symlink(target, link)
+            self.assertFalse(mask_file(link), "a symbolic link is never followed")
+            self.assertIn("yyyy", open(target).read())
 
     def test_the_masking_used_for_logs_changes_only_tokens(self):
         from timetrace.redact import mask_timetrace_tokens

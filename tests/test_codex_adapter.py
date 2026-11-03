@@ -229,17 +229,27 @@ class McpInjectionTest(unittest.TestCase):
     def fake_codex(self, d):
         script = Path(d) / "codex"
         script.write_text("#!%s\n" % __import__("sys").executable + '''
-import json, os, sys
+import json, os, sys, time
+token = os.environ.get("TIMETRACE_MCP_TOKEN")
+old = os.environ.get("TT_FAKE_PREV", "")
 with open(os.environ["TT_FAKE_TRANSCRIPT"], "a") as fh:
-    fh.write(json.dumps({"argv": sys.argv[1:], "token_in_env": os.environ.get("TIMETRACE_MCP_TOKEN")}) + "\\n")
+    fh.write(json.dumps({"argv": sys.argv[1:], "token_in_env": token}) + "\\n")
+# The final answer goes to the -o file, written by the tool itself (the real Codex does exactly this).
+if "-o" in sys.argv:
+    with open(sys.argv[sys.argv.index("-o") + 1], "w") as fh:
+        fh.write("the token is " + str(token) + " and the last one was " + old)
+print("diagnosticprefix" + str(token) + "suffix")
+print("lastrun" + old)
+time.sleep(float(os.environ.get("TT_FAKE_SLEEP", "0")))
 print(json.dumps({"type": "thread.started", "thread_id": "t1"}))
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}))
 print(json.dumps({"type": "turn.completed"}))
+sys.exit(int(os.environ.get("TT_FAKE_EXIT", "0")))
 ''')
         script.chmod(0o755)
         return str(script)
 
-    def run_adapter(self, resume, mcp):
+    def run_adapter(self, resume, mcp, extra_env=None, cancel=None, keep=None):
         import os, tempfile
         from unittest.mock import patch
         from timetrace.billing import StaticBilling
@@ -247,12 +257,19 @@ print(json.dumps({"type": "turn.completed"}))
             transcript = Path(d) / "t.jsonl"
             adapter = codex.CodexAdapter({"bin": self.fake_codex(d), "sandbox": "workspace-write"}, billing=StaticBilling(True))
             before = dict(os.environ)
-            with patch.dict(os.environ, {"TT_FAKE_TRANSCRIPT": str(transcript)}):
+            with patch.dict(os.environ, dict({"TT_FAKE_TRANSCRIPT": str(transcript)}, **(extra_env or {}))):
                 with patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
                     run = adapter.resume if resume else adapter.start
-                    result = run("go", d, "tid", str(Path(d) / "run.log"), None, mcp=mcp)
+                    try:
+                        result = run("go", d, "tid", str(Path(d) / "run.log"), cancel, mcp=mcp)
+                    except Exception:
+                        result = None
+                        self.raised = True
             records = [json.loads(line) for line in transcript.read_text().splitlines()]
             log = (Path(d) / "run.log").read_text()
+            last = Path(d) / "run.log.last.md"
+            if keep is not None:
+                keep.append(last.read_text() if last.exists() else None)
             after = dict(os.environ)
             before.pop("TT_FAKE_TRANSCRIPT", None); after.pop("TT_FAKE_TRANSCRIPT", None)
             self.assertEqual(before, after, "the process's own environment changed")
@@ -272,6 +289,63 @@ print(json.dumps({"type": "turn.completed"}))
         result, records, log = self.run_adapter(False, None)
         self.assertIsNone(records[0]["token_in_env"])
         self.assertFalse([a for a in records[0]["argv"] if "mcp_servers" in a])
+
+    OLD = "ttm_SENTINEL_" + "Q1w2E3r4T5" * 4
+
+    def assertNoTokens(self, text, *tokens):
+        for token in tokens or (self.TOKEN, self.OLD):
+            self.assertNotIn(token, text)
+            self.assertNotIn(token[4:], text)
+
+    def test_the_final_answer_file_the_tool_writes_never_keeps_the_token_however_the_run_ends(self):
+        import threading
+        cases = {
+            "finished": dict(),
+            "non-zero exit": dict(extra_env={"TT_FAKE_EXIT": "3"}),
+            "cancelled while running": None,
+            "the adapter raising": None,
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                kept = []
+                if name == "cancelled while running":
+                    cancel = threading.Event()
+                    timer = threading.Timer(1.0, cancel.set)
+                    timer.start()
+                    self.addCleanup(timer.cancel)
+                    self.run_adapter(False, self.access(), extra_env={"TT_FAKE_SLEEP": "30"}, cancel=cancel, keep=kept)
+                elif name == "the adapter raising":
+                    from unittest.mock import patch
+                    with patch.object(codex.CodexAdapter, "_run", side_effect=self._raise_after_the_tool_wrote_its_answer):
+                        self.run_adapter(False, self.access(), keep=kept)
+                else:
+                    self.run_adapter(False, self.access(), keep=kept, **case)
+                self.assertTrue(kept and kept[0] is not None, "the tool's own final-answer file was not there to be checked")
+                self.assertNoTokens(kept[0])
+                self.assertIn("REDACTED", kept[0])
+
+    def _raise_after_the_tool_wrote_its_answer(self, cmd, cwd, log_file, cancel_event=None, env=None):
+        # the real tool ran and wrote its answer (with the token), then the adapter failed
+        import subprocess
+        Path(log_file).touch()
+        subprocess.run(cmd, cwd=cwd, env=dict(__import__("os").environ, **(env or {})), capture_output=True)
+        raise RuntimeError("the adapter broke after the run")
+
+    def test_a_continuation_with_a_new_token_leaves_neither_the_new_nor_the_old_one(self):
+        kept = []
+        result, records, log = self.run_adapter(True, self.access("ttm_SENTINEL_" + "Qq1Ww2Ee3R" * 4), extra_env={"TT_FAKE_PREV": self.TOKEN}, keep=kept)
+        self.assertTrue(result.ok, result.error)
+        new = "ttm_SENTINEL_" + "Qq1Ww2Ee3R" * 4
+        self.assertEqual(records[0]["token_in_env"], new)
+        for where in (log, kept[0], json.dumps(result.output), json.dumps(result.error)):
+            self.assertNoTokens(where or "", new, self.TOKEN)
+
+    def test_a_token_run_into_other_words_is_masked_in_the_log_and_the_result(self):
+        kept = []
+        result, records, log = self.run_adapter(False, self.access(), extra_env={"TT_FAKE_PREV": self.OLD}, keep=kept)
+        self.assertNoTokens(log)
+        self.assertIn("diagnosticprefix[REDACTED", log)
+        self.assertIn("lastrun[REDACTED", log)
 
     def test_a_continuation_gets_the_new_token(self):
         _, first, _ = self.run_adapter(False, self.access())

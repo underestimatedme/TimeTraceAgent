@@ -23,6 +23,7 @@ from timetrace import __version__
 from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
 from timetrace.mcp_access import ENV_NAME, McpAccess
+from timetrace.redact import mask_file, masking
 from timetrace.models import CODEX, RunResult, Sample
 from timetrace.billing import billing_env_keys, codex_verifier, sanitized_env
 from timetrace.quota import merge_capabilities
@@ -356,17 +357,27 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             return []
 
+    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess]) -> RunResult:
+        """One execution run. Codex writes its final answer to the `-o` file itself, outside the streams that are masked
+        as they are read, so that file is masked once the run is over however it ended (finished, failed, cancelled, an
+        exception): a token the model repeated is never left in it."""
+        with masking([mcp.token] if mcp is not None else []):
+            try:
+                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+            finally:
+                mask_file(log_file + ".last.md")
+
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md",
                         add_dirs=self._writable_extras(cwd), mcp=mcp)
-        return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+        return self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
 
     def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
                mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, resume=session_id,
                         last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd), mcp=mcp)
-        res = self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
         res.session_id = res.session_id or session_id
         return res
 

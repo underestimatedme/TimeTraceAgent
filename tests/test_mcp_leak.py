@@ -44,8 +44,15 @@ import json, os, sys
 token = os.environ.get("TIMETRACE_MCP_TOKEN", "")
 with open(os.environ["TT_FAKE_TRANSCRIPT"], "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv[1:]}}) + "\\n")
+# What Codex does: its final answer is written to the file named by -o, by the tool itself.
+if "-o" in sys.argv:
+    with open(sys.argv[sys.argv.index("-o") + 1], "w") as fh:
+        fh.write("the token is " + token + "\\nthe last run's token was " + os.environ.get("TT_FAKE_PREV", ""))
+print("diagnosticprefix" + token + "suffix")
 print("TIMETRACE_MCP_TOKEN=" + token)
+print("an older token, run into a word: lastrun" + os.environ.get("TT_FAKE_PREV", ""))
 sys.stderr.write("token in stderr: " + token + "\\n")
+sys.stderr.write("diagnosticprefix" + token + "\\n")
 print(json.dumps({{"type": "thread.started", "thread_id": "t1"}}))
 print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "the token is " + token}}}}))
 print(json.dumps({{"type": "turn.completed"}}))
@@ -70,8 +77,9 @@ class TokenNeverLeavesTest(unittest.TestCase):
                 adapter = claude.ClaudeAdapter({"bin": str(Path(__file__).with_name("fake_claude_stream.py")), "allowed_tools": []},
                                                billing=StaticBilling(True), credentials=lambda: {})
                 scenario.write_text(json.dumps({"turns": [[
-                    {"raw": "tool says " + SENTINEL}, {"echo_env": "TIMETRACE_MCP_TOKEN"}, {"stderr": "stderr says " + SENTINEL},
-                    {"result": "the token is " + SENTINEL}]]}))
+                    {"raw": "tool says " + SENTINEL}, {"raw": "diagnosticprefix" + SENTINEL + "suffix"}, {"echo_env": "TIMETRACE_MCP_TOKEN"},
+                    {"stderr": "stderr says " + SENTINEL}, {"stderr": "diagnosticprefix" + SENTINEL},
+                    {"result": "the token is " + SENTINEL + ", and diagnosticprefix" + SENTINEL}]]}))
                 cloud, key = Cloud("claude", "claude-default"), "claude"
             else:
                 script = Path(d) / "codex"

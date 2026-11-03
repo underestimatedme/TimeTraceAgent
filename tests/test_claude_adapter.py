@@ -382,6 +382,19 @@ class McpInjectionTest(unittest.TestCase):
         self.assertIn("--resume", resumed)
         self.assertEqual(self.leftovers(), [])
 
+    def test_a_continuation_with_a_new_token_leaves_neither_the_new_nor_the_old_one_in_the_log_or_the_result(self):
+        old = self.TOKEN
+        new = "ttm_SENTINEL_" + "Qq1Ww2Ee3R" * 4
+        result = self.run_fake([[{"raw": "lastrun" + old}, {"echo_env": "TIMETRACE_MCP_TOKEN"}, {"raw": "diagnosticprefix" + new + "suffix"},
+                                 {"stderr": "diagnosticprefix" + old}, {"result": "old " + old + " new " + new}]], self.access(new), resume=True)
+        self.assertTrue(result.ok, result.error)
+        text = (self.d / "run.log").read_text() + (result.output or "") + (result.error or "")
+        for token in (old, new):
+            self.assertNotIn(token, text)
+            self.assertNotIn(token[4:], text)
+        self.assertIn("REDACTED", text)
+        self.assertEqual(self.leftovers(), [])
+
     def test_a_config_that_cannot_be_written_says_nothing_of_the_token(self):
         adapter = self.adapter()
         with self.assertRaises(Exception) as caught:
