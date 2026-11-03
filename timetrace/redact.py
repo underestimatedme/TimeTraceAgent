@@ -130,6 +130,21 @@ def mask_timetrace_tokens(text: str) -> str:
     return _mask_active(text) if _ACTIVE else text
 
 
+_TOKEN_BYTES = re.compile(rb"tt[mr]_[A-Za-z0-9_-]{20,}")
+
+
+def holds_timetrace_token(data: bytes) -> bool:
+    """Whether raw bytes hold a TimeTrace token in any of the ways a file may write one: as ASCII/UTF-8, or as UTF-16 of
+    either byte order (at either alignment). For files that are not text we can safely rewrite."""
+    if _TOKEN_BYTES.search(data):
+        return True
+    for view in (data, data[1:]):
+        for encoding in ("utf-16-le", "utf-16-be"):
+            if _TOKEN_BYTES.search(view.decode(encoding, errors="ignore").encode("ascii", errors="ignore")):
+                return True
+    return False
+
+
 def mask_structure(value: Any) -> Any:
     """A decoded JSON value with every string in it (and every key) masked: a copy for the log, for the lines kept and for a
     person to read. What is sent back to the process that produced it is the original, never this."""

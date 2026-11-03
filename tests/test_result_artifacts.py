@@ -378,9 +378,15 @@ class FileArtifactTest(unittest.TestCase):
         data = results.read_file_artifact(str(self.root), "dist/run.log")
         self.assertNotIn(token.encode(), data)
         self.assertIn(b"rest", data)
-        binary = b"\xff\xfe" + token.encode()
-        (self.root / "dist" / "blob.bin").write_bytes(binary)
-        self.assertEqual(results.read_file_artifact(str(self.root), "dist/blob.bin"), binary)
+        clean = b"\xff\xfe\x00\x01 harmless bytes ttm_short"
+        (self.root / "dist" / "clean.bin").write_bytes(clean)
+        self.assertEqual(results.read_file_artifact(str(self.root), "dist/clean.bin"), clean)
+        # A file that is not text cannot be rewritten; one that holds a token is not uploaded, in any way it writes it.
+        for name, blob in {"raw.bin": b"\xff\xfe" + token.encode() + b"\x00",
+                           "utf16le.bin": b"\xff\xfe" + token.encode("utf-16-le"), "utf16be.bin": b"\xfe\xff" + token.encode("utf-16-be"),
+                           "odd.bin": b"\x00" + token.encode("utf-16-le"), "shifted.bin": b"\xff" + token.encode("utf-16-le"), "run-in.bin": b"\xff" + b"prefix" + token.encode()}.items():
+            (self.root / "dist" / name).write_bytes(blob)
+            self.assertIsNone(results.read_file_artifact(str(self.root), "dist/" + name), name)
         (self.root / "dist" / "plain.txt").write_text("nothing to mask\n")
         self.assertEqual(results.read_file_artifact(str(self.root), "dist/plain.txt"), b"nothing to mask\n")
 

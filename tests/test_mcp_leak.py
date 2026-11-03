@@ -59,7 +59,9 @@ print(json.dumps({{"type": "turn.completed"}}))
 '''
 
 
-class TokenNeverLeavesTest(unittest.TestCase):
+class RunHarness(unittest.TestCase):
+    """Runs one dispatched job through the real adapter and the real upload path, with a fake tool process."""
+
     def run_agent(self, provider):
         records = io.StringIO()
         handler = logging.StreamHandler(records)
@@ -106,6 +108,9 @@ class TokenNeverLeavesTest(unittest.TestCase):
                     "disk": everything, "argv": argv, "notes": "\n".join(notes), "logging": records.getvalue(),
                     "logs": [p.read_text(errors="replace") for p in Path(d).rglob("*.log")]}
 
+
+
+class TokenNeverLeavesTest(RunHarness):
     def check(self, provider):
         got = self.run_agent(provider)
         self.assertIn("completed", got["events"], got["outcome"])
@@ -124,6 +129,55 @@ class TokenNeverLeavesTest(unittest.TestCase):
 
     def test_codex_run_through_the_real_adapter_and_upload_path(self):
         self.check("codex")
+
+
+class FileArtifactTest(RunHarness):
+    """A declared `file` artifact is read from the worktree and uploaded as it is, so what a tool wrote into it is what leaves.
+    The fake tool writes the token into files in several forms and declares them in result.json, the way a model does."""
+
+    # (The fake binary is also started for its other subcommands, such as the quota probe: only `exec` writes files, and in the
+    # directory Codex is told to work in (-C), as the real one does, never in the directory the tests run from.)
+    WRITER = """import codecs
+if "exec" in sys.argv:
+    if "-C" in sys.argv:
+        os.chdir(sys.argv[sys.argv.index("-C") + 1])
+    os.makedirs(".timetrace/out", exist_ok=True)
+    files = {{
+        "leak.bin": b"\\xff\\xfe" + token.encode(),
+        "leak16.bin": codecs.BOM_UTF16_LE + token.encode("utf-16-le"),
+        "leak.txt": ("log line\\nTIMETRACE_MCP_TOKEN=" + token + "\\n").encode(),
+        "clean.bin": b"\\xff\\xfe\\x00\\x01 nothing secret in here",
+    }}
+    for name, data in files.items():
+        with open(name, "wb") as fh:
+            fh.write(data)
+    with open(".timetrace/out/result.json", "w") as fh:
+        fh.write(json.dumps({{"artifacts": [{{"kind": "file", "ref": name}} for name in files]}}))
+"""
+
+    def test_no_upload_request_carries_the_token_in_any_form_and_a_clean_file_still_goes_up(self):
+        uploads = []
+
+        class Recording(Cloud):
+            def upload_job_file(self, token, job_id, name, data):
+                uploads.append((name, data))
+                return {"id": "file-" + name}
+
+        script = FAKE_CODEX.replace('print("TIMETRACE_MCP_TOKEN=" + token)', self.WRITER + 'print("TIMETRACE_MCP_TOKEN=" + token)')
+        module = sys.modules[__name__]
+        with patch.object(module, "FAKE_CODEX", script), patch.object(module, "Cloud", Recording):
+            got = self.run_agent("codex")
+        self.assertIn("completed", got["events"], got["outcome"])
+        self.assertIn(SENTINEL.encode(), got["disk"], "the fake tool must really have written the token into its files")
+        self.assertTrue(uploads, "nothing was uploaded: the clean file should have been")
+        for name, data in uploads:
+            self.assertNotIn(SENTINEL.encode(), data, name)
+            self.assertNotIn(SENTINEL.encode("utf-16-le"), data, name)
+            self.assertNotIn(SENTINEL[4:20].encode(), data, name)
+        self.assertEqual(sorted(name for name, _ in uploads), ["clean.bin", "leak.txt"])
+        self.assertEqual(dict(uploads)["clean.bin"], b"\xff\xfe\x00\x01 nothing secret in here")
+        self.assertIn(b"log line", dict(uploads)["leak.txt"])
+        self.assertIn(b"REDACTED", dict(uploads)["leak.txt"])
 
 
 def script_path(d):
