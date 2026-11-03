@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from timetrace import __version__
 from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
+from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.models import CODEX, RunResult, Sample
 from timetrace.billing import billing_env_keys, codex_verifier, sanitized_env
 from timetrace.quota import merge_capabilities
@@ -168,7 +169,8 @@ def parse_reset_credits(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 # ---- exec -----------------------------------------------------------------------
 def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] = None,
-              last_msg_file: Optional[str] = None, add_dirs: Optional[List[str]] = None) -> List[str]:
+              last_msg_file: Optional[str] = None, add_dirs: Optional[List[str]] = None,
+              mcp: Optional[McpAccess] = None) -> List[str]:
     sandbox = str(cfg.get("sandbox", "workspace-write"))
     cmd = [cfg.get("bin", "codex"), "exec"]
     if resume:
@@ -191,6 +193,11 @@ def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] 
         cmd += ["-m", cfg["model"]]
     if last_msg_file:
         cmd += ["-o", last_msg_file]
+    if mcp is not None:
+        # TimeTrace's MCP server for this run. The address is in the command (it is not a secret); the token is not: Codex
+        # reads it from the environment variable named here, which only this process is given.
+        cmd += ["-c", "mcp_servers.timetrace.url=%s" % json.dumps(mcp.url),
+                "-c", "mcp_servers.timetrace.bearer_token_env_var=%s" % json.dumps(ENV_NAME)]
     cmd += list(cfg.get("extra_args") or [])
     cmd += [SAFETY_RULES + "\n" + prompt]
     return cmd
@@ -286,6 +293,8 @@ def _int_or_none(v: Any) -> Optional[int]:
 class CodexAdapter(ToolAdapter):
     name = CODEX
     adapter_version = "codex-cli/0.151"
+    # Execution runs in a worktree take the job's TimeTrace MCP access (`mcp=`).
+    supports_mcp = True
 
     def __init__(self, cfg: Dict[str, Any], billing=None):
         self.cfg = cfg
@@ -347,15 +356,17 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             return []
 
-    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
+    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+              mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md",
-                        add_dirs=self._writable_extras(cwd))
-        return self._run(cmd, cwd, log_file, cancel_event)
+                        add_dirs=self._writable_extras(cwd), mcp=mcp)
+        return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
 
-    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
+    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+               mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, resume=session_id,
-                        last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd))
-        res = self._run(cmd, cwd, log_file, cancel_event)
+                        last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd), mcp=mcp)
+        res = self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
         res.session_id = res.session_id or session_id
         return res
 
@@ -411,9 +422,10 @@ class CodexAdapter(ToolAdapter):
         res.session_id = res.session_id or session_id or None
         return res
 
-    def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None) -> RunResult:
+    def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None,
+             env: Optional[Dict[str, str]] = None) -> RunResult:
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX))
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env)
         res = parse_exec(lines)
         res.exit_code = code
         if code != 0 and not res.blocked:

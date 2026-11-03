@@ -191,3 +191,89 @@ class AdapterBlockedResetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpInjectionTest(unittest.TestCase):
+    """A dispatched execution run is given TimeTrace's MCP server by two config options that name the address and the
+    environment variable the token is read from; the token itself is in the one process's environment only."""
+
+    TOKEN = "ttm_SENTINEL_" + "Z9y8X7w6V5" * 4
+    URL = "https://apis.atlaspaces.com/timetrace/api/v1/mcp"
+    cfg = {"bin": "codex", "sandbox": "workspace-write", "model": None, "extra_args": []}
+
+    def access(self, token=None):
+        from timetrace.mcp_access import McpAccess
+        return McpAccess(self.URL, token or self.TOKEN, 4102444800.0)
+
+    def test_the_command_names_the_address_and_the_variable_and_holds_no_token(self):
+        for resume in (None, "tid"):
+            cmd = codex.build_cmd(self.cfg, "do it", "/wt", resume=resume, mcp=self.access())
+            overrides = config_overrides(cmd)
+            self.assertIn('mcp_servers.timetrace.url="%s"' % self.URL, overrides)
+            self.assertIn('mcp_servers.timetrace.bearer_token_env_var="TIMETRACE_MCP_TOKEN"', overrides)
+            self.assertFalse([part for part in cmd if "ttm_" in part or self.TOKEN in part])
+            self.assertTrue(cmd[-1].endswith("do it"))
+            # before the configured extra arguments and the prompt
+            self.assertLess(cmd.index('mcp_servers.timetrace.url="%s"' % self.URL), len(cmd) - 1)
+
+    def test_without_it_the_command_is_what_it_was(self):
+        for resume in (None, "tid"):
+            plain = codex.build_cmd(self.cfg, "do it", "/wt", resume=resume)
+            self.assertEqual(plain, codex.build_cmd(self.cfg, "do it", "/wt", resume=resume, mcp=None))
+            self.assertFalse([o for o in config_overrides(plain) if "mcp_servers" in o])
+
+    def test_the_other_kinds_of_run_are_untouched(self):
+        for cmd in (codex.build_chat_cmd(self.cfg, "x", "/wt"), codex.build_folder_cmd(self.cfg, "x", "/wt")):
+            self.assertFalse([o for o in config_overrides(cmd) if "mcp_servers" in o])
+
+    def fake_codex(self, d):
+        script = Path(d) / "codex"
+        script.write_text("#!%s\n" % __import__("sys").executable + '''
+import json, os, sys
+with open(os.environ["TT_FAKE_TRANSCRIPT"], "a") as fh:
+    fh.write(json.dumps({"argv": sys.argv[1:], "token_in_env": os.environ.get("TIMETRACE_MCP_TOKEN")}) + "\\n")
+print(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}))
+print(json.dumps({"type": "turn.completed"}))
+''')
+        script.chmod(0o755)
+        return str(script)
+
+    def run_adapter(self, resume, mcp):
+        import os, tempfile
+        from unittest.mock import patch
+        from timetrace.billing import StaticBilling
+        with tempfile.TemporaryDirectory() as d:
+            transcript = Path(d) / "t.jsonl"
+            adapter = codex.CodexAdapter({"bin": self.fake_codex(d), "sandbox": "workspace-write"}, billing=StaticBilling(True))
+            before = dict(os.environ)
+            with patch.dict(os.environ, {"TT_FAKE_TRANSCRIPT": str(transcript)}):
+                with patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
+                    run = adapter.resume if resume else adapter.start
+                    result = run("go", d, "tid", str(Path(d) / "run.log"), None, mcp=mcp)
+            records = [json.loads(line) for line in transcript.read_text().splitlines()]
+            log = (Path(d) / "run.log").read_text()
+            after = dict(os.environ)
+            before.pop("TT_FAKE_TRANSCRIPT", None); after.pop("TT_FAKE_TRANSCRIPT", None)
+            self.assertEqual(before, after, "the process's own environment changed")
+        return result, records, log
+
+    def test_a_run_has_the_token_only_in_its_environment(self):
+        for resume in (False, True):
+            result, records, log = self.run_adapter(resume, self.access())
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(records[0]["token_in_env"], self.TOKEN)
+            self.assertNotIn(self.TOKEN, json.dumps(records[0]["argv"]))
+            self.assertNotIn(self.TOKEN, log)
+            self.assertIn('mcp_servers.timetrace.bearer_token_env_var="TIMETRACE_MCP_TOKEN"', records[0]["argv"])
+            self.assertEqual(("resume" in records[0]["argv"]), resume)
+
+    def test_a_run_without_it_has_no_token(self):
+        result, records, log = self.run_adapter(False, None)
+        self.assertIsNone(records[0]["token_in_env"])
+        self.assertFalse([a for a in records[0]["argv"] if "mcp_servers" in a])
+
+    def test_a_continuation_gets_the_new_token(self):
+        _, first, _ = self.run_adapter(False, self.access())
+        _, second, _ = self.run_adapter(True, self.access("ttm_SENTINEL_" + "Q1w2E3r4T5" * 4))
+        self.assertNotEqual(first[0]["token_in_env"], second[0]["token_in_env"])
