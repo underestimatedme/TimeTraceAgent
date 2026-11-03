@@ -49,6 +49,20 @@ class WorktreeTest(unittest.TestCase):
         p2, _ = worktree.ensure(str(self.repo), 2, self.home)
         self.assertEqual(p1, p2)
 
+    def test_new_worktree_drops_inherited_config_but_reuse_rejects_new_keys(self):
+        git("config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        git("config", "--worktree", "codex.localEnvironmentConfigPath", "__none__", cwd=self.repo)
+        source = Path(self.tmp.name) / "registered-linked-checkout"
+        git("worktree", "add", "-b", "daily", str(source), cwd=self.repo)
+        before = (self._admin(source) / "config.worktree").read_bytes()
+        path, _ = worktree.ensure(str(source), 24, self.home)
+        worktree.verify_metadata(path, str(source))
+        self.assertEqual((self._admin(source) / "config.worktree").read_bytes(), before)
+        self.assertEqual(git("config", "--worktree", "remote.origin.pushurl", cwd=path), worktree.NO_PUSH_URL)
+        git("config", "--worktree", "codex.localEnvironmentConfigPath", "__none__", cwd=path)
+        with self.assertRaises(worktree.MetadataTampered):
+            worktree.ensure(str(source), 24, self.home)
+
     def test_ensure_can_start_from_another_task_branch(self):
         p1, b1 = worktree.ensure(str(self.repo), 1, self.home)
         (Path(p1) / "step1.txt").write_text("one\n")

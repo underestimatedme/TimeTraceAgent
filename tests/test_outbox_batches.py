@@ -8,7 +8,7 @@ from timetrace.cloud import CloudError
 from timetrace.db import Database
 
 
-class OutboxBatchTest(unittest.TestCase):
+class OutboxFixture:
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -28,6 +28,8 @@ class OutboxBatchTest(unittest.TestCase):
             self.db.queue_remote_event(job, attempt, 3, event)
         return events
 
+
+class OutboxBatchTest(OutboxFixture, unittest.TestCase):
     def test_same_attempt_is_one_ordered_batch_with_original_payloads(self):
         events = self.enqueue("job", "attempt")
         self.agent.flush_outbox()
@@ -49,12 +51,16 @@ class OutboxBatchTest(unittest.TestCase):
             if job == "b-job":
                 raise OSError("response lost after server commit")
         self.cloud.append_events = fail_second
-        with self.assertRaises(OSError): self.agent.flush_outbox()
+        self.agent.flush_outbox()  # a lost response no longer aborts the flush: the batch is kept with a stored retry time
         self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], second)
+        retry_at = self.db.remote_event_retry("b-job", "b1", 3)["retry_at"]
         self.db.close()
         self.db = Database(self.path)
         self.agent.db = self.db
         self.cloud.append_events = append
+        self.agent.flush_outbox()
+        self.assertEqual(len(self.sent), 2, "the stored waiting time survives the reopen: nothing is resent yet")
+        self.db.conn.execute("UPDATE remote_outbox_retry SET retry_at=?", (retry_at - 3600,))
         self.agent.flush_outbox()
         self.assertEqual(self.sent, [("a-job", "a1", 3, first), ("b-job", "b1", 3, second), ("b-job", "b1", 3, second)])
         self.assertEqual(self.db.pending_remote_events(), [])
@@ -71,3 +77,74 @@ class OutboxBatchTest(unittest.TestCase):
         self.db.conn.execute("CREATE TRIGGER reject_second_ack BEFORE UPDATE OF sent_at ON remote_outbox WHEN OLD.seq=2 BEGIN SELECT RAISE(ABORT, 'disk failure'); END")
         with self.assertRaises(sqlite3.IntegrityError): self.agent.flush_outbox()
         self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], events)
+
+
+
+class OutboxConflictIsolationTest(OutboxFixture, unittest.TestCase):
+    """A-01: one attempt Valley refuses forever must not block everything else."""
+
+    def conflict_on(self, dead_job):
+        sent = self.sent
+        def append(token, job, attempt, epoch, events):
+            if job == dead_job:
+                raise CloudError("resource state conflict", status=409, code=40900)
+            sent.append((job, attempt, epoch, events))
+        self.cloud.append_events = append
+
+    def test_conflicting_batch_does_not_block_later_batches(self):
+        dead = self.enqueue("dead-job", "dead-attempt")
+        live = self.enqueue("live-job", "live-attempt")
+        self.conflict_on("dead-job")
+        with self.assertRaises(CloudError) as caught:
+            self.agent.flush_outbox()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.sent, [("live-job", "live-attempt", 3, live)])
+        # The refused batch is kept durably, never discarded.
+        self.assertEqual([row["payload"] for row in self.db.pending_remote_events()], dead)
+
+    def test_a_failure_without_a_response_ends_the_round_without_raising(self):
+        self.enqueue("a-job", "a1")
+        self.enqueue("b-job", "b1")
+        def down(*args): raise OSError("network down")
+        calls = []
+        def down_once(*args):
+            calls.append(args[1])
+            raise OSError("network down")
+        self.cloud.append_events = down_once
+        self.agent.flush_outbox()  # no longer raises: the failed batch waits (stored), and this round ends at it
+        self.assertEqual(calls, ["a-job"], "the next batch would wait out the same timeout")
+        self.assertEqual(len(self.db.pending_remote_events()), 4)
+        self.assertEqual(self.db.remote_event_retry("a-job", "a1", 3)["status"], 0)
+
+    def test_refused_batch_is_not_resent_on_every_tick(self):
+        self.enqueue("dead-job", "dead-attempt")
+        calls = []
+        def conflict(token, job, attempt, epoch, events):
+            calls.append(job)
+            raise CloudError("resource state conflict", status=409, code=40900)
+        self.cloud.append_events = conflict
+        for _ in range(3):
+            try: self.agent.flush_outbox()
+            except CloudError: pass
+        self.assertEqual(calls, ["dead-job"])
+
+    def test_next_claim_still_claims_and_names_the_refused_attempt_once(self):
+        self.enqueue("dead-job", "dead-attempt")
+        self.conflict_on("dead-job")
+        logs = []
+        self.agent.log = logs.append
+        wanted = {"job": {"id": "next-job"}}
+        self.cloud.claim = lambda token: wanted
+        for _ in range(3):
+            self.assertIs(self.agent._next_claim(), wanted)
+        refused = [line for line in logs if "dead-attempt" in line]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("409", refused[0])
+
+    def test_loop_errors_are_logged_once_per_distinct_error(self):
+        logs = []
+        self.agent.log = logs.append
+        for _ in range(3):
+            self.agent._note_loop_error(CloudError("resource state conflict", status=409))
+        self.agent._note_loop_error(OSError("network down"))
+        self.assertEqual(len(logs), 2)

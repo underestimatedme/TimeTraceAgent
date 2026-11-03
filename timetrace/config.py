@@ -1,5 +1,8 @@
 """Configuration: spec §9 defaults deep-merged with ~/.timetrace/config.json."""
 import copy
+import fcntl
+from contextlib import contextmanager
+from functools import wraps
 import json
 import os
 import re
@@ -198,6 +201,27 @@ def load_user(home_dir: Path) -> Dict[str, Any]:
     return doc
 
 
+@contextmanager
+def locked(home_dir):
+    """Serialize CLI updates and remote read/validate/write transactions."""
+    Path(home_dir).mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(Path(home_dir) / "config.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def config_locked(fn):
+    @wraps(fn)
+    def wrapped(home_dir, *args, **kwargs):
+        with locked(home_dir):
+            return fn(home_dir, *args, **kwargs)
+    return wrapped
+
+
 def _write_user(home_dir: Path, doc: Dict[str, Any]) -> None:
     """Atomic write of config.json with mode 0600."""
     path = Path(home_dir) / "config.json"
@@ -221,6 +245,7 @@ def explicit_tool_bin(home_dir: Path, tool: str) -> str:
     return value if isinstance(value, str) and value and value != tool else ""
 
 
+@config_locked
 def store_tool_bin(home_dir: Path, tool: str, path: str) -> None:
     """Record a discovered absolute tool path, marked as found automatically."""
     doc = load_user(home_dir)
@@ -233,6 +258,7 @@ def store_tool_bin(home_dir: Path, tool: str, path: str) -> None:
     _write_user(home_dir, doc)
 
 
+@config_locked
 def set_value(home_dir: Path, key: str, raw: str) -> Any:
     """Validate and write one key into config.json (atomic, 0600)."""
     value = parse_value(key, raw)

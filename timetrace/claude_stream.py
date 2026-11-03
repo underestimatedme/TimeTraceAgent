@@ -43,6 +43,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
+from timetrace.redact import mask_structure, mask_timetrace_tokens
 from timetrace.process import MAX_CAPTURED_LINES, MAX_LOG_BYTES, _kill_group, _shell_quote, child_env
 
 INIT_REQUEST_ID = "timetrace-init"
@@ -149,14 +150,18 @@ class StreamSession:
 
     def _read_stdout(self, stream, log) -> None:
         for line in iter(stream.readline, ""):
+            # A run's token is in its environment, so what it prints is masked: the log, the lines kept and what the host is shown.
+            # The line itself is read as it came (masking text inside raw JSON can break the JSON, or change a command that is
+            # then echoed back to Claude as approved).
             raw = line.rstrip("\n")
-            self._log(log, line)
             msg = None
             if raw.startswith("{"):
                 try:
                     msg = json.loads(raw)
                 except ValueError:
                     msg = None
+            shown = json.dumps(mask_structure(msg), ensure_ascii=False) if isinstance(msg, dict) else mask_timetrace_tokens(raw)
+            self._log(log, shown + "\n")
             kind = msg.get("type") if isinstance(msg, dict) else None
             if kind == "control_request":
                 self._on_control_request(msg)
@@ -168,7 +173,7 @@ class StreamSession:
                 continue
             if kind in ("control_response", "keep_alive"):
                 continue
-            self.lines.append(raw)
+            self.lines.append(shown)
             if len(self.lines) > MAX_CAPTURED_LINES:
                 del self.lines[:len(self.lines) - MAX_CAPTURED_LINES]
             with self._lock:
@@ -184,7 +189,7 @@ class StreamSession:
 
     def _read_stderr(self, stream, log) -> None:
         for line in iter(stream.readline, ""):
-            self._log(log, "[stderr] " + line)
+            self._log(log, "[stderr] " + mask_timetrace_tokens(line))
 
     def _on_control_request(self, msg: Dict[str, Any]) -> None:
         request_id = str(msg.get("request_id") or "")
@@ -211,7 +216,7 @@ class StreamSession:
                 decision = {"behavior": "deny", "message": NO_HOST_DENY}
             else:
                 try:
-                    decision = self.host.permission(request, cancelled) or {}
+                    decision = self.host.permission(mask_structure(request), cancelled) or {}   # (shown masked; answered with the original)
                 except Exception:
                     decision = {"behavior": "deny", "message": NO_HOST_DENY}
         finally:
