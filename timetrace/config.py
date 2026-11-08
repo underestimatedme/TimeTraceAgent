@@ -59,6 +59,10 @@ DEFAULTS: Dict[str, Any] = {
     "codex": {
         "bin": "codex",
         "sandbox": "workspace-write",
+        # Domains a task run's commands may reach ("api.example.com", "*.example.com"). Empty: no network. Every
+        # other domain is refused, and there is no per-command approval on a Codex run: whatever a listed domain
+        # accepts with credentials this Mac holds, any Codex task here can do. Folder and chat runs never get it.
+        "network_domains": [],
         "model": None,
         "extra_args": [],
         # Where Codex keeps its login; None = ~/.codex/auth.json.

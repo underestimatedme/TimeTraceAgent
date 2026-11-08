@@ -4,6 +4,12 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.1：Codex 任务可按域名联网
+
+新增 `codex.network_domains`，让 Codex 任务能访问指定域名，例如发布到 App Store 时的 `*.apple.com`。默认仍然断网，不设置就没有任何变化，也不需要升级服务端。Codex 没有逐条命令审批，清单不为空时，这台电脑上的所有 Codex 任务都能访问这些域名，所以不发布时请留空。详见 [0.6.1 发布说明](docs/releases/0.6.1.md)。
+
+升级：`brew update && brew upgrade timetraceagent`，然后执行 `timetrace agent install` 和 `timetrace agent doctor`。
+
 ## 0.6.0：MCP 接入与正式 Runner 修复
 
 包含已安装正式版本的心跳恢复、成果上传隔离、手动放弃成果的持久审计，以及 Claude Code / Codex 派活中的 MCP 接入。任务访问随 attempt 和 lease 失效；临时配置使用 0600 权限并在运行结束后清理。MCP 令牌不放进命令参数，运行日志与上传成果会脱敏；持有 MCP 访问的 Codex 任务关闭 shell snapshot，避免环境令牌被持久化。
@@ -24,7 +30,7 @@ timetrace agent install
 timetrace agent doctor
 ```
 
-首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.0"`；不要混用两套后台服务。
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.1"`；不要混用两套后台服务。
 
 长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
 
@@ -143,7 +149,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.0"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.1"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
@@ -275,7 +281,7 @@ timetrace agent install
                                "Bash(git diff:*)", "Bash(git log:*)"],
              "setting_sources": "user",
              "model": null, "extra_args": []},
-  "codex":  {"bin": "codex",  "sandbox": "workspace-write", "model": null, "extra_args": []}
+  "codex":  {"bin": "codex",  "sandbox": "workspace-write", "network_domains": [], "model": null, "extra_args": []}
 }
 ```
 
@@ -307,6 +313,7 @@ timetrace config set interval_sec 60
 - `allowed_repos` 非空时，`timetrace add --repo` 必须落在其中某个目录之下。
 - `permission_mode` 决定 Claude 无头运行时能做什么。`acceptEdits` 允许改文件，命令只放行 `allowed_tools` 里的（缺省是本地 git 提交相关的几条）；要让它跑构建和测试，往 `allowed_tools` 加规则（如 `"Bash(npm test:*)"`）或把模式改成 `bypassPermissions`。这是你的决定，工具不替你做。
 - Codex 的 `sandbox` 对应 `codex exec -s`（续接时以 `-c sandbox_mode=…` 传入，续接不会退回到 `~/.codex/config.toml` 里更宽的模式）；`workspace-write` 只允许写 worktree 和提交所需的 git 元数据，且关闭网络。
+- Codex 的 `network_domains`（默认 `[]`，即断网）列出任务命令可访问的域名，例如 `["*.apple.com"]`，其他域名一律被拦；写法不合规（`*`、`*.com`、地址、URL）时整张清单作废，继续断网。文件夹任务和对话不受影响，始终断网。Codex 没有逐条命令审批：清单里的域名，这台电脑上任何 Codex 任务都能访问，**不要列 Git 服务器**，详见 `docs/SECURITY_REVIEW.md`。
 
 ## 自托管
 
