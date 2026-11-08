@@ -107,3 +107,17 @@ class TailTextTest(unittest.TestCase):
             tail = tail_text(p, limit=100)
             self.assertLessEqual(len(tail.encode("utf-8")), 100)
 
+
+
+class LastLogLineTest(unittest.TestCase):
+    def test_last_log_line(self):
+        from timetrace.process import last_log_line
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        self.assertEqual(last_log_line(d / "missing.log"), "")
+        only_exit = d / "exit.log"
+        only_exit.write_text("--- exit 1 ---\n")
+        self.assertEqual(last_log_line(only_exit), "")
+        long = d / "long.log"
+        long.write_text("x" * 300 + "\n\n--- exit -9 ---\n  \n")
+        self.assertEqual(len(last_log_line(long)), 200)

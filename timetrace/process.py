@@ -117,6 +117,19 @@ def _shell_quote(value: str) -> str:
     return value
 
 
+_EXIT_MARKER = re.compile(r"^--- exit -?\d+ ---$")
+
+
+def last_log_line(path, limit: int = 200) -> str:
+    """The log's last non-blank line that is not our own `--- exit N ---`
+    marker, stripped and cut to `limit` characters; "" when there is none."""
+    for line in reversed(tail_text(path).splitlines()):
+        line = line.strip()
+        if line and not _EXIT_MARKER.match(line):
+            return line[:limit]
+    return ""
+
+
 def tail_text(path, limit: int = 8000) -> str:
     """Last `limit` bytes of a log as text; invalid UTF-8 is replaced, and a
     partial first line is dropped so the tail starts at a line boundary.
