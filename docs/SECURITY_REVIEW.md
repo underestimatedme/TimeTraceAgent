@@ -723,6 +723,29 @@ override a deny.
 (`StreamCmdTest`, `StreamAdapterTest`), `tests/test_cli.py`,
 `tests/test_cloud.py`.
 
+## Addendum 2026-11-09: `codex.network_domains`
+
+Network off stays the default for Codex. A task run can be given named domains (`codex.network_domains`, local config
+only), so a release run can reach `*.apple.com` without opening everything.
+
+- *How.* A Codex permission profile (`default_permissions`, `permissions.<name>.network.domains`) with
+  `features.network_proxy` replaces the workspace-write settings: the same writes (worktree, temp, narrow git paths)
+  and the network only through Codex's proxy. `network_proxy` is marked experimental in Codex 0.165.0.
+- *Fail closed.* `*`, `*.com`, an address, a URL, or any entry that cannot be read leaves the whole list unused and the
+  network off. Only `workspace-write` task runs qualify; folder and chat runs are unchanged.
+- *What still holds.* A plain `git push` to a host that is not listed fails at the proxy, SSH included; the worktree
+  pushurl stays. Do not list a Git host.
+- *Residual risk.* A Codex run has no per-command approval (`codex exec` runs with policy "never"). Every Codex task on
+  this Mac can read what the user can read and call a listed domain, so with `*.apple.com` listed and an App Store Connect
+  key on disk it can submit a release without asking. A human gate has to come from the task or the pipeline, not from
+  this setting. Listed domains are also a way out for anything the run can read.
+- *The rules still apply.* SAFETY_RULES 3 keeps a run to its working directory: in a real run the model refused a script
+  outside the worktree and ran the same script once it was in the repository. Release tooling belongs in the repository.
+- *Verified on Codex 0.165.0.* With `codex sandbox`, outside any temp directory: a commit in a linked worktree succeeds;
+  `.git/config`, `.git/hooks` and the worktree's `.git` file are not writable; `*.apple.com` answers; `github.com` (HTTPS
+  and SSH) and `example.com` are refused. With real `codex exec` runs, start and resume: the same network results, the
+  commit, and a read-only App Store Connect query by a script in the repository, with no key in the run's log.
+
 ## Verification
 
 - Conversation import: `tests/test_import_parse.py`.

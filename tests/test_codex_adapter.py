@@ -118,6 +118,69 @@ def config_overrides(cmd):
     return [cmd[i + 1] for i, part in enumerate(cmd) if part == "-c"]
 
 
+class NetworkDomainsTest(unittest.TestCase):
+    """`codex.network_domains`: the only way a task run's commands reach the network, and only those domains."""
+    allowed = dict(BuildCmdTest.cfg, network_domains=["api.appstoreconnect.apple.com", "*.apple.com"])
+
+    def test_no_domains_is_the_sandbox_as_it_was(self):
+        for cfg in (BuildCmdTest.cfg, dict(BuildCmdTest.cfg, network_domains=[])):
+            cmd = codex.build_cmd(cfg, "go", "/wt")
+            self.assertIn("-s", cmd)
+            self.assertIn("sandbox_workspace_write.network_access=false", config_overrides(cmd))
+            self.assertFalse([o for o in config_overrides(cmd) if "default_permissions" in o or "network_proxy" in o])
+
+    def test_defaults_leave_the_network_off(self):
+        from timetrace import config
+        self.assertEqual(config.DEFAULTS["codex"]["network_domains"], [])
+
+    def test_domains_run_under_a_profile_that_allows_only_them(self):
+        overrides = config_overrides(codex.build_cmd(self.allowed, "go", "/wt"))
+        self.assertIn("features.network_proxy=true", overrides)
+        self.assertIn('default_permissions="timetrace_task"', overrides)
+        self.assertIn("permissions.timetrace_task.network.enabled=true", overrides)
+        self.assertIn('permissions.timetrace_task.network.domains={"api.appstoreconnect.apple.com"="allow","*.apple.com"="allow"}', overrides)
+
+    def test_a_profile_replaces_the_legacy_sandbox_settings_rather_than_mixing_with_them(self):
+        cmd = codex.build_cmd(self.allowed, "go", "/wt")
+        self.assertNotIn("-s", cmd)
+        self.assertEqual(cmd[cmd.index("-C") + 1], "/wt")
+        self.assertFalse([o for o in config_overrides(cmd) if o.startswith(("sandbox_mode", "sandbox_workspace_write"))])
+
+    def test_the_profile_writes_only_the_worktree_temp_and_the_narrow_git_paths(self):
+        overrides = config_overrides(codex.build_cmd(self.allowed, "go", "/wt", add_dirs=["/repo/.git/objects", '/q"x']))
+        self.assertIn('permissions.timetrace_task.filesystem={":root"="read",":project_roots"={"."="write"},":tmpdir"="write",":slash_tmp"="write","/repo/.git/objects"="write","/q\\"x"="write"}', overrides)
+
+    def test_a_resumed_run_keeps_the_profile(self):
+        cmd = codex.build_cmd(self.allowed, "go on", "/wt", resume="tid")
+        self.assertEqual(cmd[:4], ["codex", "exec", "resume", "tid"])
+        self.assertNotIn("-s", cmd)
+        self.assertNotIn("-C", cmd)
+        self.assertIn('default_permissions="timetrace_task"', config_overrides(cmd))
+
+    def test_domains_are_lowercased_and_deduplicated(self):
+        cfg = dict(BuildCmdTest.cfg, network_domains=["Foo.Example.com", "foo.example.com"])
+        self.assertIn('permissions.timetrace_task.network.domains={"foo.example.com"="allow"}', config_overrides(codex.build_cmd(cfg, "go", "/wt")))
+
+    def test_one_bad_entry_leaves_the_network_off(self):
+        # A list that cannot be read as written must not half apply, and `*` or a URL is not a narrow allowance.
+        for bad in (["*"], ["*.com"], ["github.com/x"], ["https://apple.com"], [""], ['a"b.com'], ["localhost"], ["ok.apple.com", "*"], [1], "apple.com", {"apple.com": True}):
+            with self.subTest(bad=bad):
+                cmd = codex.build_cmd(dict(BuildCmdTest.cfg, network_domains=bad), "go", "/wt")
+                self.assertIn("sandbox_workspace_write.network_access=false", config_overrides(cmd))
+                self.assertFalse([o for o in config_overrides(cmd) if "network_proxy" in o])
+
+    def test_only_a_workspace_write_run_can_have_the_network(self):
+        cmd = codex.build_cmd(dict(self.allowed, sandbox="read-only"), "go", "/wt")
+        self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
+        self.assertIn("sandbox_workspace_write.network_access=false", config_overrides(cmd))
+        self.assertFalse([o for o in config_overrides(cmd) if "network_proxy" in o])
+
+    def test_folder_and_chat_runs_never_have_the_network(self):
+        for cmd in (codex.build_folder_cmd(self.allowed, "go", "/out"), codex.build_chat_cmd(self.allowed, "hi", "/repo")):
+            self.assertFalse([o for o in config_overrides(cmd) if "network_proxy" in o or "default_permissions" in o])
+        self.assertIn("sandbox_workspace_write.network_access=false", config_overrides(codex.build_folder_cmd(self.allowed, "go", "/out")))
+
+
 class WorktreeWritableRootTest(unittest.TestCase):
     def test_build_cmd_passes_extra_writable_dirs_as_config_for_start_and_resume(self):
         # `codex exec resume` rejects --add-dir; the config override works for both.

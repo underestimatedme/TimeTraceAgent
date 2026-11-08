@@ -11,13 +11,14 @@ Facts this relies on (verified 2026-09-02 on Codex CLI 0.151.0):
 - `codex exec resume <thread_id> --json <prompt>` continues a thread.
 """
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import os
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from timetrace import __version__
 from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
@@ -169,27 +170,75 @@ def parse_reset_credits(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # ---- exec -----------------------------------------------------------------------
+TASK_PROFILE = "timetrace_task"
+# A host, or `*.` and a host: at least two labels and a name for the last one, so `*`, `*.com`, an address or a URL
+# cannot be written as an allowance.
+_DOMAIN = re.compile(r"^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def network_domains(cfg: Dict[str, Any]) -> List[str]:
+    """The domains a task run's commands may reach (`codex.network_domains`), lowercased, each once. Empty - the network
+    stays off - unless the run is workspace-write and every entry is a narrow domain: a list that cannot be read as
+    written must not half apply."""
+    value = cfg.get("network_domains")
+    if str(cfg.get("sandbox", "workspace-write")) != "workspace-write" or not isinstance(value, list):
+        return []
+    domains: List[str] = []
+    for entry in value:
+        domain = entry.lower() if isinstance(entry, str) else ""
+        if not _DOMAIN.match(domain):
+            return []
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def _toml_table(entries: List[Tuple[str, str]]) -> str:
+    return "{%s}" % ",".join("%s=%s" % (json.dumps(key), value) for key, value in entries)
+
+
+def _network_profile(domains: List[str], add_dirs: Optional[List[str]]) -> List[str]:
+    """A permission profile in place of the workspace-write settings (Codex takes one or the other): the same writes -
+    the worktree, temp, and the narrow git paths; Codex keeps `.git` read-only in a project root - and the network only
+    through Codex's proxy, which refuses every other domain, so `git push` to a host not listed still fails."""
+    writes = [(":root", '"read"'), (":project_roots", '{"."="write"}'), (":tmpdir", '"write"'), (":slash_tmp", '"write"')]
+    writes += [(path, '"write"') for path in add_dirs or []]
+    allow = [(domain, '"allow"') for domain in domains]
+    overrides = ["features.network_proxy=true",
+                 "default_permissions=%s" % json.dumps(TASK_PROFILE),
+                 "permissions.%s.filesystem=%s" % (TASK_PROFILE, _toml_table(writes)),
+                 "permissions.%s.network.enabled=true" % TASK_PROFILE,
+                 "permissions.%s.network.domains=%s" % (TASK_PROFILE, _toml_table(allow))]
+    return [part for override in overrides for part in ("-c", override)]
+
+
 def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] = None,
               last_msg_file: Optional[str] = None, add_dirs: Optional[List[str]] = None,
               mcp: Optional[McpAccess] = None) -> List[str]:
     sandbox = str(cfg.get("sandbox", "workspace-write"))
+    domains = network_domains(cfg)
     cmd = [cfg.get("bin", "codex"), "exec"]
     if resume:
         cmd += ["resume", resume]
     cmd += ["--json", "--skip-git-repo-check"]
-    if not resume:
-        cmd += ["-s", sandbox, "-C", cwd]
-    # `codex exec resume` has no -s: pin the sandbox through config so a
-    # resumed run cannot fall back to a laxer mode from ~/.codex/config.toml.
-    cmd += ["-c", "sandbox_mode=%s" % json.dumps(sandbox)]
-    # Model-run commands never need the network (the model API is called by
-    # codex itself, outside the sandbox); this also makes `git push` fail.
-    cmd += ["-c", "sandbox_workspace_write.network_access=false"]
-    # Directories the workspace-write sandbox may also write: the parts of the
-    # main repo's .git that `git commit` in a linked worktree needs. Passed as
-    # config because `codex exec resume` rejects --add-dir.
-    if add_dirs:
-        cmd += ["-c", "sandbox_workspace_write.writable_roots=%s" % json.dumps(list(add_dirs))]
+    if domains:
+        if not resume:
+            cmd += ["-C", cwd]
+        cmd += _network_profile(domains, add_dirs)
+    else:
+        if not resume:
+            cmd += ["-s", sandbox, "-C", cwd]
+        # `codex exec resume` has no -s: pin the sandbox through config so a
+        # resumed run cannot fall back to a laxer mode from ~/.codex/config.toml.
+        cmd += ["-c", "sandbox_mode=%s" % json.dumps(sandbox)]
+        # Without `network_domains` model-run commands have no network (the model API is called
+        # by codex itself, outside the sandbox); this also makes `git push` fail.
+        cmd += ["-c", "sandbox_workspace_write.network_access=false"]
+        # Directories the workspace-write sandbox may also write: the parts of the
+        # main repo's .git that `git commit` in a linked worktree needs. Passed as
+        # config because `codex exec resume` rejects --add-dir.
+        if add_dirs:
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=%s" % json.dumps(list(add_dirs))]
     if cfg.get("model"):
         cmd += ["-m", cfg["model"]]
     if last_msg_file:
