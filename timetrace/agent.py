@@ -21,7 +21,7 @@ from timetrace import (approvals, audit, checks, dev_status, folder, pause, quot
                        worktree)
 from timetrace.remote_control import RunControl
 from timetrace.mcp_access import parse_claim, skip_note, still_usable
-from timetrace.process import tail_text
+from timetrace.process import last_log_line, tail_text
 from timetrace.redact import redact
 from timetrace.review_evidence import source_run_evidence
 from timetrace.checkpoints import Checkpoint, checkpoint_problem
@@ -1331,7 +1331,7 @@ class Agent:
         else:
             self.db.delete_checkpoint(plan_key)
             outcome = "failed"
-            event = {"seq": 2, "type": outcome, "message": redact(result.error or "exit %s" % result.exit_code)[:1000],
+            event = {"seq": 2, "type": outcome, "message": redact(result.error or self._exit_message(result, log_file))[:1000],
                      "output_tail": tail_text(log_file)}
         event["observed_at"] = observed_end
         self._report(claim, [event])
@@ -1411,12 +1411,17 @@ class Agent:
         return self._run_leased(claim, adapter, None, lambda cancel: chat(job["prompt"], cwd, session, log_file, cancel),
                                 deadline, finish)
 
-    @staticmethod
-    def _ai_unfinished(result, log_file):
+    def _exit_message(self, result, log_file):
+        """`exit N`, plus the log's last line when run logs may leave this
+        computer (the same switch as output_tail); Valley translates both."""
+        line = last_log_line(log_file) if self.upload_output_tail else ""
+        return "exit %s: %s" % (result.exit_code, line) if line else "exit %s" % result.exit_code
+
+    def _ai_unfinished(self, result, log_file):
         if result.blocked:
             return "waiting_quota", {"seq": 2, "type": "waiting_quota",
                                      "message": redact(result.error or "quota blocked")[:1000]}
-        return "failed", {"seq": 2, "type": "failed", "message": redact(result.error or "exit %s" % result.exit_code)[:1000],
+        return "failed", {"seq": 2, "type": "failed", "message": redact(result.error or self._exit_message(result, log_file))[:1000],
                           "output_tail": tail_text(log_file)}
 
     def _run_leased(self, claim, adapter, gate, work, deadline, finish, crash="adapter crashed"):

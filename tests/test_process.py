@@ -107,3 +107,42 @@ class TailTextTest(unittest.TestCase):
             tail = tail_text(p, limit=100)
             self.assertLessEqual(len(tail.encode("utf-8")), 100)
 
+
+
+class LastLogLineTest(unittest.TestCase):
+    def test_last_log_line(self):
+        from timetrace.process import last_log_line
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        self.assertEqual(last_log_line(d / "missing.log"), "")
+        only_exit = d / "exit.log"
+        only_exit.write_text("--- exit 1 ---\n")
+        self.assertEqual(last_log_line(only_exit), "")
+        long = d / "long.log"
+        long.write_text("x" * 300 + "\n\n--- exit -9 ---\n  \n")
+        self.assertEqual(len(last_log_line(long)), 200)
+
+    def test_last_log_line_redacts_before_cutting(self):
+        from timetrace.process import last_log_line
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        log = d / "secret.log"
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        log.write_text("x" * 177 + " token " + token + "\n--- exit 1 ---\n")
+        line = last_log_line(log)
+        self.assertNotIn("A1b2C3d4E5", line)
+        self.assertLessEqual(len(line), 200)
+
+    def test_last_log_line_ignores_the_command_echo(self):
+        from timetrace.process import last_log_line
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        silent = d / "silent.log"
+        silent.write_text("$ codex exec 'build the settings page'\n--- exit -9 ---\n")
+        self.assertEqual(last_log_line(silent), "")
+        earlier = d / "earlier.log"
+        earlier.write_text("old run output\n--- exit 1 ---\n$ codex exec 'retry'\n--- exit 2 ---\n")
+        self.assertEqual(last_log_line(earlier), "")
+        stderr = d / "stderr.log"
+        stderr.write_text("$ codex exec 'x'\n[stderr] permission denied: ./build.sh\n--- exit 2 ---\n")
+        self.assertEqual(last_log_line(stderr), "permission denied: ./build.sh")

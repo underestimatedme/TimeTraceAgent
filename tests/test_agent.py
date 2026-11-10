@@ -629,6 +629,28 @@ class OutputTailTest(unittest.TestCase):
         agent.run_once()
         return cloud, db
 
+    def _exit_run(self, log, **agent_kwargs):
+        class Exits(Adapter):
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+                Path(log_file).write_text(log)
+                return RunResult(exit_code=2, ok=False, error="", session_id="s")
+
+        cloud, _ = self.run_with(Exits(), **agent_kwargs)
+        return [e for e in cloud.events if e["type"] == "failed"][0]
+
+    def test_exit_without_error_names_the_last_log_line(self):
+        failed = self._exit_run("step one\npermission denied: ./build.sh\n--- exit 2 ---\n")
+        self.assertEqual(failed["message"], "exit 2: permission denied: ./build.sh")
+
+    def test_exit_hint_respects_output_tail_switch(self):
+        failed = self._exit_run("step one\npermission denied: ./build.sh\n--- exit 2 ---\n", upload_output_tail=False)
+        self.assertEqual(failed["message"], "exit 2")
+
+    def test_exit_hint_is_redacted(self):
+        failed = self._exit_run("token Bearer abcdefghijklmnop0123456789\n--- exit 2 ---\n")
+        self.assertTrue(failed["message"].startswith("exit 2: "))
+        self.assertNotIn("abcdefghijklmnop0123456789", failed["message"])
+
     def test_secrets_are_redacted_before_they_are_queued_or_uploaded(self):
         secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 

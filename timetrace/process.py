@@ -8,7 +8,7 @@ import time
 from typing import IO, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
-from timetrace.redact import mask_timetrace_tokens
+from timetrace.redact import mask_timetrace_tokens, redact
 
 MAX_CAPTURED_LINES = 10_000
 MAX_LOG_BYTES = 10 * 1024 * 1024
@@ -115,6 +115,27 @@ def _shell_quote(value: str) -> str:
     if not value or any(ch in value for ch in " \t\n\"'$`\\"):
         return "'" + value.replace("'", "'\\''") + "'"
     return value
+
+
+_EXIT_MARKER = re.compile(r"^--- exit -?\d+ ---$")
+
+
+def last_log_line(path, limit: int = 200) -> str:
+    """The latest run's last line of output: after the last `$ cmd` echo,
+    not our own `--- exit N ---` marker, without the `[stderr] ` prefix,
+    redacted and then cut to `limit` characters; "" when the run printed
+    nothing."""
+    lines = tail_text(path).splitlines()
+    echoes = [i for i, line in enumerate(lines) if line.startswith("$ ")]
+    if echoes:
+        lines = lines[echoes[-1] + 1:]
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith("[stderr] "):
+            line = line[len("[stderr] "):].strip()
+        if line and not _EXIT_MARKER.match(line):
+            return redact(line)[:limit]
+    return ""
 
 
 def tail_text(path, limit: int = 8000) -> str:
