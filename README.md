@@ -60,6 +60,8 @@ AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里�
 
 ## 快速开始
 
+首次使用请看 [安装、绑定与第一个任务](docs/getting-started.md)。
+
 ```sh
 brew install underestimatedme/timetrace/timetraceagent
 tta setup                          # 检查工具 → 登记仓库 → 扫码绑定手机 → 安装后台 Runner
@@ -77,7 +79,7 @@ timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
 
-`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=1`：只有授权码和展示用的电脑名，没有任何凭据，手机上仍需登录账号并点「确认绑定」才会生效。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
+`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=2`：包含本次配对码与电脑展示信息，不包含长期凭据。手机核对电脑后显示 4 位数字，需在电脑输入并完成服务端确认才会生效。配对码也应保密。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
 
 二维码用半块字符绘制（两行模块占一行文字，约 49×25 字符，80 列终端放得下），四周留 4 个模块的静区。彩色终端里强制白底黑码，与终端主题无关；设置了 `NO_COLOR`、`TERM=dumb` 或输出不是终端时改为不带颜色的反相字符（适合深色背景的终端）。上方框内的「2 分钟内有效（剩余 1:45）」每秒原地刷新，不会重印二维码；过期后自动换新码，最多 5 轮。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
 
