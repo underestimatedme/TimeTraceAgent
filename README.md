@@ -4,6 +4,10 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.3：执行中续租偶尔失败不再结束 AI 进程
+
+AI 进程运行时，续租请求或登录/计费检查偶尔失败一次（网络抖动、`claude auth status` 超时等），以前会立刻结束进程、删除断点，一步执行到一半就作废。0.6.3 起，只要当前租约还剩 15 秒以上就继续运行并重试；真正到期、被取消或电脑端停止时才结束。每次暂缓和结束都会把原因写进 `daemon.log`。不需要升级服务端。详见 [0.6.3 发布说明](docs/releases/0.6.3.md)。
+
 ## 0.6.2：中断后没留断点的步骤可以重试
 
 一步执行到一半被中断、又没留下断点时，电脑端为避免重复执行会拒绝重新开始。0.6.2 起这类拒绝报为“失败”（以前是“等待输入”，网页上没有任何处理入口），你在网页上确认旧进程已停止并重试后，电脑端会从头执行这一步。需要配合同期发布的服务端。详见 [0.6.2 发布说明](docs/releases/0.6.2.md)。
@@ -34,7 +38,7 @@ timetrace agent install
 timetrace agent doctor
 ```
 
-首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"`；不要混用两套后台服务。
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.3"`；不要混用两套后台服务。
 
 长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
 
@@ -155,7 +159,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.3"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent

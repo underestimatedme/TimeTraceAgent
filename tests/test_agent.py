@@ -1410,3 +1410,83 @@ class RecoveryFenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MidRunRenewalTest(unittest.TestCase):
+    """A running AI process is stopped only when its lease is really ending,
+    a cancel arrives, or the runner stops; one failed check is retried."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = Path(self.tmp.name)
+        repo = home / "repo"; init_repo(repo)
+        self.db = Database(home / "timetrace.db")
+        self.db.upsert_workspace("ws1", "repo", str(repo), "main")
+        self.cloud = FakeCloud()
+        self.renewals = 0
+        self.logs = []
+        self.cancelled = []
+        self.started = threading.Event()
+        test = self
+
+        class Running(Adapter):
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+                test.started.set()
+                # Runs long enough for several renewals unless cancelled.
+                if cancel_event is not None and cancel_event.wait(.3):
+                    test.cancelled.append(True)
+                    return RunResult(exit_code=-9, error="killed")
+                return RunResult(exit_code=0, ok=True, output="finished", session_id=session_id)
+
+        self.adapter = Running()
+        self.agent = Agent(self.db, self.cloud, {"codex": self.adapter}, home, lambda: "token",
+                           prepare_workspace=lambda repo, task_id, home, base: (repo, "branch"),
+                           heartbeat_interval=.02, log=self.logs.append)
+
+    def renew_failing(self, failures):
+        """The first renewal (before the spawn) succeeds; then `failures(n)`
+        decides whether the n-th in-run renewal fails."""
+        ok = self.cloud.renew
+        def renew(*args):
+            self.renewals += 1
+            if self.renewals > 1 and failures(self.renewals - 1):
+                raise OSError("network blip")
+            return ok(*args)
+        self.cloud.renew = renew
+
+    def test_one_failed_renewal_does_not_stop_the_run(self):
+        self.renew_failing(lambda n: n == 1)
+        self.assertEqual(self.agent.run_once(), "job j1 → awaiting_review")
+        self.assertEqual(self.cancelled, [])
+        self.assertTrue(any("renewal held" in line and "lease renewal failed" in line for line in self.logs), self.logs)
+        self.assertTrue(any("OSError: network blip" in line for line in self.logs), self.logs)
+
+    def test_one_closed_billing_check_does_not_stop_the_run(self):
+        failed = []
+        original = self.agent._zero_spend
+        def flaky(adapter, job):
+            if self.started.is_set() and not failed:
+                failed.append(1)  # e.g. `claude auth status` timed out once
+                return False
+            return original(adapter, job)
+        self.agent._zero_spend = flaky
+        self.assertEqual(self.agent.run_once(), "job j1 → awaiting_review")
+        self.assertEqual(self.cancelled, [])
+
+    def test_renewals_failing_until_the_lease_ends_still_stop_and_say_why(self):
+        self.renew_failing(lambda n: True)
+        with patch("timetrace.agent.RENEW_HOLD_MARGIN_SECONDS", 90.0):
+            outcome = self.agent.run_once()
+        self.assertIn("fenced (lease renewal failed)", outcome)
+        self.assertEqual(self.cancelled, [True])
+        self.assertTrue(any("stopping the run: lease renewal failed" in line for line in self.logs), self.logs)
+
+    def test_cancel_still_stops_at_once(self):
+        ok = self.cloud.renew
+        def renew(*args):
+            self.renewals += 1
+            return {"desired_action": "cancel"} if self.renewals > 1 else ok(*args)
+        self.cloud.renew = renew
+        self.assertIn("cancel", self.agent.run_once())
+        self.assertEqual(self.cancelled, [True])

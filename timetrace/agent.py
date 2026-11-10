@@ -47,6 +47,9 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 FOLDER_HEAD = "folder"
 # The block reason of a job the daemon stopped (SIGTERM / SIGINT / stop()).
 STOPPED = "runner_stopped"
+# While an AI process runs, a failed renewal or gate check is retried as long
+# as the current lease has more than this left; only then is the run stopped.
+RENEW_HOLD_MARGIN_SECONDS = 15.0
 # How long shutdown waits for workers after cancelling them. launchd sends
 # SIGKILL ExitTimeOut (20 s) after SIGTERM; a killed tool group takes ≤ 2 s.
 SHUTDOWN_GRACE_SECONDS = 15
@@ -471,6 +474,8 @@ class Agent:
             runner_state.record(self.home, reset_credits=entries)
 
     def _note_cloud_error(self, exc: Exception, where: str) -> None:
+        if where == "renew":
+            self.log("renew failed: %s: %s" % (type(exc).__name__, str(exc)[:200]))
         if isinstance(exc, CloudError) and exc.code == VERSION_REJECTED_CODE:
             audit.record(self.home, "version_rejected", where=where, message=str(exc)[:200])
 
@@ -843,6 +848,24 @@ class Agent:
                 self._controls.pop(claim["attempt_id"], None)
             self._untrack(cancel_event)
 
+    def _renew_running(self, claim, adapter, deadline, control):
+        """Renew while the AI process runs. A failed request or gate check is
+        retried while the lease still has RENEW_HOLD_MARGIN_SECONDS left; a
+        cancel, a runner stop or a lease about to lapse stops the run. Every
+        hold and stop is logged with its reason."""
+        renewed, reason = self._renew(claim, adapter, deadline, None, control)
+        if not reason:
+            return renewed, ""
+        job = claim["job"]
+        hard = (reason in ("cancelled", STOPPED) or job.get("desired_action") == "cancel"
+                or job.get("status") == "cancelled")
+        left = renewed - time.time()
+        if not hard and left > RENEW_HOLD_MARGIN_SECONDS:
+            self.log("job %s: renewal held (%s); retrying, %.0fs of lease left" % (job["id"], reason, left))
+            return renewed, ""
+        self.log("job %s: stopping the run: %s" % (job["id"], reason))
+        return renewed, reason
+
     def _renew_wait(self, reason, deadline, control=None):
         """Seconds until the next lease renewal (Valley's renew_after_seconds
         while a protocol-2 job runs)."""
@@ -1168,7 +1191,7 @@ class Agent:
                     except TimeoutError:
                         if time.time() >= next_renew:
                             if not reason:
-                                deadline, reason = self._renew(claim, adapter, deadline, None, control)
+                                deadline, reason = self._renew_running(claim, adapter, deadline, control)
                                 if reason:
                                     cancel_event.set()
                             next_renew = time.time() + self._renew_wait(reason, deadline, control)
