@@ -12,13 +12,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode
 
 from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
-                       render, runner_state, scheduler, statusline_hook, toolpath, worktree)
+                       render, runner_state, scheduler, statusline_hook, sync, toolpath, worktree)
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
@@ -43,7 +44,7 @@ def _adapters(cfg: Dict[str, Any]):
 
 
 def _log(msg: str) -> None:
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
+    print(time.strftime("%Y-%m-%d %H:%M:%S%z"), msg, flush=True)
 
 
 def _cloud(cfg: Dict[str, Any]) -> CloudClient:
@@ -364,6 +365,28 @@ def _find_workspace(db: Database, ref: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def cmd_release(args):
+    from timetrace import release
+    home, cfg, db = _open(args)
+    try:
+        if args.release_cmd == "prepare":
+            workspace = _find_workspace(db, args.workspace)
+            if workspace is None:
+                raise ValueError("unknown workspace")
+            result = release.prepare(home, db, workspace, args.previous, cfg, args.timeout)
+        elif args.release_cmd == "execute":
+            result = release.execute(home, args.id, args.approve, cfg)
+        else:
+            result = release.status(home, args.id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["state"] in ("prepared", "healthy") else 1
+    except (ValueError, OSError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        db.conn.close()
+
+
 def cmd_workspace_check(args: argparse.Namespace) -> int:
     _, _, db = _open(args)
     if args.check_cmd == "list":
@@ -387,6 +410,21 @@ def cmd_workspace_check(args: argparse.Namespace) -> int:
     if not checks.valid_name(args.name):
         print("error: check name must match [a-z0-9_-]{1,40}: %r" % args.name, file=sys.stderr)
         return 2
+    if args.check_cmd == "trust":
+        from . import objective_checks
+        argv = db.get_check(workspace["id"], args.name)
+        try:
+            contract = objective_checks.register(workspace["path"], args.name, argv or [],
+                                                 args.objective, args.checker, args.protect)
+            if args.workflow:
+                with open(args.workflow, encoding="utf-8") as stream:
+                    contract = objective_checks.with_workflow(db, workspace["id"], contract, json.load(stream))
+        except (ValueError, OSError) as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 2
+        db.save_objective_check(workspace["id"], args.name, contract)
+        print("objective contract registered: %s (%s)" % (args.name, contract["version"]))
+        return 0
     if args.check_cmd == "remove":
         if not db.remove_check(workspace["id"], args.name):
             print("no check %s in workspace %s" % (args.name, workspace["id"]), file=sys.stderr)
@@ -426,6 +464,10 @@ def _runner_workspaces(db: Database) -> list:
             entry["enabled"] = entry["directory_inventory"]["status"] == "ok"
         else:
             entry["context"] = collect_workspace_context(row["path"])
+        from .objective_checks import inventory
+        contracts = inventory(db, row["id"])
+        if contracts:
+            entry["objective_checks"] = contracts
         entries.append(entry)
     return entries
 
@@ -471,19 +513,24 @@ def _str_list(value) -> List[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
-def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any]) -> list:
+def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) -> list:
     """Inventory entry per adapter. `plan_tier` is display only; the zero-spend
     flag is the adapter's verified capability, never inferred from a binary."""
     tools = []
     for name, adapter in adapters.items():
         binary = str(cfg.get(name, {}).get("bin", name))
         tier = adapter.plan_tier() if hasattr(adapter, "plan_tier") else None
+        from timetrace.routing import identity
+        routing_account, routing_model = identity(adapter)
         tools.append({
             "id": name + "-default", "provider": name, "version": "local",
+            "routing_version": 1, "routing_account": routing_account, "routing_model": routing_model,
             "can_enforce_zero_spend": adapter_capabilities(adapter).get("can_enforce_zero_spend") is True,
             "status": "available" if shutil.which(binary) else "unavailable",
             "plan_tier": tier or "",
         })
+        if catalogs is not None:
+            tools[-1]['model_catalog'] = catalogs.get(adapter)
     return tools
 
 
@@ -508,11 +555,14 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return state["sessions"].token()
 
     def revoked() -> None:
-        CredentialStore().delete()
-        state["sessions"].credentials = None
+        state["sessions"].invalidate_access()
 
+    from timetrace.remote_config import RemoteConfig
+    from timetrace.model_catalog import ModelCatalogCache
+    catalogs = ModelCatalogCache()
     agent = Agent(db, cloud, adapters, home, token,
-                  inventory=lambda: (_runner_workspaces(db), _runner_tools(cfg, adapters), _max_parallel(cfg),
+                  remote_config=RemoteConfig(home, cfg, adapters),
+                  inventory=lambda: (_runner_workspaces(db), _runner_tools(cfg, adapters, catalogs), _max_parallel(cfg),
                                      _max_parallel_per_tool(cfg)),
                   log=_log, on_revoked=revoked,
                   upload_output_tail=bool(cfg.get("upload_output_tail", True)),
@@ -559,6 +609,74 @@ def cmd_agent_pause(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_discard_results(args: argparse.Namespace) -> int:
+    """Set aside the results of one attempt the server refused (409). By hand only, never counted as delivered."""
+    home, _, db = _open(args)
+    refused = [p for p in db.remote_outbox_diagnostics()
+               if p["job_id"] == args.job and p["attempt_id"] == args.attempt and p["status"] == 409]
+    if not refused:
+        print("没有任务 %s / 尝试 %s 这个被服务器拒收（HTTP 409）的待上传批次。只有被拒收的批次可以丢弃；"
+              "其它失败会自己恢复，见 timetrace agent doctor。" % (args.job, args.attempt))
+        return 2
+    count = sum(p["pending_events"] for p in refused)
+    if not args.yes:
+        print("将丢弃任务 %s / 尝试 %s 的 %d 条结果（服务器已拒收）。它们仍保留在本机数据库，但不会再上传，也不算已送达。"
+              "确认请加 --yes。" % (args.job, args.attempt, count))
+        return 1
+    # The person's decision is written - and forced to disk - before anything is changed. If the audit log cannot take
+    # it, nothing is discarded; if the process ends after the commit, the request entry is what tells the truth.
+    discard_id = uuid.uuid4().hex[:12]
+    ids = {"discard_id": discard_id, "job_id": args.job, "attempt_id": args.attempt, "source": "local"}
+    try:
+        audit.record_durable(home, "discard_requested", events=count, **ids)
+    except OSError as exc:
+        print("审计日志写不进去（%s），为了不留下没有记录的处置，没有丢弃任何结果；它们仍等着上传结果的处理。"
+              "先让 %s 可写，再重新运行。" % (exc, audit.path(home)))
+        return 3
+    try:
+        count = db.discard_conflicted_remote_events(args.job, args.attempt)
+    except Exception as exc:
+        # Whether the statement or its follow-up reached the file is not known, so the entry says exactly that.
+        audit.record(home, "discard_failed", error=type(exc).__name__, database_change="unknown", **ids)
+        raise
+    if not count:
+        audit.record(home, "discard_unchanged", reason="nothing was left to set aside", **ids)
+        print("没有可丢弃的结果：这个批次刚被处理过，或已不是被拒收的状态。")
+        return 2
+    try:
+        audit.record_durable(home, "outbox_discard", events=count, **ids)
+    except OSError as exc:
+        print("已丢弃 %d 条结果（仍保留在本机数据库，不再上传，也不算已送达），但完成记录没能写进审计日志（%s）。"
+              "丢弃前的请求记录（discard_requested，编号 %s）已在审计日志里。" % (count, exc, discard_id))
+        return 4
+    print("已丢弃 %d 条结果：仍保留在本机数据库，不再上传，也不算已送达。" % count)
+    return 0
+
+
+def cmd_agent_sync(args: argparse.Namespace) -> int:
+    """Have the running Runner re-check logins and report now, without a restart."""
+    home, _, _ = _open(args)
+    if not toolpath.launch_agent_state()["running"]:
+        print("后台 Runner 没在运行，无法同步 → 运行 timetrace agent doctor 查看原因")
+        return 1
+    request_id = sync.request(home)
+    print("已请求后台 Runner 重新检查登录并上报……")
+    state = sync.wait(home, request_id, args.timeout)
+    if state is None:
+        print("Runner 在 %d 秒内还没处理（可能正在执行任务）。请求已保留，Runner 空出后会自动上报；"
+              "稍后运行 timetrace agent doctor 查看。" % args.timeout)
+        return 1
+    if state.get("sync_pushed"):
+        print("已同步到服务器：%s（%s 个工作区，%s 个工具）" % (
+            _iso_local(state.get("inventory_pushed_at")), state.get("inventory_workspaces", "?"),
+            state.get("inventory_tools", "?")))
+    else:
+        print("Runner 已重新检查登录，但上报失败 → 查看 ~/.timetrace/daemon.log")
+    for line in _health_lines({k: v for k, v in (state.get("health") or {}).items() if k.endswith("_login")}):
+        print(line)
+    return 0 if state.get("sync_pushed") else 1
+
+
 _LOGIN_LABEL = {"ok": "正常", "expired": "已过期 → 在这台 Mac 上重新登录", "missing": "未登录"}
 
 
@@ -600,6 +718,11 @@ def _reset_credit_lines(adapters: Dict[str, Any]) -> List[str]:
         lines.append("    %s %s%s" % (credit.get("status"), credit.get("description") or credit.get("id"),
                                      "，%s 过期" % credit["expires_at"] if credit.get("expires_at") else ""))
     return lines
+
+
+def _outbox_failure_text(status) -> str:
+    """Status 0 in the outbox's retry state means no usable response came back."""
+    return "HTTP %d" % status if status else "无有效响应（网络错误、超时或响应无法解析）"
 
 
 def _iso_local(epoch) -> str:
@@ -758,6 +881,19 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     for line in _reset_credit_lines(adapters):
         print(line)
     diagnostics = lock_diagnostics(home)
+    for pending in db.remote_outbox_diagnostics():
+        if pending["status"] == 409:
+            print("结果上报被服务器拒收: 任务 %s / 尝试 %s，HTTP 409，%d 条结果保留在本机，最早一条产生于 %s，已重试 %d 次；不会自动丢弃。" % (
+                pending["job_id"], pending["attempt_id"], pending["pending_events"],
+                _iso_local(pending["oldest_event_at"]), pending["failures"]))
+            print("  确认不再需要这些结果后运行: timetrace agent discard-results %s %s --yes" % (
+                pending["job_id"], pending["attempt_id"]))
+            continue
+        print("结果上报待恢复: 任务 %s / 尝试 %s，%s，%d 条结果完整保留；下次重试 %s" % (
+            pending["job_id"], pending["attempt_id"], _outbox_failure_text(pending["status"]),
+            pending["pending_events"], _iso_local(pending["retry_at"])))
+    if db.abandoned_remote_event_count():
+        print("已手动丢弃的结果: %d 条（保留在本机数据库，不再上传，也不算已送达）" % db.abandoned_remote_event_count())
     for message in diagnostics:
         print("Execution lock: %s" % message)
     return 0 if paired and workspaces and not diagnostics else 1
@@ -1005,8 +1141,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("%s = %s" % (key, config.format_value(cfg.get(key))))
             for tool, value in _max_parallel_per_tool(cfg).items():
                 print("%s.%s = %d" % (config.PER_TOOL_KEY, tool, value))
-            for key in config.TOOL_BIN_KEYS:
-                print("%s = %s" % (key, (cfg.get(key.split(".")[0]) or {}).get("bin", "")))
+            for key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+                section, field = key.split(".", 1)
+                print("%s = %s" % (key, config.format_value((cfg.get(section) or {}).get(field))))
             return 0
         if args.config_cmd == "get":
             if args.key.startswith(config.PER_TOOL_KEY + "."):
@@ -1016,8 +1153,9 @@ def cmd_config(args: argparse.Namespace) -> int:
                     config.parse_value(args.key, "1")  # raises naming the tools
                 print(limits[tool])
                 return 0
-            if args.key in config.TOOL_BIN_KEYS:
-                print((config.load(home).get(args.key.split(".")[0]) or {}).get("bin", ""))
+            if args.key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+                section, field = args.key.split(".", 1)
+                print(config.format_value((config.load(home).get(section) or {}).get(field)))
                 return 0
             if args.key not in config.scalar_keys():
                 config.parse_value(args.key, "")  # raises with the list of keys
@@ -1029,7 +1167,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 2
     print("%s = %s  (%s)" % (args.key, config.format_value(value), home / "config.json"))
     if args.key in ("cloud_base_url", "upload_output_tail", "interval_sec", "max_parallel") \
-            or args.key.startswith(config.PER_TOOL_KEY + "."):
+            or args.key.startswith(config.PER_TOOL_KEY + ".") or args.key in config.TOOL_MODEL_KEYS:
         print("restart the Runner to apply: launchctl kickstart -k gui/%d/com.atlaspaces.timetrace.agent" % os.getuid())
     if args.key in config.TOOL_BIN_KEYS:
         print("然后运行 timetrace agent install，让后台 Runner 使用它（并把它的目录加入 PATH）")
@@ -1375,6 +1513,14 @@ def build_parser() -> argparse.ArgumentParser:
     wr.set_defaults(fn=cmd_workspace_remove)
     wc = workspace_sub.add_parser("check", help="check commands a step's automatic acceptance may run")
     wc_sub = wc.add_subparsers(dest="check_cmd", required=True)
+    trust = wc_sub.add_parser("trust", help="bind a finite objective to an independent external checker")
+    trust.add_argument("workspace")
+    trust.add_argument("name")
+    trust.add_argument("--objective", required=True)
+    trust.add_argument("--checker", required=True)
+    trust.add_argument("--protect", action="append", default=[])
+    trust.add_argument("--workflow", help="operator-owned JSON component DAG; final integration is automatic")
+    trust.set_defaults(fn=cmd_workspace_check)
     wca = wc_sub.add_parser("add", help="register: timetrace workspace check add <workspace> <name> -- <command...>")
     wca.add_argument("workspace", help="workspace id, name or path")
     wca.add_argument("name", help="[a-z0-9_-]{1,40}")
@@ -1387,6 +1533,21 @@ def build_parser() -> argparse.ArgumentParser:
     wcr.add_argument("workspace")
     wcr.add_argument("name")
     wcr.set_defaults(fn=cmd_workspace_check)
+
+    rel = sub.add_parser("release", help="prepare, explicitly authorize, and verify a registered release")
+    rel_sub = rel.add_subparsers(dest="release_cmd", required=True)
+    rp = rel_sub.add_parser("prepare")
+    rp.add_argument("workspace")
+    rp.add_argument("--previous", required=True, help="exact known-good Git revision for rollback")
+    rp.add_argument("--timeout", type=int, default=300)
+    rp.set_defaults(fn=cmd_release)
+    re = rel_sub.add_parser("execute")
+    re.add_argument("id")
+    re.add_argument("--approve", required=True, help="authorization hash from the reviewed prepare receipt, including rollback")
+    re.set_defaults(fn=cmd_release)
+    rs = rel_sub.add_parser("status")
+    rs.add_argument("id")
+    rs.set_defaults(fn=cmd_release)
 
     st = sub.add_parser("setup", help="guided setup: tools, repositories, pairing, LaunchAgent")
     st.add_argument("--repo", action="append", help="register this git repository (repeatable)")
@@ -1418,6 +1579,14 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
                          ).set_defaults(fn=cmd_agent_pause)
     agent_sub.add_parser("resume", help="take new work again after `agent pause`").set_defaults(fn=cmd_agent_pause)
+    ad = agent_sub.add_parser("discard-results", help="set aside the results of an attempt the server refused (HTTP 409)")
+    ad.add_argument("job")
+    ad.add_argument("attempt")
+    ad.add_argument("--yes", action="store_true", help="really set them aside (without it only shows what would be)")
+    ad.set_defaults(fn=cmd_agent_discard_results)
+    sync_p = agent_sub.add_parser("sync", help="have the running Runner re-check logins and report to Valley now")
+    sync_p.add_argument("--timeout", type=int, default=120, help="seconds to wait for the Runner (default 120)")
+    sync_p.set_defaults(fn=cmd_agent_sync)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")
     ai.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                     help="do not register the Claude Code statusLine hook")

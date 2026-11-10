@@ -1,7 +1,11 @@
 """Configuration: spec §9 defaults deep-merged with ~/.timetrace/config.json."""
 import copy
+import fcntl
+from contextlib import contextmanager
+from functools import wraps
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -55,6 +59,10 @@ DEFAULTS: Dict[str, Any] = {
     "codex": {
         "bin": "codex",
         "sandbox": "workspace-write",
+        # Domains a task run's commands may reach ("api.example.com", "*.example.com"). Empty: no network. Every
+        # other domain is refused, and there is no per-command approval on a Codex run: whatever a listed domain
+        # accepts with credentials this Mac holds, any Codex task here can do. Folder and chat runs never get it.
+        "network_domains": [],
         "model": None,
         "extra_args": [],
         # Where Codex keeps its login; None = ~/.codex/auth.json.
@@ -116,6 +124,7 @@ PER_TOOL_MAX = 8
 
 # `timetrace config set claude.bin /path/to/claude`: the tool binary the Runner starts.
 TOOL_BIN_KEYS = ("claude.bin", "codex.bin")
+TOOL_MODEL_KEYS = ("claude.model", "codex.model")
 # Marks a `<tool>.bin` that setup / agent install / doctor found on their own;
 # such a value is re-resolved later, one the user set is never overwritten.
 BIN_SOURCE_AUTO = "auto"
@@ -148,6 +157,11 @@ def parse_value(key: str, raw: str) -> Any:
         return _per_tool_value(key, raw)
     if key in TOOL_BIN_KEYS:
         return _tool_bin_value(key, raw)
+    if key in TOOL_MODEL_KEYS:
+        text = str(raw).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", text):
+            raise ValueError("%s expects an explicit model ID or supported alias" % key)
+        return text
     keys = scalar_keys()
     if key not in keys:
         raise ValueError("unknown or non-scalar key: %s (settable: %s)" % (key, ", ".join(sorted(keys))))
@@ -191,6 +205,27 @@ def load_user(home_dir: Path) -> Dict[str, Any]:
     return doc
 
 
+@contextmanager
+def locked(home_dir):
+    """Serialize CLI updates and remote read/validate/write transactions."""
+    Path(home_dir).mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(Path(home_dir) / "config.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def config_locked(fn):
+    @wraps(fn)
+    def wrapped(home_dir, *args, **kwargs):
+        with locked(home_dir):
+            return fn(home_dir, *args, **kwargs)
+    return wrapped
+
+
 def _write_user(home_dir: Path, doc: Dict[str, Any]) -> None:
     """Atomic write of config.json with mode 0600."""
     path = Path(home_dir) / "config.json"
@@ -214,6 +249,7 @@ def explicit_tool_bin(home_dir: Path, tool: str) -> str:
     return value if isinstance(value, str) and value and value != tool else ""
 
 
+@config_locked
 def store_tool_bin(home_dir: Path, tool: str, path: str) -> None:
     """Record a discovered absolute tool path, marked as found automatically."""
     doc = load_user(home_dir)
@@ -226,11 +262,12 @@ def store_tool_bin(home_dir: Path, tool: str, path: str) -> None:
     _write_user(home_dir, doc)
 
 
+@config_locked
 def set_value(home_dir: Path, key: str, raw: str) -> Any:
     """Validate and write one key into config.json (atomic, 0600)."""
     value = parse_value(key, raw)
     doc = load_user(home_dir)
-    if key.startswith(PER_TOOL_KEY + ".") or key in TOOL_BIN_KEYS:
+    if key.startswith(PER_TOOL_KEY + ".") or key in TOOL_BIN_KEYS + TOOL_MODEL_KEYS:
         section, sub = key.split(".", 1)
         nested = doc.get(section)
         nested = dict(nested) if isinstance(nested, dict) else {}

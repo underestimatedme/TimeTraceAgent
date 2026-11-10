@@ -101,6 +101,27 @@ class ImportParseTest(unittest.TestCase):
     def no_worktree(*args, **kwargs):
         raise AssertionError("no worktree for an import parse")
 
+    def test_planning_reuses_lease_and_isolated_parser_without_import_result(self):
+        class Planner(Parser):
+            plan = Parser.parse_import
+        draft = {"work_item": {"title": "修复"}, "steps": []}
+        outcome, done = self.run_job(Planner(reply=json.dumps(draft)), kind="planning", planning_job_id="planning-1", import_id=None)
+        self.assertEqual(done["planning_result"], draft)
+        self.assertNotIn("import_result", done)
+        self.assertEqual(self.parser.calls[0]["files"], [])
+        self.assertEqual(self.db.get_remote_claim("imp1")["prompt"], "")
+        self.assertFalse(Path(self.parser.calls[0]["cwd"]).exists())
+
+    def test_planning_requires_explicit_adapter_capability_and_job_binding(self):
+        _, done = self.run_job(Parser(), kind="planning", planning_job_id="planning-1")
+        self.assertEqual(done["type"], "failed")
+        self.assertEqual(self.parser.calls, [])
+        class Planner(Parser):
+            plan = Parser.parse_import
+        _, done = self.run_job(Planner(), kind="planning", planning_job_id="../bad")
+        self.assertEqual(done["type"], "failed")
+        self.assertEqual(self.parser.calls, [])
+
     def test_runs_in_a_fresh_private_empty_directory_removed_afterwards(self):
         outcome, done = self.run_job()
         self.assertEqual(outcome, "job imp1 → parsed")

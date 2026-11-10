@@ -1,6 +1,6 @@
 # 从连接电脑到查看第一个成果
 
-适用：刻迹 Flutter 客户端与 TimeTraceAgent 0.5.2。手机需使用支持“生成并开始”和成果反馈的新版刻迹。
+适用：刻迹 Flutter 客户端与 TimeTraceAgent 0.6.2 或更新版本。手机需使用支持“生成并开始”和成果反馈的新版刻迹。
 
 ## 先准备什么
 
@@ -11,19 +11,22 @@
 
 ## 1. 在 Mac 安装 Agent
 
-新绑定最低要求 0.5.1，推荐已发布的 [0.5.2](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)。Homebrew 0.5.2 公式更新暂缓，不能靠反复 `brew upgrade timetraceagent` 获得该版。
+新绑定最低要求 0.5.1，推荐使用最新版本（当前为 [0.6.2](releases/0.6.2.md)）。
 
-**首次安装**，可用 pipx 从发布 tag 安装。需要 Python 3.9 或更新版本和 Git；如果尚未安装 pipx，可先用已有的 Homebrew 安装 pipx：
+**首次安装**推荐用 Homebrew：
 
 ```sh
-brew install pipx
-pipx ensurepath
+brew install underestimatedme/timetrace/timetraceagent
+tta --version
+tta setup
 ```
 
-重新打开终端，再运行：
+已用 Homebrew 安装的，升级用 `brew update && brew upgrade timetraceagent`。
+
+也可以用 pipx 从发布 tag 安装，需要 Python 3.9 或更新版本和 Git：
 
 ```sh
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.2"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"
 tta --version
 tta setup
 ```

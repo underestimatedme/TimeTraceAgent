@@ -11,17 +11,20 @@ Facts this relies on (verified 2026-09-02 on Codex CLI 0.151.0):
 - `codex exec resume <thread_id> --json <prompt>` continues a thread.
 """
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import os
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from timetrace import __version__
-from timetrace.adapters.base import CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
+from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
+from timetrace.mcp_access import ENV_NAME, McpAccess
+from timetrace.redact import mask_file, masking
 from timetrace.models import CODEX, RunResult, Sample
 from timetrace.billing import billing_env_keys, codex_verifier, sanitized_env
 from timetrace.quota import merge_capabilities
@@ -113,6 +116,7 @@ def app_server_request(bin_: str, method: str, params: Optional[dict] = None,
     finally:
         proc.kill()
         proc.wait()
+        t.join(timeout=2)
         for stream in (proc.stdin, proc.stdout):
             try:
                 stream.close()
@@ -166,30 +170,90 @@ def parse_reset_credits(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # ---- exec -----------------------------------------------------------------------
+TASK_PROFILE = "timetrace_task"
+# A host, or `*.` and a host: at least two labels and a name for the last one, so `*`, `*.com`, an address or a URL
+# cannot be written as an allowance.
+_DOMAIN = re.compile(r"^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def network_domains(cfg: Dict[str, Any]) -> List[str]:
+    """The domains a task run's commands may reach (`codex.network_domains`), lowercased, each once. Empty - the network
+    stays off - unless the run is workspace-write and every entry is a narrow domain: a list that cannot be read as
+    written must not half apply."""
+    value = cfg.get("network_domains")
+    if str(cfg.get("sandbox", "workspace-write")) != "workspace-write" or not isinstance(value, list):
+        return []
+    domains: List[str] = []
+    for entry in value:
+        domain = entry.lower() if isinstance(entry, str) else ""
+        if not _DOMAIN.match(domain):
+            return []
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def _toml_table(entries: List[Tuple[str, str]]) -> str:
+    return "{%s}" % ",".join("%s=%s" % (json.dumps(key), value) for key, value in entries)
+
+
+def _network_profile(domains: List[str], add_dirs: Optional[List[str]]) -> List[str]:
+    """A permission profile in place of the workspace-write settings (Codex takes one or the other): the same writes -
+    the worktree, temp, and the narrow git paths; Codex keeps `.git` read-only in a project root - and the network only
+    through Codex's proxy, which refuses every other domain, so `git push` to a host not listed still fails."""
+    writes = [(":root", '"read"'), (":project_roots", '{"."="write"}'), (":tmpdir", '"write"'), (":slash_tmp", '"write"')]
+    writes += [(path, '"write"') for path in add_dirs or []]
+    allow = [(domain, '"allow"') for domain in domains]
+    overrides = ["features.network_proxy=true",
+                 "default_permissions=%s" % json.dumps(TASK_PROFILE),
+                 "permissions.%s.filesystem=%s" % (TASK_PROFILE, _toml_table(writes)),
+                 "permissions.%s.network.enabled=true" % TASK_PROFILE,
+                 "permissions.%s.network.domains=%s" % (TASK_PROFILE, _toml_table(allow))]
+    return [part for override in overrides for part in ("-c", override)]
+
+
 def build_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optional[str] = None,
-              last_msg_file: Optional[str] = None, add_dirs: Optional[List[str]] = None) -> List[str]:
+              last_msg_file: Optional[str] = None, add_dirs: Optional[List[str]] = None,
+              mcp: Optional[McpAccess] = None) -> List[str]:
     sandbox = str(cfg.get("sandbox", "workspace-write"))
+    domains = network_domains(cfg)
     cmd = [cfg.get("bin", "codex"), "exec"]
     if resume:
         cmd += ["resume", resume]
     cmd += ["--json", "--skip-git-repo-check"]
-    if not resume:
-        cmd += ["-s", sandbox, "-C", cwd]
-    # `codex exec resume` has no -s: pin the sandbox through config so a
-    # resumed run cannot fall back to a laxer mode from ~/.codex/config.toml.
-    cmd += ["-c", "sandbox_mode=%s" % json.dumps(sandbox)]
-    # Model-run commands never need the network (the model API is called by
-    # codex itself, outside the sandbox); this also makes `git push` fail.
-    cmd += ["-c", "sandbox_workspace_write.network_access=false"]
-    # Directories the workspace-write sandbox may also write: the parts of the
-    # main repo's .git that `git commit` in a linked worktree needs. Passed as
-    # config because `codex exec resume` rejects --add-dir.
-    if add_dirs:
-        cmd += ["-c", "sandbox_workspace_write.writable_roots=%s" % json.dumps(list(add_dirs))]
+    if domains:
+        if not resume:
+            cmd += ["-C", cwd]
+        cmd += _network_profile(domains, add_dirs)
+    else:
+        if not resume:
+            cmd += ["-s", sandbox, "-C", cwd]
+        # `codex exec resume` has no -s: pin the sandbox through config so a
+        # resumed run cannot fall back to a laxer mode from ~/.codex/config.toml.
+        cmd += ["-c", "sandbox_mode=%s" % json.dumps(sandbox)]
+        # Without `network_domains` model-run commands have no network (the model API is called
+        # by codex itself, outside the sandbox); this also makes `git push` fail.
+        cmd += ["-c", "sandbox_workspace_write.network_access=false"]
+        # Directories the workspace-write sandbox may also write: the parts of the
+        # main repo's .git that `git commit` in a linked worktree needs. Passed as
+        # config because `codex exec resume` rejects --add-dir.
+        if add_dirs:
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=%s" % json.dumps(list(add_dirs))]
     if cfg.get("model"):
         cmd += ["-m", cfg["model"]]
     if last_msg_file:
         cmd += ["-o", last_msg_file]
+    if mcp is not None:
+        # TimeTrace's MCP server for this run. The address is in the command (it is not a secret); the token is not: Codex
+        # reads it from the environment variable named here, which only this process is given.
+        cmd += ["-c", "mcp_servers.timetrace.url=%s" % json.dumps(mcp.url),
+                "-c", "mcp_servers.timetrace.bearer_token_env_var=%s" % json.dumps(ENV_NAME),
+                # `codex exec` has approval policy "never", which fails every MCP tool call that is not pre-approved. This
+                # server only: the tools a dispatched run may call are limited by Valley (the run's fixed policy), not here.
+                "-c", 'mcp_servers.timetrace.default_tools_approval_mode="approve"',
+                # Codex writes the environment of its shell (this token included) to CODEX_HOME/shell_snapshots/*.sh for the
+                # model's commands, and the file stays after the run: a run that holds the token does not write one.
+                "-c", "features.shell_snapshot=false"]
     cmd += list(cfg.get("extra_args") or [])
     cmd += [SAFETY_RULES + "\n" + prompt]
     return cmd
@@ -285,6 +349,8 @@ def _int_or_none(v: Any) -> Optional[int]:
 class CodexAdapter(ToolAdapter):
     name = CODEX
     adapter_version = "codex-cli/0.151"
+    # Execution runs in a worktree take the job's TimeTrace MCP access (`mcp=`).
+    supports_mcp = True
 
     def __init__(self, cfg: Dict[str, Any], billing=None):
         self.cfg = cfg
@@ -333,6 +399,9 @@ class CodexAdapter(ToolAdapter):
     def plan_tier(self) -> Optional[str]:
         return tiers.codex_plan_tier(self._auth_path())
 
+    def routing_account_key(self) -> Optional[str]:
+        return tiers.codex_account_key(self._auth_path(), digest_length=64)
+
     def account_key(self) -> Optional[str]:
         return tiers.codex_account_key(self._auth_path())
 
@@ -343,15 +412,27 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             return []
 
-    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
-        cmd = build_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md",
-                        add_dirs=self._writable_extras(cwd))
-        return self._run(cmd, cwd, log_file, cancel_event)
+    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess]) -> RunResult:
+        """One execution run. Codex writes its final answer to the `-o` file itself, outside the streams that are masked
+        as they are read, so that file is masked once the run is over however it ended (finished, failed, cancelled, an
+        exception): a token the model repeated is never left in it."""
+        with masking([mcp.token] if mcp is not None else []):
+            try:
+                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+            finally:
+                mask_file(log_file + ".last.md")
 
-    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None) -> RunResult:
+    def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+              mcp: Optional[McpAccess] = None) -> RunResult:
+        cmd = build_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md",
+                        add_dirs=self._writable_extras(cwd), mcp=mcp)
+        return self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
+
+    def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
+               mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, resume=session_id,
-                        last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd))
-        res = self._run(cmd, cwd, log_file, cancel_event)
+                        last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd), mcp=mcp)
+        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
         res.session_id = res.session_id or session_id
         return res
 
@@ -372,6 +453,12 @@ class CodexAdapter(ToolAdapter):
         sandbox pinned through config, no writable roots) with the review
         rules, always a new thread."""
         return self.chat(prompt, cwd, "", log_file, cancel_event, rules=REVIEW_RULES)
+
+    def plan(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
+        """One read-only project planning request: a chat turn's argv (read-only
+        sandbox pinned through config, no writable roots, no git repository
+        required) with the planning rules, always a new thread."""
+        return self.chat(prompt, cwd, "", log_file, cancel_event, rules=PLANNING_RULES)
 
     def parse_import(self, prompt: str, cwd: str, log_file: str, cancel_event=None) -> RunResult:
         """One read-only conversation import: a chat turn's argv (read-only
@@ -401,9 +488,10 @@ class CodexAdapter(ToolAdapter):
         res.session_id = res.session_id or session_id or None
         return res
 
-    def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None) -> RunResult:
+    def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None,
+             env: Optional[Dict[str, str]] = None) -> RunResult:
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX))
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env)
         res = parse_exec(lines)
         res.exit_code = code
         if code != 0 and not res.blocked:

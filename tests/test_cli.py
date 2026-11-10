@@ -19,6 +19,8 @@ def git(*args, cwd):
 class CliTest(unittest.TestCase):
     def test_inventory_uploads_explicit_zero_spend_capability(self):
         class CapabilityAdapter:
+            name = "codex"
+            cfg = {}
             def __init__(self, value):
                 self.value = value
 
@@ -47,10 +49,13 @@ class CliTest(unittest.TestCase):
                     code, _, err = self.run_cli("agent", "run", "--once")
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len(payloads), 1)
+                self.assertEqual(payloads[0]["tools"][0]["model_catalog"]["status"], "login_required")
                 self.assertIs(payloads[0]["tools"][0].get("can_enforce_zero_spend"), expected)
 
     def test_inventory_uploads_plan_tier(self):
         class TierAdapter:
+            name = "claude"
+            cfg = {}
             def capabilities(self):
                 return {"can_enforce_zero_spend": True}
 
@@ -232,6 +237,78 @@ class CliTest(unittest.TestCase):
         self.assertFalse(pause.paused(home))
         self.assertEqual([e["event"] for e in audit.read(home)], ["pause", "resume"])
 
+    def test_agent_sync_waits_for_the_runner_and_shows_what_it_pushed(self):
+        from timetrace import config, runner_state, sync
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True)
+
+        def runner(*a, **k):
+            # Stands in for the running Runner picking the request up.
+            request_id = sync.pending(home)
+            if request_id:
+                runner_state.record(home, sync_id=request_id, sync_pushed=True, inventory_pushed_at=1793290701,
+                                    inventory_workspaces=3, inventory_tools=2,
+                                    health={"claude_login": "ok", "codex_login": "ok", "workspaces": []})
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=runner):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 0)
+        self.assertIn("已同步到服务器", out)
+        self.assertIn("claude 登录: 正常", out)
+        self.assertIn("3 个工作区，2 个工具", out)
+        self.assertIsNone(sync.pending(home))
+
+    def test_agent_sync_reports_a_failed_push(self):
+        from timetrace import config, runner_state, sync
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True)
+
+        def runner(*a, **k):
+            request_id = sync.pending(home)
+            if request_id:
+                runner_state.record(home, sync_id=request_id, sync_pushed=False)
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=runner):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 1)
+        self.assertIn("上报失败", out)
+
+    def test_agent_sync_without_a_running_runner_says_so(self):
+        from timetrace import config, sync
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": False, "running": False, "pid": None}):
+            code, out, _ = self.run_cli("agent", "sync")
+        self.assertEqual(code, 1)
+        self.assertIn("后台 Runner 没在运行", out)
+        self.assertIsNone(sync.pending(config.home()))
+
+    def test_agent_sync_times_out_but_leaves_the_request(self):
+        from timetrace import config, sync
+        clock = [0.0]
+
+        def tick(seconds):
+            clock[0] += seconds
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=tick), \
+             patch("timetrace.sync.time.monotonic", side_effect=lambda: clock[0]):
+            code, out, _ = self.run_cli("agent", "sync", "--timeout", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("还没处理", out)
+        self.assertLess(clock[0], 4)
+        with patch("timetrace.toolpath.launch_agent_state", return_value={"loaded": True, "running": True, "pid": 9}), \
+             patch("timetrace.sync.time.sleep", side_effect=tick), \
+             patch("timetrace.sync.time.monotonic", side_effect=lambda: clock[0]):
+            clock[0] = 0.0
+            self.run_cli("agent", "sync")
+        self.assertGreaterEqual(clock[0], 120)  # default: Valley can take a minute to accept the push
+        self.assertIsNotNone(sync.pending(config.home()))
+
+    def test_daemon_log_lines_carry_date_time_and_offset(self):
+        # A line is only useful next to Valley's own logs if it names the day and the zone.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._log("hello")
+        self.assertRegex(out.getvalue(), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} hello\n$")
+
     def test_doctor_shows_reset_credits_read_only(self):
         class CodexLike:
             def capabilities(self):
@@ -304,11 +381,13 @@ class CliTest(unittest.TestCase):
         git("commit", "-q", "-m", "init", cwd=self.repo)
         self._old = os.environ.get("TIMETRACE_HOME")
         os.environ["TIMETRACE_HOME"] = str(self.home)
+        # Never load host Keychain credentials in CLI fixtures.
         # No real login shell, no real ~/Library/LaunchAgents: tool discovery
         # has its own tests (test_toolpath) with a fake HOME.
         user_home = root / "user"
         user_home.mkdir()
-        for target, value in (("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
+        for target, value in (("timetrace.cli.CredentialStore.load", lambda self, account="default": None),
+                              ("timetrace.cli._discover_tools", lambda home, user_home=None: (cli.config.load(home), {})),
                               ("timetrace.cli.Path.home", lambda: user_home),
                               ("builtins.input", lambda prompt: "0000")):
             p = patch(target, new=value)

@@ -697,6 +697,11 @@ override a deny.
 - `timetrace agent pause|resume` writes `~/.timetrace/local_pause.json`
   (0600, separate from runner_state.json so the agent cannot overwrite it);
   Valley cannot lift it.
+- `timetrace agent sync` writes `~/.timetrace/sync_request.json` (0600,
+  a random id only). The running agent forces its cached zero-spend
+  verdicts, the self-check and an inventory push on its own thread, then
+  acknowledges with `sync_id` / `sync_pushed` in runner_state.json. Nothing
+  else is read from the file and nothing new leaves the computer.
 - `caffeinate -i -w <agent pid>` (fixed argv, `/usr/bin/caffeinate`) while
   any job runs; it exits by itself with the agent.
 - Reset credits: a short-lived `codex app-server` (sanitized environment,
@@ -717,6 +722,29 @@ override a deny.
 `tests/test_self_check.py`, `tests/test_claude_adapter.py`
 (`StreamCmdTest`, `StreamAdapterTest`), `tests/test_cli.py`,
 `tests/test_cloud.py`.
+
+## Addendum 2026-11-09: `codex.network_domains`
+
+Network off stays the default for Codex. A task run can be given named domains (`codex.network_domains`, local config
+only), so a release run can reach `*.apple.com` without opening everything.
+
+- *How.* A Codex permission profile (`default_permissions`, `permissions.<name>.network.domains`) with
+  `features.network_proxy` replaces the workspace-write settings: the same writes (worktree, temp, narrow git paths)
+  and the network only through Codex's proxy. `network_proxy` is marked experimental in Codex 0.165.0.
+- *Fail closed.* `*`, `*.com`, an address, a URL, or any entry that cannot be read leaves the whole list unused and the
+  network off. Only `workspace-write` task runs qualify; folder and chat runs are unchanged.
+- *What still holds.* A plain `git push` to a host that is not listed fails at the proxy, SSH included; the worktree
+  pushurl stays. Do not list a Git host.
+- *Residual risk.* A Codex run has no per-command approval (`codex exec` runs with policy "never"). Every Codex task on
+  this Mac can read what the user can read and call a listed domain, so with `*.apple.com` listed and an App Store Connect
+  key on disk it can submit a release without asking. A human gate has to come from the task or the pipeline, not from
+  this setting. Listed domains are also a way out for anything the run can read.
+- *The rules still apply.* SAFETY_RULES 3 keeps a run to its working directory: in a real run the model refused a script
+  outside the worktree and ran the same script once it was in the repository. Release tooling belongs in the repository.
+- *Verified on Codex 0.165.0.* With `codex sandbox`, outside any temp directory: a commit in a linked worktree succeeds;
+  `.git/config`, `.git/hooks` and the worktree's `.git` file are not writable; `*.apple.com` answers; `github.com` (HTTPS
+  and SSH) and `example.com` are refused. With real `codex exec` runs, start and resume: the same network results, the
+  commit, and a read-only App Store Connect query by a script in the repository, with no key in the run's log.
 
 ## Verification
 

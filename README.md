@@ -2,8 +2,43 @@
 
 给 Claude Code 和 Codex 排任务的无人值守队列，也是刻迹 iOS App 的电脑端 Runner：手机派任务，这台 Mac 用你已经登录的 `claude` / `codex` 执行。撞到限额就睡到重置时间，再用原会话续接；顺手把两个工具每个限额桶的余量采样进 SQLite。
 
-命令是 `timetrace`，短名 `tta`，两者完全等价。零依赖，Python 3.9+ 标准库，目前只支持 macOS。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
+命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.2：中断后没留断点的步骤可以重试
+
+一步执行到一半被中断、又没留下断点时，电脑端为避免重复执行会拒绝重新开始。0.6.2 起这类拒绝报为“失败”（以前是“等待输入”，网页上没有任何处理入口），你在网页上确认旧进程已停止并重试后，电脑端会从头执行这一步。需要配合同期发布的服务端。详见 [0.6.2 发布说明](docs/releases/0.6.2.md)。
+
+## 0.6.1：Codex 任务可按域名联网
+
+新增 `codex.network_domains`，让 Codex 任务能访问指定域名，例如发布到 App Store 时的 `*.apple.com`。默认仍然断网，不设置就没有任何变化，也不需要升级服务端。Codex 没有逐条命令审批，清单不为空时，这台电脑上的所有 Codex 任务都能访问这些域名，所以不发布时请留空。详见 [0.6.1 发布说明](docs/releases/0.6.1.md)。
+
+升级：`brew update && brew upgrade timetraceagent`，然后执行 `timetrace agent install` 和 `timetrace agent doctor`。
+
+## 0.6.0：MCP 接入与正式 Runner 修复
+
+包含已安装正式版本的心跳恢复、成果上传隔离、手动放弃成果的持久审计，以及 Claude Code / Codex 派活中的 MCP 接入。任务访问随 attempt 和 lease 失效；临时配置使用 0600 权限并在运行结束后清理。MCP 令牌不放进命令参数，运行日志与上传成果会脱敏；持有 MCP 访问的 Codex 任务关闭 shell snapshot，避免环境令牌被持久化。
+
+在 [TimeTrace 用户控制台的 AI 连接](https://timetrace.atlaspaces.com/workspace/connections) 查看客户端接入指引。派活任务自动绑定对应访问；成果仍由用户验收，AI 没有验收工具。完整验证范围和局限见 [0.6.0 发布说明](docs/releases/0.6.0.md) 与 [真实 MCP 联调记录](docs/mcp-e2e-2026-11.md)。用户配置的其他 Claude MCP 服务器仍会加载，大型工具目录可能消耗较多上下文。
+
+先升级配套服务端，再更新已有安装并重启同一个 Runner：`brew update && brew upgrade timetraceagent`，然后执行 `timetrace agent install` 和 `timetrace agent doctor`。已有配对与数据保留；首次安装使用 `brew install underestimatedme/timetrace/timetraceagent`。历史版本说明保留在下方。
+
+
+## 0.5.7：首次配置、交付证据与发布闭环
+
+公开安装与线上配置能力对齐。已有配对、项目目录和模型设置在升级后保留：
+
+```sh
+brew update
+brew upgrade timetraceagent
+timetrace agent install
+timetrace agent doctor
+```
+
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"`；不要混用两套后台服务。
+
+长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
+
+[固定命令发布与回滚](docs/RELEASE-LIFECYCLE.md) 支持准备、具体方案授权、健康检查、失败回滚和恢复验证。服务端每日项目巡检复用现有开发状态采集，不需要浏览器一直打开。
 
 ## 0.5.1：电脑唯一标识
 
@@ -11,7 +46,7 @@
 
 同一账号下同一设备只允许一个有效绑定，重复绑定会明确提示使用现有绑定或先在手机解绑；同名的不同电脑仍可分别绑定。已有绑定通过新版 Runner 的已登录库存上报登记设备标识，不需重新配对。旧记录缺少可靠标识，不能按名称自动合并，请在手机确认后解绑多余记录。
 
-服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。推荐使用已发布的 [0.5.2](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)。Homebrew 0.5.2 公式更新暂缓；需要本版请使用下方 pipx 安装方式。
+服务端启用设备标识校验后，新绑定需要 0.5.1 或更新版本；旧版的已有登录仍可使用。0.5.1 已发布到 GitHub Release 与 Homebrew；升级用 `brew upgrade timetraceagent`。
 
 ## 0.5.0 起：手机数字确认绑定
 
@@ -25,11 +60,10 @@ AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里�
 
 ## 快速开始
 
-首次使用请看 [安装、绑定与第一个任务](docs/getting-started.md)。以下使用已有的 pipx（尚未安装可先 `brew install pipx`、`pipx ensurepath` 并重开终端）：
+首次使用请看 [安装、绑定与第一个任务](docs/getting-started.md)。
 
 ```sh
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.2"
-tta --version
+brew install underestimatedme/timetrace/timetraceagent
 tta setup                          # 检查工具 → 登记仓库 → 扫码绑定手机 → 安装后台 Runner
 ```
 
@@ -57,6 +91,7 @@ Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.time
 - **追加指令**：Claude 任务运行中直接写入会话（stream-json 输入）；Codex 在本轮结束后以 `codex exec resume` 在同一个作业里执行，沙箱参数不变，零付费核验照常。
 - **审批**：Claude 需要权限时先按本机规则判断——工作副本内的读写和只读命令（`git status/diff/log`、`ls`、`cat` 等）自动允许；`git push`、改远端或其他分支、写工作副本以外、读凭据目录一律拒绝（手机批准也不能放行）；其余推到手机，10 分钟没人处理即拒绝。「本任务内同类都允许」只在本作业有效。等待审批不计入任务超时，租约照常续期。
 - **暂停接活**：`timetrace agent pause` / `timetrace agent resume`。本机暂停优先，手机无法解除；正在运行的任务不受影响。
+- **立即同步**：在这台 Mac 上重新登录 Claude / Codex 后运行 `timetrace agent sync`，后台 Runner 会在下一轮循环里重新核验登录、刷新自检并上报工具清单（即使没有变化），不用等 5 分钟的定时上报，也不用重启 Runner；正在运行的任务不受影响，额度仍按原节奏上报。命令最多等 120 秒（`--timeout` 可改），通常半分钟左右完成，主要取决于 Valley 接收上报的速度。
 - **防休眠**：有任务运行时启动 `caffeinate -i -w <pid>`（只阻止空闲睡眠，合盖仍会睡），没有任务时结束；配置 `prevent_sleep: false` 关闭。
 - **自检**：启动时、每 10 分钟、任务失败后检查 Claude / Codex 登录、工作区所在磁盘剩余空间（不足 1 GB 时不接新任务）、各工作区状态，随工具清单上报，手机据此显示「为什么不接活」。
 - **Codex 重置机会**：每 10 分钟短时启动 `codex app-server` 读取 `account/rateLimits/read` 里的 `rateLimitResetCredits`（只读，读不到时上报「未知」而不是 0 次）。刻迹从不使用重置（不调用 `account/rateLimitResetCredit/consume`），请在官方客户端里自己操作。
@@ -105,22 +140,22 @@ timetrace workspace check remove TimeTrace build
 
 `timetrace agent doctor` 会打印每个工具的套餐等级和实时额度，和手机「你的 AI」页应显示的一致，用来现场对照。
 
-## 0.5.2 已发布
+## 0.5.2 发布准备
 
 0.5.2 包含只读开发状态采集、Git 读取失败时的正确报告，以及多电脑时间偏差导致事件回执失败的修复。先部署包含 `server_now` 的 Valley 服务端，再升级 Agent。旧服务端缺少该字段时仍使用本地时间；已持久化的事件保持原时间戳，系统时钟仍应同步。
 
-[0.5.2 已发布](https://github.com/underestimatedme/TimeTraceAgent/releases/tag/v0.5.2)，可从发布 tag 安装。Homebrew 0.5.2 更新暂缓，`brew upgrade` 目前不提供本版。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
+此版本正在准备发布；下面的安装命令仍指向已发布的 0.5.1。发布和 Homebrew 更新完成后再切换安装指引。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
 
 ## 安装
 
 三种方式，任选其一：
 
 ```sh
-# 1) Homebrew：当前尚未提供 0.5.2；需要新版使用下方 pipx 方式
+# 1) Homebrew（推荐）；升级用 brew upgrade timetraceagent
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.5.2"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
@@ -252,7 +287,7 @@ timetrace agent install
                                "Bash(git diff:*)", "Bash(git log:*)"],
              "setting_sources": "user",
              "model": null, "extra_args": []},
-  "codex":  {"bin": "codex",  "sandbox": "workspace-write", "model": null, "extra_args": []}
+  "codex":  {"bin": "codex",  "sandbox": "workspace-write", "network_domains": [], "model": null, "extra_args": []}
 }
 ```
 
@@ -284,6 +319,7 @@ timetrace config set interval_sec 60
 - `allowed_repos` 非空时，`timetrace add --repo` 必须落在其中某个目录之下。
 - `permission_mode` 决定 Claude 无头运行时能做什么。`acceptEdits` 允许改文件，命令只放行 `allowed_tools` 里的（缺省是本地 git 提交相关的几条）；要让它跑构建和测试，往 `allowed_tools` 加规则（如 `"Bash(npm test:*)"`）或把模式改成 `bypassPermissions`。这是你的决定，工具不替你做。
 - Codex 的 `sandbox` 对应 `codex exec -s`（续接时以 `-c sandbox_mode=…` 传入，续接不会退回到 `~/.codex/config.toml` 里更宽的模式）；`workspace-write` 只允许写 worktree 和提交所需的 git 元数据，且关闭网络。
+- Codex 的 `network_domains`（默认 `[]`，即断网）列出任务命令可访问的域名，例如 `["*.apple.com"]`，其他域名一律被拦；写法不合规（`*`、`*.com`、地址、URL）时整张清单作废，继续断网。文件夹任务和对话不受影响，始终断网。Codex 没有逐条命令审批：清单里的域名，这台电脑上任何 Codex 任务都能访问，**不要列 Git 服务器**，详见 `docs/SECURITY_REVIEW.md`。
 
 ## 自托管
 
@@ -408,3 +444,34 @@ unreadable, plus a root README snapshot (README.md, README.markdown, README,
 README.txt in that order, ignoring case). Snapshots are limited to 32 KiB of
 UTF-8 and descriptions to 500 characters. Local paths and linked files are not
 uploaded. Inventory refreshes update the collection timestamp; no AI is invoked.
+
+## 项目分类执行规则（待发布）
+
+本分支支持 Valley 的 `routing_version: 1` 协议。终端清单上报登录账号的完整 SHA-256 指纹与配置中明确指定的 `claude.model` / `codex.model`；不会上传账号凭据。未指定模型时，Web 显示需要配置，不能加入允许列表。
+
+服务端领取结果携带所需账号、模型；执行器在开始、续租和创建进程前核对本地实际登录与模型配置。切换账号、切换模型或 profile 不匹配会阻止运行。旧任务在所属账号未启用新规则时保持兼容。
+
+当前同一供应商在一台电脑上仍使用其默认终端配置；多个账号可分布于已绑定的不同电脑。此分支尚未发布为 Homebrew 版本，不能把当前稳定版的安装成功当作协议已支持。
+
+模型需显式配置，例如 `tta config set claude.model sonnet`。Codex 使用该账号 `model/list` 返回的模型 ID：`tta config set codex.model <模型ID>`。修改后按命令提示重启 Runner，网页刷新「AI 账号与模型」即可看到上报结果。
+
+### P0 acceptance packs (0.5.8rc1 candidate)
+
+Workspace configuration protocol 3 adds `regression`, `markdown_sections` and
+`web_flow` contracts. Upgrade the backend to accept config protocol 3 **before**
+installing this candidate. The execution protocol stays at 2.
+
+Regression reuses a locally registered check, freezes tracked tests/configuration
+and every file outside an explicit repair scope, and pins the executable/checker.
+It proves the registered tests only, not test coverage or an OS sandbox. Markdown
+checks require real headings and non-placeholder section bodies; factual accuracy
+is outside their scope. Web flow uses at most 20 declarative browser actions with
+explicit assertions on the exact commit in the trusted preview renderer; static
+pages do not require Docker, stateful previews do. No arbitrary remote command,
+JavaScript or external URL is accepted as a contract.
+
+`TIMETRACE_WEB_FLOW_LIVE=1 python3 -m unittest tests.test_web_flow_live` runs the
+actual Chromium negative/positive fixture. `tests/live_acceptance_packs.py` is
+an opt-in loopback Valley harness with real model calls; it records three task
+categories and optionally a same-task feedback/re-receipt round. These are
+assistant-operated acceptance samples, never independent new-user research.

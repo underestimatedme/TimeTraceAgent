@@ -77,6 +77,15 @@ class ConfigCommandTest(unittest.TestCase):
             code = cli.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    def test_model_selection_is_explicit_and_round_trips(self):
+        for tool in ("claude", "codex"):
+            code, _, err = self.run_cli("config", "set", tool + ".model", "model-test")
+            self.assertEqual(code, 0, err)
+            code, out, _ = self.run_cli("config", "get", tool + ".model")
+            self.assertEqual(out.strip(), "model-test")
+            code, _, _ = self.run_cli("config", "set", tool + ".model", "--model other")
+            self.assertEqual(code, 2)
+
     def test_get_shows_the_effective_value(self):
         code, out, _ = self.run_cli("config", "get", "upload_output_tail")
         self.assertEqual((code, out.strip()), (0, "true"))
