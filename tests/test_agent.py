@@ -932,8 +932,42 @@ class RecoveryFenceTest(unittest.TestCase):
             self.db.mark_plan_started("plan-1", "other-job", "other-attempt")
             return coding_slot_lock(home)
         with patch("timetrace.agent.coding_slot_lock", acquire_after_start):
-            self.assertIn("waiting_input", self.agent.run_once())
+            self.assertIn("manual recovery required", self.agent.run_once())
         self.assertEqual(self.calls, [])
+
+    def test_started_plan_without_checkpoint_is_reported_as_failed(self):
+        # Valley lets a person retry a failed run; a waiting_input one waits
+        # for an answer nobody can give.
+        self.db.mark_plan_started("plan-1", "old-job", "old-attempt")
+        self.claim["job"]["plan_id"] = "plan-1"
+        self.assertIn("manual recovery required", self.agent.run_once())
+        self.assertEqual(self.cloud.events[-1]["type"], "failed")
+        self.assertIn("manual recovery required", self.cloud.events[-1]["message"])
+        self.assertEqual(self.calls, [])
+
+    def test_operator_confirmed_recovery_starts_the_plan_afresh(self):
+        self.db.mark_plan_started("plan-1", "old-job", "old-attempt")
+        self.claim["job"].update(plan_id="plan-1", recovery_confirmed=True)
+        self.adapter.start = lambda prompt, cwd, session_id, log_file, cancel_event=None: (
+            self.calls.append("start"), RunResult(exit_code=0, ok=True, session_id=session_id))[1]
+        self.assertEqual(self.agent.run_once(), "job j1 → awaiting_review")
+        self.assertEqual(self.calls, ["start"])
+
+    def test_recovery_confirmation_never_restarts_a_reported_job(self):
+        # The confirmation covers a new run of the Plan, not a replay of the
+        # job that was already blocked.
+        self.db.mark_plan_started("plan-1", "old-job", "old-attempt")
+        self.claim["job"]["plan_id"] = "plan-1"
+        self.agent.run_once()
+        self.claim = {**self.claim, "attempt_id": "a2", "job": dict(self.claim["job"], recovery_confirmed=True)}
+        self.assertIn("manual recovery required", self.agent.run_once())
+        self.assertEqual(self.calls, [])
+
+    def test_recovery_confirmation_still_resumes_a_checkpoint(self):
+        self.checkpoint()
+        self.claim["job"]["recovery_confirmed"] = True
+        self.agent.run_once()
+        self.assertEqual([call[0] for call in self.calls], ["resume"])
 
     def test_cancelled_resume_exception_deletes_checkpoint_and_reports_cancel(self):
         self.checkpoint()
@@ -1324,7 +1358,7 @@ class RecoveryFenceTest(unittest.TestCase):
     def test_started_attempt_without_checkpoint_requires_input(self):
         self.db.save_remote_claim(self.claim, state="running")
         self.claim["attempt_id"] = "a2"
-        self.assertIn("waiting_input", self.agent.run_once())
+        self.assertIn("manual recovery required", self.agent.run_once())
         self.assertEqual(self.calls, [])
 
     def test_new_job_for_started_plan_without_checkpoint_requires_input(self):
@@ -1334,7 +1368,7 @@ class RecoveryFenceTest(unittest.TestCase):
         self.claim["job"]["id"] = "j2"
         self.claim["attempt_id"] = "a2"
         self.calls.clear()
-        self.assertIn("waiting_input", self.agent.run_once())
+        self.assertIn("manual recovery required", self.agent.run_once())
         self.assertEqual(self.calls, [])
 
     def test_cancelling_plan_cannot_be_bypassed_with_new_job_id(self):
@@ -1348,7 +1382,7 @@ class RecoveryFenceTest(unittest.TestCase):
         self.claim["job"]["id"] = "j2"
         self.claim["attempt_id"] = "a3"
         self.calls.clear()
-        self.assertIn("waiting_input", self.agent.run_once())
+        self.assertIn("manual recovery required", self.agent.run_once())
         self.assertEqual(self.calls, [])
 
 

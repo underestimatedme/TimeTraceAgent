@@ -674,7 +674,7 @@ class Agent:
             try:
                 checkpoint = self.db.get_checkpoint(plan_key)
             except (TypeError, ValueError, KeyError):
-                return self._blocked(claim, plan_key, "checkpoint unreadable; manual recovery required")
+                return self._blocked(claim, plan_key, "checkpoint unreadable; manual recovery required", event_type="failed")
             latest = self.db.get_remote_claim(job_id)
             if checkpoint:
                 if checkpoint.plan_id != plan_key:
@@ -684,9 +684,16 @@ class Agent:
                                                 workspace["path"], adapter_capabilities(adapter).get("can_resume") is True)
                 if reason:
                     return self._blocked(claim, plan_key, reason, checkpoint)
-            elif (self.db.plan_started(plan_key) or (existing and existing["state"] != "claimed")
-                  or (latest and latest["state"] != "claimed")):
-                return self._blocked(claim, plan_key, "checkpoint missing for previously started job; manual recovery required")
+            elif ((existing and existing["state"] != "claimed") or (latest and latest["state"] != "claimed")
+                  or (self.db.plan_started(plan_key) and job.get("recovery_confirmed") is not True)):
+                # Reported as failed: Valley lets the person retry a failed run
+                # once they confirm the earlier one stopped.
+                return self._blocked(claim, plan_key, "checkpoint missing for previously started job; manual recovery required",
+                                     event_type="failed")
+            elif self.db.plan_started(plan_key):
+                # The person confirmed in Valley that the Plan's earlier run has
+                # stopped and chose to run it again from the start.
+                self.log("job %s: earlier run of plan %s confirmed stopped; starting afresh" % (job_id, plan_key))
             if project_root:
                 try:
                     project_directories.prepare(workspace)
@@ -774,9 +781,10 @@ class Agent:
             return deadline, "lease_expired"
         return renewed, gate(renewed)
 
-    def _blocked(self, claim, plan_key, reason, checkpoint=None, seq=1, observed_at=None, note=""):
+    def _blocked(self, claim, plan_key, reason, checkpoint=None, seq=1, observed_at=None, note="", event_type="waiting_input"):
         """`note`: a folder run changed files outside its output directory
-        before it was stopped; named in the event and never resumable."""
+        before it was stopped; named in the event and never resumable.
+        `event_type`: "failed" for a block only a person's retry resolves."""
         cancelled = reason == "cancelled"
         if cancelled or note:
             self.db.delete_checkpoint(plan_key)
@@ -785,7 +793,7 @@ class Agent:
             # must not redirect a write or prevent the waiting_input event.
             checkpoint.reason = reason
             self.db.save_checkpoint(checkpoint)
-        event_type = "cancelled" if cancelled else "waiting_input"
+        event_type = "cancelled" if cancelled else event_type
         message = "dispatch blocked: %s" % reason + ("; " + note if note else "")
         self._report(claim, [{"seq": seq, "type": event_type, "message": message,
                               "observed_at": observed_at or self._observed_now()}])
@@ -793,7 +801,7 @@ class Agent:
         if cancelled:
             return "job %s → cancelled" % claim["job"]["id"]
         if reason.startswith("checkpoint") and not note:
-            return "job %s → waiting_input (%s)" % (claim["job"]["id"], reason)
+            return "job %s → %s (%s)" % (claim["job"]["id"], event_type, reason)
         return "job %s → blocked (%s)" % (claim["job"]["id"], reason)
 
     def _fenced(self, job_id, plan_key, reason, note=""):
