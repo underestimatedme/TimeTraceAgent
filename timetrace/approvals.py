@@ -180,10 +180,28 @@ def _git_denied(args_tokens: List[str]) -> str:
     return ""
 
 
+# The run's own result directory, written relative to the worktree
+# (`.timetrace/out/`, results.py): a relative reference to it, not preceded by
+# a path (`~/`, `$HOME/`, `../`), names a file inside the worktree.
+_TASK_OUTPUT_REF = re.compile(r"(?:^|(?<=[\s'\"=:]))(?:\./)?\.timetrace/out(?:\.prev-[\w.-]+)?(?=$|[\s'\"/])")
+_CHANGES_DIRECTORY = re.compile(r"(?:^|[\s;&|(`])(?:cd|pushd|popd)(?:$|\s)")
+
+
+def _task_output_is_local(root: str) -> bool:
+    """The output directory resolves inside the worktree (or does not exist
+    yet); a symlink the model planted elsewhere does not qualify."""
+    return _inside(os.path.realpath(os.path.join(root, ".timetrace", "out")), root)
+
+
 def _scrub(text: str, root: str) -> str:
     """`text` with the worktree's own absolute path replaced by ".", so the
-    credential pattern (which matches `.timetrace/`) sees only other paths."""
-    return str(text).replace(root + os.sep, "./").replace(root, ".")
+    credential pattern (which matches `.timetrace/`) sees only other paths.
+    A relative reference to the run's output directory is also inside the
+    worktree, unless the command changes directory first."""
+    text = str(text).replace(root + os.sep, "./").replace(root, ".")
+    if not _CHANGES_DIRECTORY.search(text) and _task_output_is_local(root):
+        text = _TASK_OUTPUT_REF.sub("./task-output", text)
+    return text
 
 
 def _bash(command: str, root: str, home: str) -> Verdict:

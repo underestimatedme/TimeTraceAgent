@@ -62,6 +62,33 @@ class RuleTableTest(unittest.TestCase):
         self.check("Bash", {"command": "cat %s/../../config.json" % self.root}, DENY)
         self.check("Read", {"file_path": str(self.home / ".timetrace" / "timetrace.db")}, DENY)
 
+    def test_the_task_output_dir_is_part_of_the_worktree(self):
+        # 2026-11-11 Roomy run 146d333a: copying its own .timetrace/out/sec5-7.md
+        # into docs/ was denied as "访问凭据" because the text rule matched the
+        # relative ".timetrace/" in the command.
+        (self.root / ".timetrace" / "out").mkdir(parents=True)
+        self.check("Bash", {"command": "cp .timetrace/out/sec5-7.md docs/appstore/sec-new.tmp && echo ok"}, ASK)
+        self.check("Bash", {"command": "mv .timetrace/out/sec5-7.md docs/appstore/sec-new.tmp"}, ASK)
+        self.check("Bash", {"command": "cat .timetrace/out/result.json"}, ALLOW)
+        self.check("Bash", {"command": "cat ./.timetrace/out/result.json"}, ALLOW)
+        self.check("Bash", {"command": "ls .timetrace/out.prev-20261111"}, ALLOW)
+
+    def test_task_output_dir_exemption_stays_narrow(self):
+        (self.root / ".timetrace" / "out").mkdir(parents=True)
+        for command in ("cat ~/.timetrace/config.json", "cat $HOME/.timetrace/out/x",
+                        "cat .timetrace/config.json", "cat .timetrace/outbox/x",
+                        "cd ~ && cat .timetrace/out/x", "pushd .. ; cat .timetrace/out/x",
+                        "cat ../../.timetrace/out/x", "cat %s/../../.timetrace/out/x" % self.root,
+                        "cat .ssh/id_rsa .timetrace/out/x"):
+            self.check("Bash", {"command": command}, DENY)
+
+    def test_a_symlinked_task_output_dir_is_still_a_credential_path(self):
+        (self.root / ".timetrace").mkdir(parents=True)
+        (self.home / ".timetrace" / "secrets").mkdir(parents=True)
+        os.symlink(self.home / ".timetrace" / "secrets", self.root / ".timetrace" / "out")
+        self.check("Bash", {"command": "cp .timetrace/out/token docs/x"}, DENY)
+        self.check("Bash", {"command": "cat .timetrace/out/token"}, DENY)
+
     def test_reads_inside_are_allowed_and_outside_ask(self):
         self.check("Read", {"file_path": str(self.root / "src" / "a.py")}, ALLOW)
         self.check("Grep", {"pattern": "x", "path": str(self.root)}, ALLOW)
