@@ -4,6 +4,12 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.6：审批请求走独立的回报通道
+
+新的审批请求不再排在其他慢上传后面：每个运行中的任务有一条独立通道，请求一产生就入队，并连同该次执行尚未确认的事件一起上传（单次 2.5 秒超时、立即重试一次，同一次执行最多 3 个上传同时进行），不再占用全局上传锁。未能发出的事件按原有退避继续重试；服务端拒绝（HTTP 409）时仍然只保留、低频重试、不丢弃。事件内容、序号和协议不变，服务端无需先升级，执行协议仍为 2。Agent 日志新增 `slow upload` 与 `approval request waited` 两类耗时行（只含耗时和任务编号），用来判断慢在本机还是服务端。服务端本身变慢或不可用时，本机无法更快送达。详见 [0.6.6 发布说明](docs/releases/0.6.6.md)。
+
+升级：`brew update && brew upgrade timetraceagent`，然后执行 `timetrace agent install` 和 `timetrace agent doctor`。
+
 ## 0.6.5：本地队列可与在线 Agent 并存，登录诊断更准确
 
 - `timetrace run` 现在可以在在线的 `timetrace agent run` 旁边运行本地队列，两边共用执行槽位，合计不超过上限；Agent 与并存队列对 `agent.lock` 持共享锁，0.6.4 及更早版本的 `timetrace run`／`timetrace agent run`（独占加锁）因此在新版本在线期间拿不到锁，不会重置或重复运行正在执行的任务。**Agent 和队列都要先升到 0.6.5**；旧版 Agent 在线时队列拒绝并存。升级顺序、回滚和暂停状态的处理见 [docs/queue-beside-agent-upgrade.md](docs/queue-beside-agent-upgrade.md)。
