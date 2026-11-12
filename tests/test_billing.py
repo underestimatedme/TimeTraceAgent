@@ -183,6 +183,19 @@ class CodexVerificationTest(unittest.TestCase):
         self.assertEqual(self.verify("Not logged in\n", code=1).reason, "not_logged_in")
         self.assertEqual(self.verify("something else", code=0).reason, "auth_status_unparseable")
 
+    def test_nonzero_exit_never_trusts_the_success_phrase(self):
+        # Only exit 0 may verify, whatever the text says (mirrors the Claude rule).
+        for code in (1, 2, 126, 127, 137, -9, 255):
+            verdict = self.verify("Logged in using ChatGPT\n", code=code,
+                                  auth={"auth_mode": "chatgpt", "OPENAI_API_KEY": None})
+            self.assertFalse(verdict.verified, "exit %d verified" % code)
+            self.assertNotEqual(verdict.reason, "", "exit %d has no reason" % code)
+
+    def test_nonzero_exit_keeps_the_api_key_refusal(self):
+        verdict = self.verify("Logged in using an API key\n", code=1)
+        self.assertFalse(verdict.verified)
+        self.assertEqual(verdict.reason, "auth_method_not_subscription:api_key")
+
 
 class VerifierCacheTest(unittest.TestCase):
     def test_caches_within_ttl_and_reverifies_after(self):

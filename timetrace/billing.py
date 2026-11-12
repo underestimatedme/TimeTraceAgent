@@ -168,7 +168,7 @@ def verify_codex(cfg: Mapping[str, object], run: Callable[[Sequence[str], float]
     except Exception as exc:
         return _unverified("codex", "auth_status_unavailable:" + type(exc).__name__, mode, now)
     text = output.lower()
-    if "logged in using chatgpt" in text:
+    if code == 0 and "logged in using chatgpt" in text:
         return BillingVerdict(provider="codex", verified=True, reason="", auth_method="chatgpt", verified_at=now)
     if "api key" in text:
         return _unverified("codex", "auth_method_not_subscription:api_key", "api_key", now)
