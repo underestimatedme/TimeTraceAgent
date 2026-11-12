@@ -50,6 +50,15 @@ STOPPED = "runner_stopped"
 # While an AI process runs, a failed renewal or gate check is retried as long
 # as the current lease has more than this left; only then is the run stopped.
 RENEW_HOLD_MARGIN_SECONDS = 15.0
+# An approval request or control acknowledgement that arrived while another
+# request was in flight is reported before the next lease renewal, which can
+# itself take seconds. The renewal is held back at most this long past its due
+# time, and never when the lease has less than twice this left.
+REPORT_BEFORE_RENEW_SECONDS = 3.0
+# An upload, or an approval request waiting to be queued, that takes this long
+# is written to the Agent log (timings and ids only, never event content), so a
+# slow approval can be placed on this computer or on Valley.
+SLOW_UPLOAD_LOG_SECONDS = 2.0
 # How long shutdown waits for workers after cancelling them. launchd sends
 # SIGKILL ExitTimeOut (20 s) after SIGTERM; a killed tool group takes ≤ 2 s.
 SHUTDOWN_GRACE_SECONDS = 15
@@ -233,6 +242,7 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
+        self._flush_post, self._flush_batches = 0.0, 0
         # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
         # (remote_outbox_retry), so a restart keeps every batch's waiting time.
         self._outbox_failures_logged = {}
@@ -1190,6 +1200,11 @@ class Agent:
                         break
                     except TimeoutError:
                         if time.time() >= next_renew:
+                            now = time.time()
+                            if (control is not None and control.started and control.wakeup.is_set()
+                                    and now < next_renew + REPORT_BEFORE_RENEW_SECONDS
+                                    and deadline - now > 2 * REPORT_BEFORE_RENEW_SECONDS):
+                                continue  # report what arrived while the last request was in flight
                             if not reason:
                                 deadline, reason = self._renew_running(claim, adapter, deadline, control)
                                 if reason:
@@ -2083,7 +2098,13 @@ class Agent:
         if control is not None and getattr(control, "started", False):
             # Control acknowledgements and approval requests come first:
             # they happened before whatever this call reports.
-            events = control.take_events() + list(events)
+            taken = control.take_events()
+            for event in taken:
+                if event.get("type") == "approval_requested":
+                    lag = time.monotonic() - control.emitted_at.pop(event.get("request_id"), time.monotonic())
+                    if lag >= SLOW_UPLOAD_LOG_SECONDS:
+                        self.log("approval request waited %.1fs before it was queued (job %s)" % (lag, job_id))
+            events = taken + list(events)
         # A job with a control has side events (protocol 2) between
         # `running` and its terminal event: each event takes the next
         # sequence number. Other jobs keep their fixed numbers (a replayed
@@ -2223,8 +2244,18 @@ class Agent:
 
     def flush_outbox(self) -> None:
         # Parallel jobs flush too: one batch is never sent twice at once.
+        asked = time.monotonic()
         with self._flush_lock:
-            self._flush_outbox()
+            got = time.monotonic()
+            self._flush_post = 0.0
+            self._flush_batches = 0
+            try:
+                self._flush_outbox()
+            finally:
+                lock_wait, post = got - asked, self._flush_post
+                if lock_wait + (time.monotonic() - got) >= SLOW_UPLOAD_LOG_SECONDS:
+                    self.log("slow upload: lock_wait=%.1fs post=%.1fs batches=%d (waited for this computer's own flush "
+                             "lock, then sent to Valley)" % (lock_wait, post, self._flush_batches))
 
     def _flush_outbox(self) -> None:
         batches = {}
@@ -2247,8 +2278,13 @@ class Agent:
             # Pairing/refresh problems are not this batch's fault: they still
             # propagate to the claim loop's own handling.
             token = self.access_token()
+            posted = time.monotonic()
             try:
-                self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+                self._flush_batches += 1
+                try:
+                    self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+                finally:
+                    self._flush_post += time.monotonic() - posted
             except CloudError as exc:
                 if exc.status == 401:
                     raise

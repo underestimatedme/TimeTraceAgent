@@ -48,6 +48,8 @@ class RunControl:
         self.started = False
         self._cond = threading.Condition()
         self._events: List[Dict[str, Any]] = []
+        # request_id -> when the Runner asked (monotonic): the Agent logs how long a request waited to be queued.
+        self.emitted_at: Dict[str, float] = {}
         self._seen_controls = set()
         self._queued: List[Tuple[str, str]] = []
         self._send: Optional[Callable[[str], bool]] = None
@@ -81,6 +83,8 @@ class RunControl:
 
     def _emit(self, event: Dict[str, Any]) -> None:
         """Caller holds self._cond."""
+        if event.get("type") == "approval_requested":
+            self.emitted_at[str(event.get("request_id"))] = time.monotonic()
         self._events.append(event)
         self.wakeup.set()
 
