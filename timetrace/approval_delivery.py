@@ -71,30 +71,24 @@ class ApprovalPump:
     def stop(self) -> None:
         """The job is over (RunControl.close() was called): let the uploads in
         flight finish - they are bounded - and release the threads."""
+        self.control.pending.set()  # do not make the job wait for the next idle tick
         self._thread.join(_STOP_WAIT_SECONDS)
         self._pool.shutdown(wait=True)
 
     # ---- the pump thread --------------------------------------------------
     def _run(self) -> None:
         control = self.control
-        control.delivering = True
-        try:
-            self._loop(control)
-        finally:
-            control.delivering = False
-
-    def _loop(self, control: Any) -> None:
         ticked = time.monotonic()
         while not control.closed:
-            control.wakeup.wait(_IDLE_WAKE_SECONDS)
+            control.pending.wait(_IDLE_WAKE_SECONDS)
             if control.closed:
                 break
-            if not control.started:
+            if control.pending.is_set() and not control.started:
+                time.sleep(.05)
                 continue
-            if not control.wakeup.is_set():
+            if not control.pending.is_set():
                 # Nothing new: events the fast tries could not send are retried
-                # on the normal backoff (the supervising loop no longer flushes
-                # control events itself while this pump delivers them).
+                # on the normal backoff.
                 if time.monotonic() - ticked >= _RETRY_TICK_SECONDS:
                     ticked = time.monotonic()
                     try:
@@ -117,9 +111,11 @@ class ApprovalPump:
                 self._again = True
                 return
             self._inflight += 1
+        self.agent.fast_begin(self.claim)  # before the thread starts: the normal flush must see it
         try:
             self._pool.submit(self._upload, force)
         except RuntimeError:  # pool already shut down: the job is over
+            self.agent.fast_end(self.claim)
             with self._lock:
                 self._inflight -= 1
 
@@ -129,6 +125,7 @@ class ApprovalPump:
         except Exception as exc:
             self.agent.log("approval upload: %s" % type(exc).__name__)
         finally:
+            self.agent.fast_end(self.claim)
             with self._lock:
                 self._inflight -= 1
                 again, self._again = self._again, False

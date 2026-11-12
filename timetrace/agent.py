@@ -248,6 +248,9 @@ class Agent:
         # Sequence numbers of one attempt are allocated one caller at a time (the
         # supervising loop and the approval pump both queue events).
         self._report_lock = threading.Lock()
+        # attempts with an approval-path upload in flight; the normal flush waits for them (bounded)
+        self._fast_cond = threading.Condition()
+        self._fast_inflight = {}
         # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
         # (remote_outbox_retry), so a restart keeps every batch's waiting time.
         self._outbox_failures_logged = {}
@@ -1201,8 +1204,7 @@ class Agent:
                         else:
                             # Wake for approval requests / acknowledgements too.
                             control.wakeup.wait(max(.001, min(next_renew - time.time(), 1.0)))
-                            if (control.started and control.wakeup.is_set() and not future.done()
-                                    and not control.delivering):
+                            if control.started and control.wakeup.is_set() and not future.done():
                                 self._report(claim, [])
                             result = future.result(timeout=0)
                         break
@@ -2278,6 +2280,11 @@ class Agent:
             retry = self.db.remote_event_retry(job, attempt, epoch)
             if retry is not None and time.time() < retry["retry_at"]:
                 continue
+            if self._fast_inflight.get(key):
+                self._wait_fast(key)
+                rows = self.db.pending_remote_events_for(job, attempt, epoch)
+                if not rows:
+                    continue
             rows.sort(key=lambda row: row["seq"])
             # Pairing/refresh problems are not this batch's fault: they still
             # propagate to the claim loop's own handling.
@@ -2343,13 +2350,47 @@ class Agent:
             return self.cloud.append_events(token, job, attempt, epoch, payloads, timeout=timeout)
         return self.cloud.append_events(token, job, attempt, epoch, payloads)
 
+    # Result events (the end of a run) never take the approval path: they keep
+    # the normal flush, in one piece, exactly as before.
+    _RESULT_EVENT_TYPES = ("completed", "failed", "cancelled", "waiting_quota", "waiting_local_auth", "waiting_input")
+
+    def _fast_rows(self, key):
+        """The attempt's unacknowledged events up to, not including, its first result event."""
+        rows = []
+        for row in self.db.pending_remote_events_for(*key):
+            if row["payload"].get("type") in self._RESULT_EVENT_TYPES:
+                break
+            rows.append(row)
+        return rows
+
     def _upload_due(self, claim) -> bool:
         """Events of this attempt wait and their backoff (if any) has run out."""
         key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
         retry = self.db.remote_event_retry(*key)
         if retry is not None and time.time() < retry["retry_at"]:
             return False
-        return bool(self.db.pending_remote_events_for(*key))
+        return bool(self._fast_rows(key))
+
+    def fast_begin(self, claim) -> None:
+        key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        with self._fast_cond:
+            self._fast_inflight[key] = self._fast_inflight.get(key, 0) + 1
+
+    def fast_end(self, claim) -> None:
+        key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        with self._fast_cond:
+            self._fast_inflight[key] -= 1
+            if not self._fast_inflight[key]:
+                del self._fast_inflight[key]
+            self._fast_cond.notify_all()
+
+    def _wait_fast(self, key) -> None:
+        """The normal flush lets an approval-path upload of the same attempt finish first (it is bounded),
+        so the two do not send the same events side by side."""
+        limit = time.monotonic() + approval_delivery.APPROVAL_UPLOAD_TIMEOUT_SECONDS * approval_delivery.APPROVAL_UPLOAD_ATTEMPTS + 1
+        with self._fast_cond:
+            while self._fast_inflight.get(key, 0) and time.monotonic() < limit:
+                self._fast_cond.wait(max(.01, limit - time.monotonic()))
 
     def _upload_attempt(self, claim, force: bool = True) -> None:
         """Approval path (see approval_delivery): send this attempt's whole
@@ -2366,7 +2407,11 @@ class Agent:
         # earlier, slower failure set: events are rare and small, and this is
         # how "the old upload is slow" is told from "Valley is down" (the two
         # bounded tries below fail fast when Valley is down).
-        rows = self.db.pending_remote_events_for(*key)
+        self._upload_rows(key, retry)
+
+    def _upload_rows(self, key, retry) -> None:
+        job, attempt, epoch = key
+        rows = self._fast_rows(key)
         if not rows:
             return
         payloads, failure = [row["payload"] for row in rows], None
