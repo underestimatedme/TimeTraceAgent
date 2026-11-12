@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 
 @dataclass(frozen=True)
@@ -204,6 +204,58 @@ def tool_slot_lock(home, tool: str, index: int) -> FileLock:
     Claude and Codex jobs run side by side up to their own limits."""
     name = re.sub(r"[^a-z0-9_-]", "_", str(tool).lower())[:32] or "_"
     return FileLock(str(_locks_dir(home) / ("coding-slot-%s-%d.lock" % (name, int(index)))))
+
+
+class SlotLimits(NamedTuple):
+    """The limits the cloud agent's jobs obey: `overall` coding slots (`max_parallel`) and, when per-tool
+    limits are configured, `per_tool[tool]` slots of the tool's own."""
+    overall: int
+    per_tool: Optional[Dict[str, int]] = None
+
+
+class ToolSlotBusy(LockBusy):
+    """Every slot of the job's tool is taken (or fenced)."""
+
+    def __init__(self, tool: str, cause: Exception):
+        super().__init__(str(cause))
+        self.tool, self.cause = tool, cause
+
+
+def first_free(locks):
+    """The first lock of `locks` that can be taken. A lock with a crash fence is skipped (it stays fenced
+    for manual recovery); only when none is free does a fence surface, as UnclearedOwner."""
+    busy = fenced = None
+    for lock in locks:
+        try:
+            return lock.acquire()
+        except UnclearedOwner as exc:
+            fenced = fenced or exc
+        except LockBusy as exc:
+            busy = exc
+    raise fenced or busy
+
+
+def acquire_job_slots(home, tool: Optional[str], limits: Optional[SlotLimits] = None) -> List[FileLock]:
+    """The slots one local job holds, in the order the agent takes its own: the tool's slot, then the first
+    free overall slot, so a queue task beside an online agent stays inside the same limits. Without `limits`
+    only overall slot 0 is taken (the original local-only fence). A failure never leaves a slot taken;
+    raises ToolSlotBusy / LockBusy / UnclearedOwner."""
+    if limits is None:
+        return [coding_slot_lock(home).acquire()]
+    held: List[FileLock] = []
+    if tool is not None and limits.per_tool is not None:
+        count = max(1, int(limits.per_tool.get(tool, 1)))
+        try:
+            held.append(first_free([tool_slot_lock(home, tool, i) for i in range(count)]))
+        except LockBusy as exc:
+            raise ToolSlotBusy(tool, exc) from exc
+    try:
+        held.append(first_free([coding_slot_lock(home, i) for i in range(max(1, int(limits.overall)))]))
+    except BaseException:
+        for lock in reversed(held):
+            lock.release()
+        raise
+    return held
 
 
 def plan_lock(home, plan_key: str) -> FileLock:

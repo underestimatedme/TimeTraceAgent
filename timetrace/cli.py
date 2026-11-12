@@ -25,7 +25,7 @@ from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
-from timetrace.dispatch import adapter_capabilities, lock_diagnostics
+from timetrace.dispatch import SlotLimits, adapter_capabilities, lock_diagnostics
 from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, FAILED, RUNNABLE, RUNNING, TOOLS,
                          Sample)
 
@@ -51,14 +51,86 @@ def _cloud(cfg: Dict[str, Any]) -> CloudClient:
     return CloudClient(str(cfg["cloud_base_url"]), device_id=device_identity(config.home()))
 
 
-def _acquire_execution_lock(home: Path):
-    lock_file = open(home / "agent.lock", "a+")
+def _flock_file(path: Path):
+    lock_file = open(path, "a+")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock_file.close()
         return None
     return lock_file
+
+
+def _acquire_execution_lock(home: Path):
+    """The process-wide lock of the online agent daemon (`timetrace agent run`)."""
+    return _flock_file(home / "agent.lock")
+
+
+_AGENT_RUN = re.compile(r"\btimetrace\b.*\bagent\s+run\b")
+
+
+def _agent_daemon_holds_lock(home: Path) -> bool:
+    """True when every other process that has agent.lock open is a running `timetrace agent run`.
+    Best effort and read-only (lsof, ps): anything unreadable or unrecognised is False, which keeps
+    the queue out exactly as before."""
+    try:
+        listed = subprocess.run(["lsof", "-t", "--", str(Path(home) / "agent.lock")],
+                                capture_output=True, text=True, timeout=10).stdout.split()
+        pids = sorted({int(p) for p in listed if p.isdigit()} - {os.getpid()})
+        if not pids:
+            return False
+        for pid in pids:
+            command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                     capture_output=True, text=True, timeout=10).stdout
+            if not _AGENT_RUN.search(command):
+                return False
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+class _SchedulerGuard:
+    """What lets the local queue (`timetrace run`) run.
+
+    Its own lock keeps two queues apart. Then either it takes the process-wide agent.lock, as it always
+    did (nothing else is running: mode "exclusive", which also keeps an agent from starting beside it),
+    or that lock is held by an online agent daemon and the queue runs beside it (mode "beside-agent"),
+    where it must obey the shared coding-slot limits (see scheduler._dispatch). A lock held by anything
+    that is not an agent daemon, such as another queue of an older version, keeps the queue out."""
+
+    def __init__(self, home: Path):
+        self.home = Path(home)
+        self.mode: Optional[str] = None
+        self._role = None
+        self._agent = None
+
+    def acquire(self) -> Optional[str]:
+        self._role = _flock_file(self.home / "scheduler.lock")
+        if self._role is None:
+            return "error: another timetrace scheduler is already running"
+        err = self.refresh()
+        if err:
+            self.release()
+        return err
+
+    def refresh(self) -> Optional[str]:
+        """Call before each pass: an agent that went away is replaced by this queue holding agent.lock itself,
+        so an older queue cannot slip in behind it; a lock taken by something else stops this queue."""
+        if self._agent is None:
+            self._agent = _acquire_execution_lock(self.home)
+        if self._agent is not None:
+            self.mode = "exclusive"
+            return None
+        if _agent_daemon_holds_lock(self.home):
+            self.mode = "beside-agent"
+            return None
+        return "error: another timetrace agent is already running"
+
+    def release(self) -> None:
+        for f in (self._agent, self._role):
+            if f is not None:
+                f.close()
+        self._agent = self._role = self.mode = None
 
 
 def _pair_link(user_code: str, name: str, expires_at: Optional[int] = None) -> str:
@@ -1231,33 +1303,44 @@ def cmd_ls(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
-    lock_file = _acquire_execution_lock(home)
-    if lock_file is None:
-        print("error: another timetrace agent is already running", file=sys.stderr)
+    guard = _SchedulerGuard(home)
+    err = guard.acquire()
+    if err:
+        print(err, file=sys.stderr)
         return 1
     adapters = _adapters(cfg)
     interval = args.interval or int(cfg.get("interval_sec", 30))
-    _log("timetrace %s daemon, home=%s, interval=%ss%s" % (
-        __version__, home, interval, ", once" if args.once else ""))
-    _recover_running(db)
-    while True:
-        try:
-            out = scheduler.run_once(db, adapters, cfg, home, log=_log)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:  # keep the daemon alive; the event log has the details
-            out = "loop error: %s" % exc
-            db.add_event("loop_error", payload={"error": str(exc)})
-        if out != "idle":
-            _log(out)
-        if args.once:
-            return 0
-        try:
-            time.sleep(interval if out in ("idle", "circuit open") or out.startswith("loop error")
-                       else 1)
-        except KeyboardInterrupt:
-            _log("stopped")
-            return 0
+    limits = SlotLimits(_max_parallel(cfg), _max_parallel_per_tool(cfg))
+    _log("timetrace %s daemon, home=%s, interval=%ss%s%s" % (
+        __version__, home, interval, ", once" if args.once else "",
+        ", beside an online agent (shared coding slots)" if guard.mode == "beside-agent" else ""))
+    try:
+        _recover_running(db)
+        while True:
+            err = guard.refresh()
+            if err:
+                print(err, file=sys.stderr)
+                return 1
+            try:
+                out = scheduler.run_once(db, adapters, cfg, home, log=_log,
+                                         slots=limits if guard.mode == "beside-agent" else None)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # keep the daemon alive; the event log has the details
+                out = "loop error: %s" % exc
+                db.add_event("loop_error", payload={"error": str(exc)})
+            if out != "idle":
+                _log(out)
+            if args.once:
+                return 0
+            try:
+                time.sleep(interval if out in ("idle", "circuit open") or out.startswith("loop error")
+                           else 1)
+            except KeyboardInterrupt:
+                _log("stopped")
+                return 0
+    finally:
+        guard.release()
 
 
 def _recover_running(db: Database) -> None:

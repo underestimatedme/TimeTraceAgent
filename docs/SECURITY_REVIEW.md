@@ -370,16 +370,27 @@ A folder workspace has no git history to isolate a run in, so the control is
   serialized by locks, so parallel jobs never race a token rotation or send
   one batch twice. Upkeep (quota, inventory) stays on the loop thread.
 - Locks: `coding-slot.lock`, `coding-slot-1.lock` … (at most `max_parallel`
-  jobs from the agent; the local scheduler uses slot 0 only). An AI job
+  jobs from the agent; the local queue alone uses slot 0 only, beside an agent it takes the first free one). An AI job
   (task, chat or review turn) first takes one of its provider's own slots,
   `coding-slot-<tool>-<i>.lock` (i < `max_parallel_per_tool[tool]`, a tool
   not named gets 1), then an overall slot; a failure on the second releases
   the first. Per-tool slots have the same crash fence, skip-if-fenced and
   shutdown release as the overall ones; a job whose tool is full is deferred
   ("tool busy: <tool>") like one that finds the runner full.
-  Scheduler runs (`timetrace run`) and agent jobs (`timetrace agent run`) never
-  overlap: both take the process-wide `agent.lock`, so only one of the two
-  daemons runs at a time. A slot left with a crash fence is skipped while
+  The local queue (`timetrace run`) and the agent (`timetrace agent run`) never
+  exceed those limits together. The agent daemon holds the process-wide
+  `agent.lock` for its whole life. The queue holds its own `scheduler.lock` (two
+  queues never run at once) and then either takes `agent.lock` itself, when no
+  agent is online (this keeps an agent from starting beside it, as before), or,
+  when `agent.lock` is held by a running `timetrace agent run` (found with
+  `lsof` and `ps`, read-only), runs **beside** the agent: each queue task then
+  takes a slot of its tool and the first free overall slot, in the order and
+  from the same pools the agent's jobs use, so the combined concurrency stays
+  within `max_parallel` and `max_parallel_per_tool`. A lock held by anything
+  that is not an agent daemon (for example an older `timetrace run`) or one
+  that cannot be identified keeps the queue out with the original error. When
+  the agent leaves, the queue takes `agent.lock` itself on its next pass. A
+  slot left with a crash fence is skipped while
   another slot is free; the fence surfaces (manual recovery) only when no
   slot is free. *Known limitation:* a job deferred because every slot is
   busy or fenced is not handed back to Valley early — releasing a claim

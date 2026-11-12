@@ -231,6 +231,8 @@ timetrace events [--type task_blocked]
 
 前台：`timetrace run`（本地队列）或 `timetrace agent run`（手机远程派发）。后台用 launchd：
 
+在线 Agent 常驻时，`timetrace run` 会在它旁边运行本地队列，并与 Agent 共用同一组执行槽位（`max_parallel`、`max_parallel_per_tool`），两边合计不会超过上限；不用停止 Agent。两个本地队列不会同时运行；`agent.lock` 被不是在线 Agent 的进程占着时，仍报 `another timetrace agent is already running`。
+
 ```sh
 timetrace agent install              # 写入 ~/Library/LaunchAgents/com.atlaspaces.timetrace.agent.plist 并加载
 tail -f ~/.timetrace/daemon.log
