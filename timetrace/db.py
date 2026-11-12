@@ -272,6 +272,19 @@ class Database:
             result.append(item)
         return result
 
+    def pending_remote_events_for(self, job: str, attempt: str, epoch: int) -> List[Dict[str, Any]]:
+        """The unacknowledged events of one attempt, in sequence order: the batch
+        that is safe to (re)send, because Valley skips what it already holds."""
+        rows = self.conn.execute(
+            "SELECT * FROM remote_outbox WHERE job_id=? AND attempt_id=? AND lease_epoch=?"
+            " AND sent_at IS NULL AND abandoned_at IS NULL ORDER BY seq", (job, attempt, epoch)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            result.append(item)
+        return result
+
     def mark_remote_event_sent(self, event_id: int, now: Optional[int] = None) -> None:
         self.conn.execute("UPDATE remote_outbox SET sent_at=? WHERE id=?", (now or _now(), event_id))
         self._release_failed_plans([event_id])

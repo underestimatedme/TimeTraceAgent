@@ -46,6 +46,8 @@ class RunControl:
         self.renew_after: Optional[float] = None
         # Set once the job reported `running`: events may be sent from then on.
         self.started = False
+        # True while an ApprovalPump delivers this run's control events promptly (approval_delivery.py).
+        self.delivering = False
         self._cond = threading.Condition()
         self._events: List[Dict[str, Any]] = []
         # request_id -> when the Runner asked (monotonic): the Agent logs how long a request waited to be queued.
@@ -166,6 +168,10 @@ class RunControl:
     @property
     def finished(self) -> bool:
         return self._finished
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def close(self) -> None:
         """The job is over: stop every wait for a decision."""
