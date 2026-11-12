@@ -2280,7 +2280,7 @@ class Agent:
             retry = self.db.remote_event_retry(job, attempt, epoch)
             if retry is not None and time.time() < retry["retry_at"]:
                 continue
-            if self._fast_inflight.get(key):
+            if self._fast_live(key):
                 self._wait_fast(key)
                 rows = self.db.pending_remote_events_for(job, attempt, epoch)
                 if not rows:
@@ -2374,23 +2374,36 @@ class Agent:
     def fast_begin(self, claim) -> None:
         key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
         with self._fast_cond:
-            self._fast_inflight[key] = self._fast_inflight.get(key, 0) + 1
+            self._fast_inflight.setdefault(key, []).append(
+                time.monotonic() + approval_delivery.APPROVAL_UPLOAD_STUCK_AFTER_SECONDS)
 
     def fast_end(self, claim) -> None:
         key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
         with self._fast_cond:
-            self._fast_inflight[key] -= 1
-            if not self._fast_inflight[key]:
-                del self._fast_inflight[key]
+            marks = self._fast_inflight.get(key)
+            if marks:
+                marks.pop(0)
+                if not marks:
+                    del self._fast_inflight[key]
             self._fast_cond.notify_all()
 
-    def _wait_fast(self, key) -> None:
-        """The normal flush lets an approval-path upload of the same attempt finish first (it is bounded),
-        so the two do not send the same events side by side."""
-        limit = time.monotonic() + approval_delivery.APPROVAL_UPLOAD_TIMEOUT_SECONDS * approval_delivery.APPROVAL_UPLOAD_ATTEMPTS + 1
+    def _fast_live(self, key):
+        """Deadlines of this attempt's approval-path uploads that still count (a stuck one expires)."""
+        now = time.monotonic()
         with self._fast_cond:
-            while self._fast_inflight.get(key, 0) and time.monotonic() < limit:
-                self._fast_cond.wait(max(.01, limit - time.monotonic()))
+            return [d for d in self._fast_inflight.get(key, ()) if d > now]
+
+    def _wait_fast(self, key) -> None:
+        """The normal flush lets an approval-path upload of the same attempt finish first, so the two
+        do not send the same events side by side. The wait ends at the latest deadline: a stuck
+        upload never makes a flush wait more than APPROVAL_UPLOAD_STUCK_AFTER_SECONDS."""
+        with self._fast_cond:
+            while True:
+                now = time.monotonic()
+                live = [d for d in self._fast_inflight.get(key, ()) if d > now]
+                if not live:
+                    return
+                self._fast_cond.wait(max(.01, max(live) - now))
 
     def _upload_attempt(self, claim, force: bool = True) -> None:
         """Approval path (see approval_delivery): send this attempt's whole
@@ -2424,7 +2437,10 @@ class Agent:
                 if exc.status == 401:
                     return
                 if exc.status == 409:
-                    self._refuse_batch(key)
+                    # Only a real refusal backs off: another upload may already have got these events
+                    # acknowledged (Valley then skips them, so 409 cannot come from a replay).
+                    if self._still_pending(rows):
+                        self._refuse_batch(key)
                     return
                 failure = exc
             except Exception as exc:

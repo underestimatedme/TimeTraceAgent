@@ -12,14 +12,16 @@ What it does. One `ApprovalPump` per running job with a RunControl:
 
 - a thread of its own wakes the moment the RunControl has an event, queues it
   in the durable outbox (same `_report` as before, under a lock that keeps
-  sequence numbers allocated one at a time), and hands the attempt to a small
-  pool of uploaders;
+  sequence numbers allocated one at a time), and hands the attempt to a few
+  daemon upload threads;
 - an uploader sends that attempt's whole unacknowledged tail (a cumulative
   batch) with a short per-request timeout and one immediate retry. It takes
   neither the global flush lock nor anyone else's batch, so a slow or stuck
   upload elsewhere cannot hold it;
-- at most `APPROVAL_UPLOAD_MAX_INFLIGHT` uploads of one attempt are in flight;
-  more events coalesce into the next one.
+- at most `APPROVAL_UPLOAD_MAX_INFLIGHT` uploads of one attempt are in flight; a new
+  event always goes out beside them, a quiet retry only when none is in flight, and
+  more events than slots coalesce into the next upload. stop() waits a fixed, short
+  time, never for an upload that does not return.
 
 What it relies on, and what it does not change. Valley applies an attempt's
 events strictly in sequence and skips every event at or below the sequence it
@@ -38,8 +40,7 @@ flush's backoff.
 """
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 
 # Budget (Runner asks -> Valley holds it): 10 s end to end, minus the page's 4 s
@@ -51,17 +52,19 @@ APPROVAL_UPLOAD_ATTEMPTS = 2
 APPROVAL_UPLOAD_MAX_INFLIGHT = 3
 _IDLE_WAKE_SECONDS = 0.5
 _RETRY_TICK_SECONDS = 1.0
-_STOP_WAIT_SECONDS = APPROVAL_UPLOAD_TIMEOUT_SECONDS * APPROVAL_UPLOAD_ATTEMPTS + 2
+# A socket timeout is not a wall-clock deadline (a trickling response or a credential
+# wait can outlast it). An upload older than this stops counting against the slots
+# and against the normal flush's wait, and stop() never waits longer than STOP_WAIT.
+APPROVAL_UPLOAD_STUCK_AFTER_SECONDS = APPROVAL_UPLOAD_TIMEOUT_SECONDS * APPROVAL_UPLOAD_ATTEMPTS + 3
+APPROVAL_PUMP_STOP_WAIT_SECONDS = 1.0
 
 
 class ApprovalPump:
     def __init__(self, agent: Any, claim: Dict[str, Any], control: Any):
         self.agent, self.claim, self.control = agent, claim, control
         self._lock = threading.Lock()
-        self._inflight = 0
+        self._uploads: List[Any] = []        # [thread, started (monotonic)]
         self._again = False
-        self._pool = ThreadPoolExecutor(max_workers=APPROVAL_UPLOAD_MAX_INFLIGHT,
-                                        thread_name_prefix="approval-upload")
         self._thread = threading.Thread(target=self._run, name="approval-pump", daemon=True)
 
     def start(self) -> "ApprovalPump":
@@ -69,11 +72,17 @@ class ApprovalPump:
         return self
 
     def stop(self) -> None:
-        """The job is over (RunControl.close() was called): let the uploads in
-        flight finish - they are bounded - and release the threads."""
+        """The job is over (RunControl.close() was called). Waits a short, fixed time
+        for the pump and for uploads in flight, never for a stuck one: the threads are
+        daemons, an upload is idempotent, and whatever it did not finish stays queued
+        for the normal flush."""
         self.control.pending.set()  # do not make the job wait for the next idle tick
-        self._thread.join(_STOP_WAIT_SECONDS)
-        self._pool.shutdown(wait=True)
+        end = time.monotonic() + APPROVAL_PUMP_STOP_WAIT_SECONDS
+        self._thread.join(max(0.0, end - time.monotonic()))
+        with self._lock:
+            uploads = list(self._uploads)
+        for thread, _ in uploads:
+            thread.join(max(0.0, end - time.monotonic()))
 
     # ---- the pump thread --------------------------------------------------
     def _run(self) -> None:
@@ -88,7 +97,7 @@ class ApprovalPump:
                 continue
             if not control.pending.is_set():
                 # Nothing new: events the fast tries could not send are retried
-                # on the normal backoff.
+                # on the normal backoff, quietly (see _submit).
                 if time.monotonic() - ticked >= _RETRY_TICK_SECONDS:
                     ticked = time.monotonic()
                     try:
@@ -105,19 +114,28 @@ class ApprovalPump:
                 continue
             self._submit(force=True)
 
+    def _live(self) -> List[Any]:
+        """Uploads still counted: running, and not past the stuck limit. Caller holds the lock."""
+        now = time.monotonic()
+        self._uploads = [u for u in self._uploads if u[0].is_alive()]
+        return [u for u in self._uploads if now - u[1] < APPROVAL_UPLOAD_STUCK_AFTER_SECONDS]
+
     def _submit(self, force: bool = True) -> None:
+        """force: a new event, which goes out at once beside whatever is in flight (its batch is
+        the whole unacknowledged tail, so it carries older events too). A quiet retry (force=False)
+        starts only when nothing is in flight: it must neither resend the tail an upload is already
+        sending nor use up the slots a new approval needs."""
         with self._lock:
-            if self._inflight >= APPROVAL_UPLOAD_MAX_INFLIGHT:
+            live = self._live()
+            if not force and live:
+                return
+            if len(live) >= APPROVAL_UPLOAD_MAX_INFLIGHT:
                 self._again = True
                 return
-            self._inflight += 1
+            thread = threading.Thread(target=self._upload, args=(force,), name="approval-upload", daemon=True)
+            self._uploads.append([thread, time.monotonic()])
         self.agent.fast_begin(self.claim)  # before the thread starts: the normal flush must see it
-        try:
-            self._pool.submit(self._upload, force)
-        except RuntimeError:  # pool already shut down: the job is over
-            self.agent.fast_end(self.claim)
-            with self._lock:
-                self._inflight -= 1
+        thread.start()
 
     def _upload(self, force: bool) -> None:
         try:
@@ -127,7 +145,6 @@ class ApprovalPump:
         finally:
             self.agent.fast_end(self.claim)
             with self._lock:
-                self._inflight -= 1
                 again, self._again = self._again, False
             if again and not self.control.closed:
                 self._submit()
