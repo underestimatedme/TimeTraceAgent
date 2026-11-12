@@ -370,7 +370,7 @@ A folder workspace has no git history to isolate a run in, so the control is
   serialized by locks, so parallel jobs never race a token rotation or send
   one batch twice. Upkeep (quota, inventory) stays on the loop thread.
 - Locks: `coding-slot.lock`, `coding-slot-1.lock` … (at most `max_parallel`
-  jobs from the agent; the local queue alone uses slot 0 only, beside an agent it takes the first free one). An AI job
+  jobs from the agent; the local queue alone uses slot 0 only, beside an agent it takes slot 0 as well). An AI job
   (task, chat or review turn) first takes one of its provider's own slots,
   `coding-slot-<tool>-<i>.lock` (i < `max_parallel_per_tool[tool]`, a tool
   not named gets 1), then an overall slot; a failure on the second releases
@@ -384,9 +384,13 @@ A folder workspace has no git history to isolate a run in, so the control is
   agent is online (this keeps an agent from starting beside it, as before), or,
   when `agent.lock` is held by a running `timetrace agent run` (found with
   `lsof` and `ps`, read-only), runs **beside** the agent: each queue task then
-  takes a slot of its tool and the first free overall slot, in the order and
-  from the same pools the agent's jobs use, so the combined concurrency stays
-  within `max_parallel` and `max_parallel_per_tool`. A lock held by anything
+  takes tool slot 0 and overall slot 0, the same pools the agent's jobs use
+  and the only indices every agent configuration has: the queue never guesses
+  the agent's limits (remote configuration can lower `max_parallel` and
+  `max_parallel_per_tool` while the queue runs), so the combined concurrency
+  stays within them, and an older `timetrace run`, which fences on overall
+  slot 0 only, cannot run the same task while the queue holds it. The queue
+  therefore waits while an agent job holds slot 0 or that tool's slot 0. A lock held by anything
   that is not an agent daemon (for example an older `timetrace run`) or one
   that cannot be identified keeps the queue out with the original error. When
   the agent leaves, the queue takes `agent.lock` itself on its next pass. A

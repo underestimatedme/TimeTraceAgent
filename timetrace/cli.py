@@ -1310,7 +1310,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
     adapters = _adapters(cfg)
     interval = args.interval or int(cfg.get("interval_sec", 30))
-    limits = SlotLimits(_max_parallel(cfg), _max_parallel_per_tool(cfg))
+    # Beside an online agent the queue takes only tool slot 0 and overall slot 0: indices every agent
+    # configuration has, so it never has to guess the agent's limits (remote configuration can lower them at
+    # any time), and overall slot 0 is the slot an older `timetrace run` fences on.
+    limits = SlotLimits(overall=1, per_tool={})
     _log("timetrace %s daemon, home=%s, interval=%ss%s%s" % (
         __version__, home, interval, ", once" if args.once else "",
         ", beside an online agent (shared coding slots)" if guard.mode == "beside-agent" else ""))

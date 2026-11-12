@@ -94,7 +94,7 @@ class QueueAlongsideAgentTest(unittest.TestCase):
             code = cli.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def test_a_queued_task_runs_beside_an_online_agent_inside_the_shared_slots(self):
+    def queue_one_task(self):
         repo = Path(self.tmp.name) / "repo"
         repo.mkdir()
         for argv in (("init", "-q"), ("config", "user.email", "t@example.com"), ("config", "user.name", "t")):
@@ -105,31 +105,85 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         db = Database(self.home / "timetrace.db")
         db.add_task("do it", str(repo), tool="claude")
         db.close()
-        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
-        # the agent's own job holds overall slot 0 and one of claude's two tool slots
-        agent_slots = [coding_slot_lock(self.home, 0).acquire(), tool_slot_lock(self.home, "claude", 0).acquire()]
-        seen = {}
 
-        def probe():
-            for name, lock in (("tool0", tool_slot_lock(self.home, "claude", 0)), ("tool1", tool_slot_lock(self.home, "claude", 1)),
-                               ("all0", coding_slot_lock(self.home, 0)), ("all1", coding_slot_lock(self.home, 1))):
-                try:
-                    lock.acquire().release()
-                    seen[name] = "free"
-                except LockBusy:
-                    seen[name] = "held"
-        try:
-            with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", probe)}):
-                code, out, err = self.run_cli("run", "--once")
-        finally:
-            for lock in agent_slots:
-                lock.release()
-        self.assertEqual(code, 0, err)
-        # the queue took claude's OTHER tool slot and the first FREE overall slot: 2 of 2 tool slots, 2 of 4 overall
-        self.assertEqual(seen, {"tool0": "held", "tool1": "held", "all0": "held", "all1": "held"})
+    def task_state(self):
         db = Database(self.home / "timetrace.db")
-        self.assertEqual(db.get_task(1)["state"], DONE)
-        db.close()
+        try:
+            return db.get_task(1)["state"]
+        finally:
+            db.close()
+
+    def slot_states(self):
+        out = {}
+        for name, lock in (("tool0", tool_slot_lock(self.home, "claude", 0)), ("tool1", tool_slot_lock(self.home, "claude", 1)),
+                           ("all0", coding_slot_lock(self.home, 0)), ("all1", coding_slot_lock(self.home, 1)),
+                           ("all3", coding_slot_lock(self.home, 3))):
+            try:
+                lock.acquire().release()
+                out[name] = "free"
+            except LockBusy:
+                out[name] = "held"
+        return out
+
+    def test_a_queued_task_beside_an_agent_holds_exactly_tool_0_and_overall_0(self):
+        # whatever limits are configured (here 8 / 4 per tool), the queue never reaches for a higher slot: the
+        # agent's limits can be lowered remotely while it runs, and slot 0 is what an older queue fences on
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg.update({"max_parallel": 8, "max_parallel_per_tool": {"claude": 4, "codex": 4}})
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        self.queue_one_task()
+        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+        seen = {}
+        with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", lambda: seen.update(self.slot_states()))}):
+            code, out, err = self.run_cli("run", "--once")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, {"tool0": "held", "tool1": "free", "all0": "held", "all1": "free", "all3": "free"})
+        self.assertEqual(self.task_state(), DONE)
+        self.assertEqual(set(self.slot_states().values()), {"free"})          # and everything is given back
+
+    def test_the_queue_waits_while_an_agent_job_holds_overall_slot_0_or_the_tools_slot_0(self):
+        for held in ("all0", "tool0"):
+            with self.subTest(agent_holds=held):
+                self.queue_one_task() if held == "all0" else None
+                db = Database(self.home / "timetrace.db")
+                db.update_task(1, state="runnable")
+                db.close()
+                self.hold("agent.lock", "-m", "timetrace", "agent", "run") if held == "all0" else None
+                lock = (coding_slot_lock(self.home, 0) if held == "all0" else tool_slot_lock(self.home, "claude", 0)).acquire()
+                started = []
+                try:
+                    with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", lambda: started.append(1))}):
+                        code, out, err = self.run_cli("run", "--once")
+                finally:
+                    lock.release()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(started, [])                                  # nothing ran beside the agent's job
+                self.assertIn("deferred", out)
+                self.assertEqual(self.task_state(), "runnable")
+
+    def test_an_older_queue_cannot_run_the_task_the_queue_is_running_beside_the_agent(self):
+        # the older `timetrace run` resets RUNNING tasks first and then fences on overall slot 0 only: while this
+        # queue holds slot 0 (the agent having just left), that older queue defers instead of running the task again
+        self.queue_one_task()
+        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+        older = {}
+
+        def older_queue_starts():
+            db = Database(self.home / "timetrace.db")
+            for t in db.tasks_in_state("running"):                              # what the older _recover_running does
+                db.update_task(t["id"], state="runnable", last_error="daemon restarted mid-run")
+            ad = FakeAdapter("claude")
+            older["out"] = scheduler.run_once(db, {"claude": ad}, {"interval_sec": 1, "jitter_sec": 0, "hook_max_tasks": 5,
+                                              "default_block_sleep_sec": 600, "circuit_breaker_failures": 3, "circuit_window_mins": 300},
+                                              self.home, log=lambda s: None)
+            older["calls"] = ad.calls
+            db.close()
+        with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", older_queue_starts)}):
+            code, _, err = self.run_cli("run", "--once")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(older["out"], "task 1 → deferred (runner busy)")
+        self.assertEqual(older["calls"], [])
+        self.assertEqual(self.task_state(), DONE)       # the reset did not stick: this queue's result is the record
 
     # --- who may run beside whom -------------------------------------------------------------
 
