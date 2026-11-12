@@ -74,6 +74,15 @@ def _unverified(provider: str, reason: str, auth_method: str, now: float) -> Bil
     return BillingVerdict(provider=provider, verified=False, reason=reason, auth_method=auth_method, verified_at=now)
 
 
+def _whole_json_object(output: str) -> Optional[dict]:
+    """The output as one JSON object, or None: no text before or after it."""
+    try:
+        value = json.loads(output.strip())
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def verify_claude(cfg: Mapping[str, object], run: Callable[[Sequence[str], float], Tuple[int, str]] = _run_status,
                   env: Optional[Mapping[str, str]] = None, settings_path: Optional[str] = None,
                   now: Optional[float] = None) -> BillingVerdict:
@@ -102,6 +111,13 @@ def verify_claude(cfg: Mapping[str, object], run: Callable[[Sequence[str], float
     except Exception as exc:  # missing binary, timeout, permission: all mean "cannot verify"
         return _unverified("claude", "auth_status_unavailable:" + type(exc).__name__, "", now)
     if code != 0:
+        # `claude auth status` exits 1 when nobody is logged in and still prints its JSON. That exact answer (exit 1,
+        # the whole output one JSON object, loggedIn strictly false) is a classification; any other non-success
+        # exit stays "cannot verify". Neither can ever verify: only exit 0 reaches the checks below.
+        if code == 1:
+            signed_out = _whole_json_object(output)
+            if signed_out is not None and signed_out.get("loggedIn") is False:
+                return _unverified("claude", "not_logged_in", str(signed_out.get("authMethod") or ""), now)
         return _unverified("claude", "auth_status_unavailable:exit_%d" % code, "", now)
     try:
         status = json.loads(output[output.index("{"):]) if "{" in output else None
