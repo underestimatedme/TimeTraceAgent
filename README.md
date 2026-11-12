@@ -4,6 +4,13 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.5：本地队列可与在线 Agent 并存，登录诊断更准确
+
+- `timetrace run` 现在可以在在线的 `timetrace agent run` 旁边运行本地队列，两边共用执行槽位，合计不超过上限；Agent 与并存队列对 `agent.lock` 持共享锁，0.6.4 及更早版本的 `timetrace run`／`timetrace agent run`（独占加锁）因此在新版本在线期间拿不到锁，不会重置或重复运行正在执行的任务。**Agent 和队列都要先升到 0.6.5**；旧版 Agent 在线时队列拒绝并存。升级顺序、回滚和暂停状态的处理见 [docs/queue-beside-agent-upgrade.md](docs/queue-beside-agent-upgrade.md)。
+- `timetrace agent doctor` 区分「未登录或登录已失效」「计费方式不符」和「无法核验」，并给出对应的登录命令。
+
+不需要升级服务端，执行协议仍为 2。详见 [0.6.5 发布说明](docs/releases/0.6.5.md)。
+
 ## 0.6.4：复制任务结果文件不再被当成访问凭据
 
 AI 在工作副本里把结果写到 `.timetrace/out/`。以前用 `cp`、`mv` 等命令按相对路径处理这些文件时，会被误判为“访问凭据”而拒绝；用读写文件工具却可以。0.6.4 起，相对路径的 `.timetrace/out`（及 `.timetrace/out.prev-*`）视为工作副本内的路径；原本需要批准的命令仍需批准。`~/.timetrace`、`.timetrace` 下的其他文件、先切换目录的命令以及指向工作副本外的符号链接仍一律拒绝。不需要升级服务端。详见 [0.6.4 发布说明](docs/releases/0.6.4.md)。
@@ -231,6 +238,8 @@ timetrace events [--type task_blocked]
 
 前台：`timetrace run`（本地队列）或 `timetrace agent run`（手机远程派发）。后台用 launchd：
 
+在线 Agent 常驻时，`timetrace run` 会在它旁边运行本地队列，并与 Agent 共用执行槽位：只拿总槽 0 和该工具的槽 0（任何 Agent 配置都有这两个，不用猜在线限额），所以 Agent 有任务占着这两个槽时队列会等待；两边合计不会超过上限，也不用停止 Agent。并存靠 `agent.lock` 的共享锁：Agent 与并存的队列都持共享锁，0.6.4 及更早版本的 `timetrace run`／`timetrace agent run` 是独占加锁，只要有新版本在线就拿不到，不会重置或重复运行正在执行的任务。**旧版 Agent 在线时队列不会并存**，会报 `another timetrace agent is already running`，须先升级 Agent，步骤与回滚见 [docs/queue-beside-agent-upgrade.md](docs/queue-beside-agent-upgrade.md)。两个本地队列不会同时运行。
+
 ```sh
 timetrace agent install              # 写入 ~/Library/LaunchAgents/com.atlaspaces.timetrace.agent.plist 并加载
 tail -f ~/.timetrace/daemon.log
@@ -369,6 +378,15 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 （`not_logged_in`、`auth_method_not_subscription:<x>`、`api_key_fallback_in_env:<VAR>` 等），
 统一门禁返回 `billing_unverified`，该工具不会收到任务。结论缓存 5 分钟，但真正 spawn 前会强制重新核验。
 `timetrace agent doctor` 会逐工具打印核验结论。核验只读登录状态，不会启动模型、不消耗额度。
+
+诊断会区分「未登录或登录已失效」「计费方式不符」和「无法核验」，保留原始原因码。
+明确未登录或认证方式不是订阅时，在这台 Mac 上运行 `claude auth login`（Claude.ai 订阅）或
+`codex login`（ChatGPT 订阅）；doctor 会使用实际找到的 CLI 路径打印命令。
+API key、替代端点、第三方 provider 或配置问题需要按提示手动排查，重新登录不保证消除这些计费路径。
+状态命令失败、输出无法识别或套餐未知时不能断定登录过期；先运行 `claude auth status` / `codex login status`
+查看具体结果，再决定是否重新登录。修复后运行对应的状态命令和 `timetrace agent doctor`，确认零付费核验通过，
+再运行 `timetrace agent sync` 刷新后台 Runner 并上报工具清单。登录恢复后仍需满足额度、接活状态等其他派活条件。
+这些提示不会自动登录或修改工具配置。
 
 ## 限额消耗的两部分覆盖：终端 + 软件
 

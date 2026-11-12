@@ -491,7 +491,9 @@ class CliTest(unittest.TestCase):
         path = self.home / "locks" / "coding-slot.lock"
         path.parent.mkdir(parents=True)
         path.write_text("1234")
-        with patch("timetrace.cli.CredentialStore") as credentials:
+        # The real tier adapters read the Claude token from the macOS Keychain; keep that off the real credentials.
+        with patch("timetrace.cli.CredentialStore") as credentials, \
+             patch("timetrace.tiers.keychain_secret", return_value=None):
             credentials.return_value.load.return_value = None
             code, out, err = self.run_cli("agent", "doctor")
         self.assertIn("manual", out)

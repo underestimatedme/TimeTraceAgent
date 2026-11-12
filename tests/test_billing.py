@@ -16,6 +16,9 @@ CLAUDE_OK = json.dumps({"loggedIn": True, "authMethod": "claude.ai", "apiProvide
                         "subscriptionType": "team", "email": "someone@example.com"})
 
 
+CLAUDE_SIGNED_OUT = json.dumps({"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"})
+
+
 def runner(outputs):
     """Fake subprocess runner: maps the first two argv words to (code, stdout)."""
     calls = []
@@ -99,6 +102,46 @@ class ClaudeVerificationTest(unittest.TestCase):
         self.assertFalse(verdict.verified)
         self.assertTrue(verdict.reason.startswith("auth_status_unavailable:"))
 
+    # `claude auth status` exits 1 when nobody is logged in and still prints its JSON on stdout. That one exact
+    # answer is a classification; every other non-success exit stays "cannot verify" and can never verify.
+    def test_signed_out_status_json_with_exit_one_is_not_logged_in(self):
+        for out in (CLAUDE_SIGNED_OUT, json.dumps({"loggedIn": False}), CLAUDE_SIGNED_OUT + "\n"):
+            with self.subTest(out=out):
+                verdict = self.verify(out, code=1)
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.reason, "not_logged_in")
+
+    def test_only_the_signed_out_answer_is_reclassified_everything_else_fails_closed(self):
+        for code, out in (
+            (1, ""), (1, "not json"), (1, "Error: something went wrong"),
+            (1, json.dumps({"authMethod": "none"})),                       # no loggedIn
+            (1, json.dumps({"loggedIn": "false"})), (1, json.dumps({"loggedIn": None})), (1, json.dumps({"loggedIn": 0})),
+            (1, json.dumps([{"loggedIn": False}])), (1, json.dumps("loggedIn")),
+            (1, CLAUDE_SIGNED_OUT + "\nwarning: stderr noise"),             # not a clean single answer
+            (1, "warning: stderr noise\n" + CLAUDE_SIGNED_OUT),
+            (1, CLAUDE_OK),                                                # looks fine, but the exit says otherwise
+            (2, CLAUDE_SIGNED_OUT), (3, CLAUDE_SIGNED_OUT), (126, CLAUDE_SIGNED_OUT), (127, CLAUDE_SIGNED_OUT),
+            (137, CLAUDE_SIGNED_OUT), (-9, CLAUDE_SIGNED_OUT), (255, CLAUDE_SIGNED_OUT),
+        ):
+            with self.subTest(code=code, out=out[:40]):
+                verdict = self.verify(out, code=code)
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.reason, "auth_status_unavailable:exit_%d" % code)
+
+    def test_no_non_success_exit_ever_verifies(self):
+        for code in (1, 2, 3, 126, 127, 137, -9, 255):
+            with self.subTest(code=code):
+                verdict = self.verify(CLAUDE_OK, code=code)
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.reason, "auth_status_unavailable:exit_%d" % code)
+
+    def test_signed_out_json_does_not_relax_the_billing_gate_when_an_api_key_path_exists(self):
+        # the zero-spend checks that come first still win
+        self.assertEqual(self.verify(CLAUDE_SIGNED_OUT, code=1, env={"ANTHROPIC_API_KEY": "x"}).reason,
+                         "api_key_fallback_in_env:ANTHROPIC_API_KEY")
+        self.assertEqual(self.verify(CLAUDE_SIGNED_OUT, code=1, settings={"apiKeyHelper": "/bin/echo"}).reason,
+                         "api_key_helper_configured")
+
     def test_status_command_is_invoked_with_configured_binary(self):
         run = runner({"auth status": (0, CLAUDE_OK)})
         billing.verify_claude({"bin": "/opt/claude"}, run=run, env={}, settings_path=self.settings, now=1.0)
@@ -139,6 +182,31 @@ class CodexVerificationTest(unittest.TestCase):
     def test_not_logged_in_and_cli_failure(self):
         self.assertEqual(self.verify("Not logged in\n", code=1).reason, "not_logged_in")
         self.assertEqual(self.verify("something else", code=0).reason, "auth_status_unparseable")
+
+    def test_nonzero_exit_never_trusts_the_success_phrase(self):
+        # Only exit 0 may verify, whatever the text says (mirrors the Claude rule).
+        for code in (1, 2, 126, 127, 137, -9, 255):
+            verdict = self.verify("Logged in using ChatGPT\n", code=code,
+                                  auth={"auth_mode": "chatgpt", "OPENAI_API_KEY": None})
+            self.assertFalse(verdict.verified, "exit %d verified" % code)
+            self.assertNotEqual(verdict.reason, "", "exit %d has no reason" % code)
+
+    def test_other_nonzero_exits_are_status_unavailable_not_logged_out(self):
+        # Only an explicit "Not logged in" may claim a signed-out tool; any other failing exit, including one that
+        # prints a contradictory success phrase, cannot say "log in again".
+        for code in (1, 2, 126, 127, 137, -9, 255):
+            for output in ("Logged in using ChatGPT\n", "boom\n", ""):
+                verdict = self.verify(output, code=code, auth={"auth_mode": "chatgpt", "OPENAI_API_KEY": None})
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.reason, "auth_status_unavailable:exit_%d" % code, (code, output))
+
+    def test_explicit_not_logged_in_keeps_the_signed_out_reason(self):
+        self.assertEqual(self.verify("Not logged in\n", code=1).reason, "not_logged_in")
+
+    def test_nonzero_exit_keeps_the_api_key_refusal(self):
+        verdict = self.verify("Logged in using an API key\n", code=1)
+        self.assertFalse(verdict.verified)
+        self.assertEqual(verdict.reason, "auth_method_not_subscription:api_key")
 
 
 class VerifierCacheTest(unittest.TestCase):

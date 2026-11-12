@@ -25,7 +25,7 @@ from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
-from timetrace.dispatch import adapter_capabilities, lock_diagnostics
+from timetrace.dispatch import SlotLimits, adapter_capabilities, lock_diagnostics
 from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, FAILED, RUNNABLE, RUNNING, TOOLS,
                          Sample)
 
@@ -51,14 +51,86 @@ def _cloud(cfg: Dict[str, Any]) -> CloudClient:
     return CloudClient(str(cfg["cloud_base_url"]), device_id=device_identity(config.home()))
 
 
-def _acquire_execution_lock(home: Path):
-    lock_file = open(home / "agent.lock", "a+")
+def _flock_file(path: Path, shared: bool = False):
+    """Open `path` and take its flock without waiting; None when someone holds a conflicting lock."""
+    lock_file = open(path, "a+")
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError:
         lock_file.close()
         return None
     return lock_file
+
+
+def _acquire_execution_lock(home: Path):
+    """agent.lock held EXCLUSIVELY: the way every `timetrace run` and `timetrace agent run` up to 0.6.4 takes
+    it, and the way a queue running alone still takes it. Nothing else can hold agent.lock then."""
+    return _flock_file(home / "agent.lock")
+
+
+class _AgentLocks:
+    """What a running agent daemon holds: agent.lock SHARED and agent-role.lock exclusive."""
+
+    def __init__(self, role, shared):
+        self._files = (shared, role)
+
+    def close(self) -> None:
+        for f in self._files:
+            f.close()
+
+
+def _acquire_agent_lock(home: Path):
+    """The agent daemon's hold on agent.lock. It is SHARED, so a queue may take it shared too and run beside
+    the agent, while an older `timetrace run` / `timetrace agent run` (exclusive, no waiting) is kept out for as
+    long as any current participant is online: no gap when the agent leaves, no `_recover_running` of an older
+    queue on a task that is being run. agent-role.lock keeps it to one agent."""
+    role = _flock_file(home / "agent-role.lock")
+    if role is None:
+        return None
+    shared = _flock_file(home / "agent.lock", shared=True)
+    if shared is None:
+        role.close()
+        return None
+    return _AgentLocks(role, shared)
+
+
+class _SchedulerGuard:
+    """What lets the local queue (`timetrace run`) run.
+
+    Its own lock keeps two queues apart. Then it takes agent.lock either exclusively, as it always did (nothing
+    else is running: mode "exclusive", which also keeps an agent from starting beside it), or shared when a
+    current agent daemon holds it shared (mode "beside-agent"), where it must obey the shared coding-slot limits
+    (see scheduler._dispatch). It keeps that hold until it exits, so the agent leaving never opens a window for an
+    older queue. A lock held exclusively by anything else, an agent or a queue of an older version, which cannot
+    know it has company, keeps the queue out (fail closed: upgrade that agent first)."""
+
+    def __init__(self, home: Path):
+        self.home = Path(home)
+        self.mode: Optional[str] = None
+        self._role = None
+        self._agent = None
+
+    def acquire(self) -> Optional[str]:
+        self._role = _flock_file(self.home / "scheduler.lock")
+        if self._role is None:
+            return "error: another timetrace scheduler is already running"
+        self._agent = _acquire_execution_lock(self.home)
+        if self._agent is not None:
+            self.mode = "exclusive"
+            return None
+        self._agent = _flock_file(self.home / "agent.lock", shared=True)
+        if self._agent is not None:
+            self.mode = "beside-agent"
+            return None
+        self.release()
+        return ("error: another timetrace agent is already running (an agent or queue of an older version cannot "
+                "share the lock: stop it, or upgrade the agent first)")
+
+    def release(self) -> None:
+        for f in (self._agent, self._role):
+            if f is not None:
+                f.close()
+        self._agent = self._role = self.mode = None
 
 
 def _pair_link(user_code: str, name: str, expires_at: Optional[int] = None) -> str:
@@ -536,9 +608,9 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) 
 
 def cmd_agent_run(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
-    lock_file = _acquire_execution_lock(home)
+    lock_file = _acquire_agent_lock(home)
     if lock_file is None:
-        print("error: another timetrace agent is already running", file=sys.stderr)
+        print("error: another timetrace agent or queue is already running", file=sys.stderr)
         return 1
     cloud = _cloud(cfg)
     state = {"sessions": SessionManager(CredentialStore(), cloud)}
@@ -777,8 +849,71 @@ def _tool_version(binary: str, node: Optional[str] = None, run=subprocess.run) -
     return text[0].strip()[:80]
 
 
+def _tool_billing_details(name: str, adapters: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return adapters[name].capability_details() if name in adapters else {}
+    except Exception as exc:
+        return {"unsupported_reason": "check_failed:" + exc.__class__.__name__}
+
+
+def _billing_login_label(details: Dict[str, Any]) -> str:
+    """Doctor's explanation, without changing the protocol's coarse health states."""
+    if details.get("can_enforce_zero_spend") is True:
+        return "正常"
+    reason = details.get("unsupported_reason") or "unknown"
+    if reason == "not_logged_in":
+        return "未登录或登录已失效"
+    if reason in ("auth_method_not_subscription:unknown", "api_provider_not_first_party:unknown"):
+        return "无法核验"
+    if reason.startswith(("auth_method_not_subscription:", "api_provider_not_first_party:",
+                          "api_key_fallback_in_env:", "api_key_fallback_in_settings:")) or reason in (
+                              "api_key_helper_configured", "api_key_fallback_in_auth_file"):
+        return "计费方式不符"
+    return "无法核验"
+
+
+def _tool_recovery(name: str, binary: str, details: Dict[str, Any]) -> List[str]:
+    """Advice only: never run login or change billing settings to open the gate."""
+    reason = details.get("unsupported_reason") or "unknown"
+    label = _billing_login_label(details)
+    explanation = {
+        "not_logged_in": "工具未报告有效的订阅登录",
+        "api_key_helper_configured": "请手动检查 Claude settings.json 的 apiKeyHelper，避免按量计费",
+        "api_key_fallback_in_auth_file": "请手动检查 Codex auth.json 中的 OPENAI_API_KEY，避免 API key 计费",
+        "settings_unreadable": "无法读取 Claude settings.json；请手动检查文件权限和 JSON 格式",
+        "auth_file_unreadable": "无法读取 Codex auth.json；请手动检查文件权限和 JSON 格式",
+        "subscription_unknown": "工具未报告订阅套餐；请核对账号的订阅状态",
+        "auth_method_not_subscription:unknown": "工具未报告认证方式；请核对登录状态输出",
+        "api_provider_not_first_party:unknown": "工具未报告服务提供方；请核对登录状态输出",
+        "auth_status_unparseable": "无法识别工具的登录状态输出；请核对 CLI 版本和状态命令输出",
+    }.get(reason, "无法确认订阅登录；请先查看状态命令的具体结果")
+    if label == "计费方式不符" and reason.startswith("auth_method_not_subscription:"):
+        explanation = "当前认证方式不是订阅登录"
+    elif label == "计费方式不符" and reason.startswith("api_provider_not_first_party:"):
+        explanation = "当前使用第三方计费通道；请手动检查 Claude 的 provider 设置，使用 Claude.ai 订阅直连"
+    elif reason.startswith("api_key_fallback_in_env:"):
+        explanation = "存在 API key 或按量端点路径；请手动检查启动 Runner 的环境变量 %s" % reason.split(":", 1)[1]
+    elif reason.startswith("api_key_fallback_in_settings:"):
+        explanation = "存在 API key 或按量端点路径；请手动检查 Claude settings.json 的 env.%s" % reason.split(":", 1)[1]
+    elif reason.startswith("auth_status_unavailable:"):
+        explanation = "登录状态命令执行失败，不能据此断定未登录或过期；请先查看具体错误"
+    lines = ["  登录诊断: %s（%s）" % (label, explanation)]
+    executable = shlex.quote(binary)
+    login = executable + (" auth login" if name == "claude" else " login")
+    status = executable + (" auth status" if name == "claude" else " login status")
+    if reason == "not_logged_in" or (label == "计费方式不符" and reason.startswith("auth_method_not_subscription:")):
+        account = "Claude.ai" if name == "claude" else "ChatGPT"
+        lines.append("  修复: 在这台 Mac 上运行 %s，使用 %s 订阅账号登录" % (login, account))
+    elif reason == "auth_status_unavailable:exit_1":
+        lines.append("  若状态命令明确提示未登录或登录过期，再在这台 Mac 上运行 %s，使用订阅账号登录" % login)
+    lines.append("  复核: 运行 %s，然后 timetrace agent doctor；以零付费核验通过为准" % status)
+    lines.append("  同步: 核验通过后运行 timetrace agent sync，刷新后台 Runner 并上报工具清单；其他派活条件仍需满足")
+    return lines
+
+
 def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolution=None,
-                runner_path: Optional[str] = None, show_version: bool = False):
+                runner_path: Optional[str] = None, show_version: bool = False,
+                details: Optional[Dict[str, Any]] = None):
     """Location, Runner visibility, version and zero-spend verdict of one tool:
     (lines, verified). `runner_path` is the LaunchAgent PATH (None: not
     installed, visibility not checked)."""
@@ -805,15 +940,15 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolu
                              % "、".join(dict.fromkeys(resolution.dirs)))
     if found and show_version:
         lines.append("  版本: %s" % _tool_version(found, resolution.node if resolution is not None else None))
-    try:
-        details = adapters[name].capability_details() if name in adapters else {}
-    except Exception as exc:
-        details = {"unsupported_reason": "check_failed:" + exc.__class__.__name__}
+    if details is None:
+        details = _tool_billing_details(name, adapters)
     verified = details.get("can_enforce_zero_spend") is True
     if verified:
         lines.append("  零付费核验: 通过（%s，%s）" % (details.get("auth_method"), _iso_local(details.get("verified_at"))))
     else:
         lines.append("  零付费核验: 未通过（%s）→ 该工具不会被派发任务" % (details.get("unsupported_reason") or "unknown"))
+        if found:
+            lines.extend(_tool_recovery(name, found, details))
     return lines, verified
 
 
@@ -858,8 +993,10 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
               "（工具清单和额度仍会照常上报）")
     adapters = _adapters(cfg)
     runner_path = toolpath.installed_launch_path(user_home)
+    tool_details = {name: _tool_billing_details(name, adapters) for name in TOOLS}
     for name in TOOLS:
-        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path, show_version=True)
+        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path,
+                              show_version=True, details=tool_details[name])
         for line in lines:
             print(line)
         if name in adapters:
@@ -876,6 +1013,12 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         report = {}
         print("  自检失败（%s）" % exc.__class__.__name__)
+    # The wire health schema cannot express an unknown check or a billing
+    # mismatch. Use the same verdict as above so doctor does not call them
+    # "not logged in" or "normal", or mistake an unknown plan for expiry.
+    report = dict(report)
+    for name, details in tool_details.items():
+        report[name + "_login"] = _billing_login_label(details)
     for line in _health_lines(report):
         print(line)
     for line in _reset_credit_lines(adapters):
@@ -1231,33 +1374,43 @@ def cmd_ls(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
-    lock_file = _acquire_execution_lock(home)
-    if lock_file is None:
-        print("error: another timetrace agent is already running", file=sys.stderr)
+    guard = _SchedulerGuard(home)
+    err = guard.acquire()
+    if err:
+        print(err, file=sys.stderr)
         return 1
     adapters = _adapters(cfg)
     interval = args.interval or int(cfg.get("interval_sec", 30))
-    _log("timetrace %s daemon, home=%s, interval=%ss%s" % (
-        __version__, home, interval, ", once" if args.once else ""))
-    _recover_running(db)
-    while True:
-        try:
-            out = scheduler.run_once(db, adapters, cfg, home, log=_log)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:  # keep the daemon alive; the event log has the details
-            out = "loop error: %s" % exc
-            db.add_event("loop_error", payload={"error": str(exc)})
-        if out != "idle":
-            _log(out)
-        if args.once:
-            return 0
-        try:
-            time.sleep(interval if out in ("idle", "circuit open") or out.startswith("loop error")
-                       else 1)
-        except KeyboardInterrupt:
-            _log("stopped")
-            return 0
+    # Beside an online agent the queue takes only tool slot 0 and overall slot 0: indices every agent
+    # configuration has, so it never has to guess the agent's limits (remote configuration can lower them at
+    # any time), and overall slot 0 is the slot an older `timetrace run` fences on.
+    limits = SlotLimits(overall=1, per_tool={})
+    _log("timetrace %s daemon, home=%s, interval=%ss%s%s" % (
+        __version__, home, interval, ", once" if args.once else "",
+        ", beside an online agent (shared coding slots)" if guard.mode == "beside-agent" else ""))
+    try:
+        _recover_running(db)
+        while True:
+            try:
+                out = scheduler.run_once(db, adapters, cfg, home, log=_log,
+                                         slots=limits if guard.mode == "beside-agent" else None)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # keep the daemon alive; the event log has the details
+                out = "loop error: %s" % exc
+                db.add_event("loop_error", payload={"error": str(exc)})
+            if out != "idle":
+                _log(out)
+            if args.once:
+                return 0
+            try:
+                time.sleep(interval if out in ("idle", "circuit open") or out.startswith("loop error")
+                           else 1)
+            except KeyboardInterrupt:
+                _log("stopped")
+                return 0
+    finally:
+        guard.release()
 
 
 def _recover_running(db: Database) -> None:

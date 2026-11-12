@@ -7,8 +7,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from timetrace import hooks, limits, worktree
 from timetrace.db import Database
-from timetrace.dispatch import (DispatchDenied, LockBusy, UnclearedOwner, adapter_dispatch_problem,
-                           coding_slot_lock, enforce_spawn_authority, spawn_authority)
+from timetrace.dispatch import (DispatchDenied, LockBusy, SlotLimits, ToolSlotBusy, acquire_job_slots, UnclearedOwner, adapter_dispatch_problem,
+                           enforce_spawn_authority, spawn_authority)
 from timetrace.models import (BLOCKED, CLAUDE, DONE, EV_CIRCUIT_OPEN, EV_SAMPLE_FAILURE,
                          EV_TASK_BLOCKED, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_RESUMED,
                          EV_TOOL_SWITCHED, EV_WINDOW_RESET, FAILED, PENDING, RUNNABLE,
@@ -26,6 +26,7 @@ def run_once(
     now: Optional[int] = None, log: Callable[[str], None] = print,
     ensure_worktree: Callable = worktree.ensure, hook_runner: Callable = hooks.run_hook,
     rng: Callable[[], float] = random.random, clock: Optional[Callable[[], int]] = None,
+    slots: Optional[SlotLimits] = None,
 ) -> str:
     clock = clock or (lambda: int(time.time()))
     now = now or clock()
@@ -52,7 +53,7 @@ def run_once(
         if tool is None:
             continue
         return _dispatch(db, adapters[tool], tool, task, cfg, home, now, log,
-                         ensure_worktree, hook_runner, rng, clock)
+                         ensure_worktree, hook_runner, rng, clock, slots)
     return "idle"
 
 
@@ -131,18 +132,30 @@ def _most_remaining(rows: List[Dict[str, Any]], tools: List[str], now: int) -> O
 
 def _dispatch(db: Database, adapter: Any, tool: str, task: Dict[str, Any], cfg: Dict[str, Any],
               home: Path, now: int, log: Callable[[str], None], ensure_worktree: Callable,
-              hook_runner: Callable, rng: Callable[[], float], clock: Callable[[], int]) -> str:
-    """Fence local execution through the same runner-wide coding slot as the
-    cloud agent so the two can never drive a process at the same time."""
+              hook_runner: Callable, rng: Callable[[], float], clock: Callable[[], int],
+              slots: Optional[SlotLimits] = None) -> str:
+    """Fence local execution through the same runner-wide coding slots as the cloud agent, so the two never
+    drive more processes than the agent's own limits allow. `slots` None: overall slot 0 only (the queue
+    runs alone). Given: the tool's slot and the first free overall slot, as the agent takes them (the queue
+    runs beside an online agent)."""
     try:
-        slot = coding_slot_lock(home).acquire()
+        held = acquire_job_slots(home, tool, slots)
+    except ToolSlotBusy as exc:
+        return ("task %d → deferred (tool busy: %s)" % (task["id"], exc.tool)
+                + ("; " + str(exc.cause) if isinstance(exc.cause, UnclearedOwner) else ""))
     except LockBusy as exc:
         return "task %d → deferred (runner busy)" % task["id"] + ("; " + str(exc) if isinstance(exc, UnclearedOwner) else "")
     try:
+        # `task` was read before the slot was ours. Under the slot, only a task that is still runnable runs.
+        current = db.get_task(task["id"])
+        if current is None or current["state"] != RUNNABLE:
+            return "task %d → skipped (no longer runnable: %s)" % (task["id"], current["state"] if current else "deleted")
+        task = current
         return _dispatch_locked(db, adapter, tool, task, cfg, home, now, log,
                                 ensure_worktree, hook_runner, rng, clock)
     finally:
-        slot.release()
+        for lock in reversed(held):
+            lock.release()
 
 
 def _dispatch_locked(db: Database, adapter: Any, tool: str, task: Dict[str, Any], cfg: Dict[str, Any],

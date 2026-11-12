@@ -370,16 +370,43 @@ A folder workspace has no git history to isolate a run in, so the control is
   serialized by locks, so parallel jobs never race a token rotation or send
   one batch twice. Upkeep (quota, inventory) stays on the loop thread.
 - Locks: `coding-slot.lock`, `coding-slot-1.lock` … (at most `max_parallel`
-  jobs from the agent; the local scheduler uses slot 0 only). An AI job
+  jobs from the agent; the local queue alone uses slot 0 only, beside an agent it takes slot 0 as well). An AI job
   (task, chat or review turn) first takes one of its provider's own slots,
   `coding-slot-<tool>-<i>.lock` (i < `max_parallel_per_tool[tool]`, a tool
   not named gets 1), then an overall slot; a failure on the second releases
   the first. Per-tool slots have the same crash fence, skip-if-fenced and
   shutdown release as the overall ones; a job whose tool is full is deferred
   ("tool busy: <tool>") like one that finds the runner full.
-  Scheduler runs (`timetrace run`) and agent jobs (`timetrace agent run`) never
-  overlap: both take the process-wide `agent.lock`, so only one of the two
-  daemons runs at a time. A slot left with a crash fence is skipped while
+  The local queue (`timetrace run`) and the agent (`timetrace agent run`) never
+  exceed those limits together. The lock protocol on `agent.lock`: every
+  version up to 0.6.4 takes it **exclusively** and without waiting, in both
+  `timetrace run` and `timetrace agent run`, and an older `timetrace run` then
+  resets every `running` task to `runnable` before it takes a slot, and may
+  dispatch a task row it read before it got the slot. From this version the
+  agent daemon holds `agent.lock` **shared** (plus `agent-role.lock`
+  exclusively, so there is still one agent). The queue holds its own
+  `scheduler.lock` (two queues never run at once) and then takes `agent.lock`
+  exclusively when nothing is online (this keeps an agent from starting beside
+  it, as before) or **shared** when a current agent holds it shared, and then
+  runs **beside** the agent. It keeps that hold until it exits, so while any
+  current agent or queue is online an older process cannot take the lock:
+  there is no window when the agent leaves, and an older queue can neither
+  reset nor run again a task this queue is running. There is no process
+  detection (`lsof`/`ps` were dropped): the kernel lock itself says whether
+  the other holders are current. An older agent holds the lock exclusively,
+  so the queue refuses to start beside it ("upgrade the agent first", see
+  `docs/queue-beside-agent-upgrade.md`): fail closed. Each queue task beside
+  an agent takes tool slot 0 and overall slot 0, the same pools the agent's
+  jobs use and the only indices every agent configuration has: the queue
+  never guesses the agent's limits (remote configuration can lower
+  `max_parallel` and `max_parallel_per_tool` while the queue runs), so the
+  combined concurrency stays within them. The queue therefore waits while an
+  agent job holds slot 0 or that tool's slot 0. Under the slots the queue
+  re-reads the task and runs it only if it is still `runnable`. A task left
+  `running` by a queue that really died is reset when the next queue starts
+  (it holds the lock, so no live owner can exist) and resumes with its
+  recorded session once a crash fence on its slots has been cleared by hand. A
+  slot left with a crash fence is skipped while
   another slot is free; the fence surfaces (manual recovery) only when no
   slot is free. *Known limitation:* a job deferred because every slot is
   busy or fenced is not handed back to Valley early — releasing a claim

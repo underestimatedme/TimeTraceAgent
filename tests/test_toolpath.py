@@ -245,6 +245,80 @@ class Verified:
         return None
 
 
+class ToolRecoveryTest(unittest.TestCase):
+    def check(self, name, reason, verified=False):
+        binary = "/tools with spaces/" + name
+        with patch("timetrace.cli.shutil.which", return_value=binary):
+            lines, ok = cli._tool_check(name, {name: {"bin": binary}},
+                                        {name: Verified(verified, reason)})
+        self.assertIs(ok, verified)
+        return "\n".join(lines)
+
+    def test_signed_out_and_wrong_auth_offer_subscription_login_and_recheck(self):
+        for name, login, status in (("claude", "auth login", "auth status"),
+                                    ("codex", "login", "login status")):
+            for reason, label in (("not_logged_in", "未登录或登录已失效"),
+                                  ("auth_method_not_subscription:api_key", "计费方式不符")):
+                with self.subTest(name=name, reason=reason):
+                    out = self.check(name, reason)
+                    self.assertIn("未通过（%s）" % reason, out)
+                    self.assertIn("该工具不会被派发任务", out)
+                    self.assertIn(label, out)
+                    self.assertIn("'/tools with spaces/%s' %s" % (name, login), out)
+                    self.assertIn("'/tools with spaces/%s' %s" % (name, status), out)
+                    self.assertIn("订阅", out)
+                    self.assertIn("timetrace agent doctor", out)
+                    self.assertIn("timetrace agent sync", out)
+                    self.assertNotIn("agent resume", out)
+
+    def test_billing_fallback_requires_manual_review_of_the_actual_source(self):
+        cases = (("claude", "api_key_fallback_in_env:ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL"),
+                 ("codex", "api_key_fallback_in_env:OPENAI_API_KEY", "OPENAI_API_KEY"),
+                 ("claude", "api_key_fallback_in_settings:ANTHROPIC_AUTH_TOKEN", "settings.json"),
+                 ("claude", "api_key_helper_configured", "apiKeyHelper"),
+                 ("codex", "api_key_fallback_in_auth_file", "auth.json"),
+                 ("claude", "api_provider_not_first_party:bedrock", "第三方"))
+        for name, reason, source in cases:
+            with self.subTest(reason=reason):
+                out = self.check(name, reason)
+                self.assertIn("计费方式不符", out)
+                self.assertIn("手动", out)
+                self.assertIn(source, out)
+                self.assertNotIn("未登录或登录已失效", out)
+                self.assertIn("timetrace agent doctor", out)
+
+    def test_unknown_verification_is_not_reported_as_expired_login(self):
+        for name in ("claude", "codex"):
+            for reason in ("auth_status_unavailable:TimeoutExpired", "auth_status_unavailable:FileNotFoundError",
+                           "auth_status_unparseable", "subscription_unknown", "settings_unreadable",
+                           "auth_file_unreadable", "auth_method_not_subscription:unknown",
+                           "api_provider_not_first_party:unknown", "check_failed:OSError", "future_reason", ""):
+                with self.subTest(name=name, reason=reason):
+                    out = self.check(name, reason)
+                    self.assertIn("无法核验", out)
+                    self.assertNotIn("未登录或登录已失效", out)
+                    self.assertNotIn("auth login", out)
+                    self.assertNotIn("修复: 在这台 Mac 上运行", out)
+                    self.assertIn("timetrace agent doctor", out)
+
+    def test_exit_one_offers_login_only_if_the_cli_confirms_an_auth_problem(self):
+        for name, login, status in (("claude", "auth login", "auth status"),
+                                    ("codex", "login", "login status")):
+            with self.subTest(name=name):
+                out = self.check(name, "auth_status_unavailable:exit_1")
+                self.assertIn("无法核验", out)
+                self.assertIn("不能据此断定未登录或过期", out)
+                self.assertIn("若状态命令明确提示未登录或登录过期", out)
+                self.assertIn("'/tools with spaces/%s' %s" % (name, login), out)
+                self.assertIn("'/tools with spaces/%s' %s" % (name, status), out)
+
+    def test_verified_tool_does_not_get_recovery_advice(self):
+        out = self.check("claude", "", verified=True)
+        self.assertIn("零付费核验: 通过", out)
+        self.assertNotIn("修复", out)
+        self.assertNotIn("agent sync", out)
+
+
 class CliDiscoveryTest(FakeHome):
     """The new Mac from the bug report: claude from the native installer in
     ~/.local/bin, codex an npm global of a mise-installed node."""
@@ -358,6 +432,22 @@ class CliDiscoveryTest(FakeHome):
         codex = out.split("\ncodex: ")[1]
         self.assertIn("注意: codex 是 node 脚本，但没有找到 node", codex)
         self.assertIn("它是 node 脚本，但 LaunchAgent 的 PATH 里没有 node", codex)
+
+    def test_doctor_does_not_call_unknown_or_billing_failures_a_login_problem(self):
+        self.adapters = {"claude": Verified(False, "auth_status_unavailable:exit_1"),
+                         "codex": Verified(False, "auth_method_not_subscription:api_key")}
+        # The protocol's coarse health states must not contradict the detailed
+        # verdict displayed by doctor. Keep the wire report unchanged.
+        report = {"claude_login": "missing", "codex_login": "ok", "disk_free_gb": 42}
+        with patch("timetrace.cli.health.check", return_value=report):
+            _, out = self.run_cli("agent", "doctor")
+        self.assertIn("claude 登录: 无法核验", out)
+        self.assertIn("codex 登录: 计费方式不符", out)
+        self.assertNotIn("claude 登录: 未登录", out)
+        self.assertNotIn("codex 登录: 正常", out)
+        self.assertIn("磁盘剩余: 42.0 GB", out)
+        self.assertEqual(report["claude_login"], "missing")
+        self.assertEqual(report["codex_login"], "ok")
 
     def test_doctor_not_found_lists_places_and_the_config_hint(self):
         os.remove(self.codex)
