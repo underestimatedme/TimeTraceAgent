@@ -172,8 +172,11 @@ def verify_codex(cfg: Mapping[str, object], run: Callable[[Sequence[str], float]
         return BillingVerdict(provider="codex", verified=True, reason="", auth_method="chatgpt", verified_at=now)
     if "api key" in text:
         return _unverified("codex", "auth_method_not_subscription:api_key", "api_key", now)
-    if "not logged in" in text or code != 0:
+    if "not logged in" in text:
         return _unverified("codex", "not_logged_in", mode, now)
+    if code != 0:
+        # A failing status command that did not say "Not logged in" proves nothing about the login.
+        return _unverified("codex", "auth_status_unavailable:exit_%d" % code, mode, now)
     return _unverified("codex", "auth_status_unparseable", mode, now)
 
 

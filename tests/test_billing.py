@@ -191,6 +191,18 @@ class CodexVerificationTest(unittest.TestCase):
             self.assertFalse(verdict.verified, "exit %d verified" % code)
             self.assertNotEqual(verdict.reason, "", "exit %d has no reason" % code)
 
+    def test_other_nonzero_exits_are_status_unavailable_not_logged_out(self):
+        # Only an explicit "Not logged in" may claim a signed-out tool; any other failing exit, including one that
+        # prints a contradictory success phrase, cannot say "log in again".
+        for code in (1, 2, 126, 127, 137, -9, 255):
+            for output in ("Logged in using ChatGPT\n", "boom\n", ""):
+                verdict = self.verify(output, code=code, auth={"auth_mode": "chatgpt", "OPENAI_API_KEY": None})
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.reason, "auth_status_unavailable:exit_%d" % code, (code, output))
+
+    def test_explicit_not_logged_in_keeps_the_signed_out_reason(self):
+        self.assertEqual(self.verify("Not logged in\n", code=1).reason, "not_logged_in")
+
     def test_nonzero_exit_keeps_the_api_key_refusal(self):
         verdict = self.verify("Logged in using an API key\n", code=1)
         self.assertFalse(verdict.verified)
