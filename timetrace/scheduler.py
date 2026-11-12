@@ -146,6 +146,11 @@ def _dispatch(db: Database, adapter: Any, tool: str, task: Dict[str, Any], cfg: 
     except LockBusy as exc:
         return "task %d → deferred (runner busy)" % task["id"] + ("; " + str(exc) if isinstance(exc, UnclearedOwner) else "")
     try:
+        # `task` was read before the slot was ours. Under the slot, only a task that is still runnable runs.
+        current = db.get_task(task["id"])
+        if current is None or current["state"] != RUNNABLE:
+            return "task %d → skipped (no longer runnable: %s)" % (task["id"], current["state"] if current else "deleted")
+        task = current
         return _dispatch_locked(db, adapter, tool, task, cfg, home, now, log,
                                 ensure_worktree, hook_runner, rng, clock)
     finally:

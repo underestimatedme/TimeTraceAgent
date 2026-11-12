@@ -1106,7 +1106,7 @@ class RecoveryFenceTest(unittest.TestCase):
                 patch("timetrace.cli._open", return_value=(self.home, {"max_parallel": 1}, self.db)), \
                 patch("timetrace.cli._cloud", return_value=self.cloud), \
                 patch("timetrace.cli._adapters", return_value={"codex": self.adapter}), \
-                patch("timetrace.cli._acquire_execution_lock", return_value=object()), \
+                patch("timetrace.cli._acquire_agent_lock", return_value=object()), \
                 patch("timetrace.cli.SessionManager", return_value=SimpleNamespace(token=lambda: "token")), \
                 self.assertRaises(KeyboardInterrupt):
             cli.cmd_agent_run(SimpleNamespace(once=False, interval=5))

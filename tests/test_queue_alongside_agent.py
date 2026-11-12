@@ -1,10 +1,14 @@
 """The local queue (`timetrace run`) beside an online agent (`timetrace agent run`).
 
-Both daemons used to take the process-wide agent.lock, so the queue could never start while the
-agent was online. The agent daemon keeps agent.lock; the queue may run beside it, but only inside
-the SAME coding-slot limits the agent's own jobs obey (tool slot, then overall slot), so the
-combined concurrency is never higher than before. Anything that is not a running `agent run`
-holding agent.lock still keeps the queue out, and two queues never run at once.
+Both daemons used to take the process-wide agent.lock exclusively, so the queue could never start while
+the agent was online. Now the agent daemon holds agent.lock SHARED (plus its own agent-role.lock, so there is
+still one agent) and the queue may run beside it by holding agent.lock shared too, but only inside the SAME
+coding-slot limits the agent's own jobs obey, so the combined concurrency is never higher than before.
+
+Every older `timetrace run` / `timetrace agent run` takes agent.lock EXCLUSIVELY and without waiting. While any
+newer participant is online that lock attempt fails, so an older queue can neither reset a running task
+(`_recover_running`) nor run it again, and there is no gap when the agent leaves. An older agent that already
+holds the lock exclusively keeps the new queue out ("upgrade the agent first"): fail closed.
 """
 import io
 import json
@@ -25,6 +29,14 @@ from timetrace.models import DONE, RunResult
 HOLDER = ("import fcntl,sys,time\n"
           "f=open(sys.argv[1],'a+');fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
           "print('held',flush=True);time.sleep(600)\n")
+# an up-to-date `timetrace agent run`: agent.lock shared + agent-role.lock exclusive
+SHARED_AGENT = ("import sys,time\n"
+                "sys.path.insert(0,sys.argv[2])\n"
+                "from pathlib import Path\n"
+                "from timetrace import cli\n"
+                "lock=cli._acquire_agent_lock(Path(sys.argv[1]))\n"
+                "assert lock is not None\n"
+                "print('held',flush=True);time.sleep(600)\n")
 
 
 class FakeAdapter:
@@ -88,6 +100,14 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         self.assertEqual(p.stdout.readline().strip(), "held")
         return p
 
+    def agent_online(self):
+        """An up-to-date `timetrace agent run` daemon in its own process."""
+        p = subprocess.Popen([sys.executable, "-I", "-c", SHARED_AGENT, str(self.home), str(Path(cli.__file__).resolve().parents[1])],
+                             stdout=subprocess.PIPE, text=True)
+        self.holders.append(p)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
+
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -132,7 +152,7 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         cfg.update({"max_parallel": 8, "max_parallel_per_tool": {"claude": 4, "codex": 4}})
         (self.home / "config.json").write_text(json.dumps(cfg))
         self.queue_one_task()
-        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+        self.agent_online()
         seen = {}
         with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", lambda: seen.update(self.slot_states()))}):
             code, out, err = self.run_cli("run", "--once")
@@ -148,7 +168,7 @@ class QueueAlongsideAgentTest(unittest.TestCase):
                 db = Database(self.home / "timetrace.db")
                 db.update_task(1, state="runnable")
                 db.close()
-                self.hold("agent.lock", "-m", "timetrace", "agent", "run") if held == "all0" else None
+                self.agent_online() if held == "all0" else None
                 lock = (coding_slot_lock(self.home, 0) if held == "all0" else tool_slot_lock(self.home, "claude", 0)).acquire()
                 started = []
                 try:
@@ -161,47 +181,46 @@ class QueueAlongsideAgentTest(unittest.TestCase):
                 self.assertIn("deferred", out)
                 self.assertEqual(self.task_state(), "runnable")
 
-    def test_an_older_queue_cannot_run_the_task_the_queue_is_running_beside_the_agent(self):
-        # the older `timetrace run` resets RUNNING tasks first and then fences on overall slot 0 only: while this
-        # queue holds slot 0 (the agent having just left), that older queue defers instead of running the task again
+    def test_an_older_queue_cannot_even_start_while_this_queue_runs_beside_the_agent_that_just_left(self):
+        # the older `timetrace run` takes agent.lock exclusively and only then resets RUNNING tasks and dispatches.
+        # Whatever the agent does, this queue keeps agent.lock shared, so that first step fails and nothing of the
+        # older queue (reset, stale read, second run) can happen to the task being run
         self.queue_one_task()
-        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+        agent = self.agent_online()
         older = {}
 
-        def older_queue_starts():
-            db = Database(self.home / "timetrace.db")
-            for t in db.tasks_in_state("running"):                              # what the older _recover_running does
-                db.update_task(t["id"], state="runnable", last_error="daemon restarted mid-run")
-            ad = FakeAdapter("claude")
-            older["out"] = scheduler.run_once(db, {"claude": ad}, {"interval_sec": 1, "jitter_sec": 0, "hook_max_tasks": 5,
-                                              "default_block_sleep_sec": 600, "circuit_breaker_failures": 3, "circuit_window_mins": 300},
-                                              self.home, log=lambda s: None)
-            older["calls"] = ad.calls
-            db.close()
-        with patch("timetrace.cli._adapters", lambda cfg: {"claude": FakeAdapter("claude", older_queue_starts)}):
+        def agent_leaves_then_older_queue_starts():
+            agent.kill()
+            agent.wait()
+            older["lock"] = cli._acquire_execution_lock(self.home)        # exactly what the older cmd_run does first
+            older["state_during"] = self.task_state()
+        adapter = FakeAdapter("claude", agent_leaves_then_older_queue_starts)
+        with patch("timetrace.cli._adapters", lambda cfg: {"claude": adapter}):
             code, _, err = self.run_cli("run", "--once")
         self.assertEqual(code, 0, err)
-        self.assertEqual(older["out"], "task 1 → deferred (runner busy)")
-        self.assertEqual(older["calls"], [])
-        self.assertEqual(self.task_state(), DONE)       # the reset did not stick: this queue's result is the record
+        self.assertIsNone(older["lock"])
+        self.assertEqual(older["state_during"], "running")                  # never reset to runnable
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(self.task_state(), DONE)
 
     # --- who may run beside whom -------------------------------------------------------------
 
     def test_queue_runs_beside_an_online_agent(self):
-        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+        self.agent_online()
         code, out, err = self.run_cli("run", "--once")
         self.assertEqual(code, 0, err)
         self.assertIn("beside an online agent", out)
 
-    def test_queue_is_refused_when_the_lock_holder_is_not_an_agent(self):
-        # e.g. a 0.6.x `timetrace run` daemon: its agent.lock must keep the queue out, as before
-        self.hold("agent.lock", "-m", "timetrace", "run")
+    def test_queue_is_refused_by_an_older_agent_that_holds_the_lock_exclusively(self):
+        # the installed 0.6.4 agent: it cannot tell it has company, so the queue stays out until the agent is upgraded
+        self.hold("agent.lock", "-m", "timetrace", "agent", "run")
         code, _, err = self.run_cli("run", "--once")
         self.assertEqual(code, 1)
         self.assertIn("another timetrace agent is already running", err)
+        self.assertIn("upgrade", err)
 
-    def test_queue_is_refused_when_an_unrelated_process_holds_the_lock(self):
-        self.hold("agent.lock", "something-else")
+    def test_queue_is_refused_when_an_older_queue_holds_the_lock(self):
+        self.hold("agent.lock", "-m", "timetrace", "run")
         code, _, err = self.run_cli("run", "--once")
         self.assertEqual(code, 1)
         self.assertIn("another timetrace agent is already running", err)
@@ -213,43 +232,109 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         self.assertIn("another timetrace scheduler is already running", err)
 
     def test_a_queue_alone_still_keeps_the_agent_out(self):
-        # nobody online: the queue takes agent.lock itself, exactly as before, so an agent cannot start beside it
+        # nobody online: the queue takes agent.lock exclusively, exactly as before, so an agent cannot start beside it
         guard = cli._SchedulerGuard(self.home)
         self.assertIsNone(guard.acquire())
         try:
             self.assertEqual(guard.mode, "exclusive")
+            self.assertIsNone(cli._acquire_agent_lock(self.home))
             self.assertIsNone(cli._acquire_execution_lock(self.home))
         finally:
             guard.release()
-        again = cli._acquire_execution_lock(self.home)
+        again = cli._acquire_agent_lock(self.home)
         self.assertIsNotNone(again)
         again.close()
 
-    def test_a_queue_beside_an_agent_takes_over_agent_lock_when_the_agent_leaves(self):
-        agent = self.hold("agent.lock", "-m", "timetrace", "agent", "run")
+    def test_a_queue_beside_an_agent_keeps_every_older_process_out_with_no_gap_when_the_agent_leaves(self):
+        agent = self.agent_online()
         guard = cli._SchedulerGuard(self.home)
         self.assertIsNone(guard.acquire())
         try:
             self.assertEqual(guard.mode, "beside-agent")
-            agent.kill()
-            agent.wait()
-            self.assertIsNone(guard.refresh())
-            self.assertEqual(guard.mode, "exclusive")        # an old scheduler cannot slip in behind the leaving agent
             self.assertIsNone(cli._acquire_execution_lock(self.home))
-        finally:
-            guard.release()
-
-    def test_beside_an_agent_a_new_non_agent_holder_stops_the_queue(self):
-        agent = self.hold("agent.lock", "-m", "timetrace", "agent", "run")
-        guard = cli._SchedulerGuard(self.home)
-        self.assertIsNone(guard.acquire())
-        try:
             agent.kill()
             agent.wait()
-            self.hold("agent.lock", "-m", "timetrace", "run")      # something else took the lock in between
-            self.assertEqual(guard.refresh(), "error: another timetrace agent is already running")
+            self.assertIsNone(cli._acquire_execution_lock(self.home))         # still shut out: no window for an older queue
         finally:
             guard.release()
+        again = cli._acquire_execution_lock(self.home)
+        self.assertIsNotNone(again)                                            # and free again once the queue is gone
+        again.close()
+
+    def test_agent_and_queue_may_start_in_either_order_and_there_is_only_one_of_each(self):
+        queue = cli._SchedulerGuard(self.home)
+        agent = cli._acquire_agent_lock(self.home)
+        self.assertIsNotNone(agent)
+        try:
+            self.assertIsNone(cli._acquire_agent_lock(self.home))              # a second agent
+            self.assertIsNone(queue.acquire())
+            self.assertEqual(queue.mode, "beside-agent")
+            second = cli._SchedulerGuard(self.home)
+            self.assertEqual(second.acquire(), "error: another timetrace scheduler is already running")
+            agent.close()
+            self.assertIsNone(cli._acquire_execution_lock(self.home))          # the queue alone still fences older ones
+            agent = cli._acquire_agent_lock(self.home)
+            self.assertIsNotNone(agent)                                        # a new agent may join the running queue
+        finally:
+            queue.release()
+            if agent:
+                agent.close()
+
+    def test_a_stale_task_row_read_before_the_slot_was_free_is_not_run_again(self):
+        # run_once reads the runnable rows, then waits for a slot (the queue may be told "busy" and read again later);
+        # when the slot comes the task may long be done: the row is re-read under the slot
+        db = Database(self.home / "timetrace.db")
+        try:
+            tid = db.add_task("do it", "/repo", tool="claude")
+            stale = db.get_task(tid)
+            db.update_task(tid, state=DONE)
+            ad = FakeAdapter("claude")
+            out = scheduler._dispatch(db, ad, "claude", stale, {}, self.home, 100, lambda s: None, fake_worktree,
+                                      lambda *a: None, lambda: 0.0, lambda: 100, SlotLimits(1, {}))
+            self.assertEqual(ad.calls, [])
+            self.assertIn("no longer runnable", out)
+            self.assertEqual(set(self.slot_states().values()), {"free"})
+        finally:
+            db.close()
+
+    # --- a task that really lost its owner ---------------------------------------------------
+
+    def test_a_task_left_running_by_a_dead_queue_is_recovered_beside_an_agent(self):
+        self.queue_one_task()
+        db = Database(self.home / "timetrace.db")
+        db.update_task(1, state="running", session_id="sess-1")
+        db.close()
+        self.agent_online()
+        adapter = FakeAdapter("claude")
+        with patch("timetrace.cli._adapters", lambda cfg: {"claude": adapter}):
+            code, out, err = self.run_cli("run", "--once")
+        self.assertEqual(code, 0, err)
+        self.assertIn("was running when the daemon stopped; will resume", out)
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(self.task_state(), DONE)
+
+    def test_a_crash_fence_left_by_the_dead_owner_defers_until_cleared_then_resumes(self):
+        self.queue_one_task()
+        db = Database(self.home / "timetrace.db")
+        db.update_task(1, state="running", session_id="sess-1")
+        db.close()
+        marker = tool_slot_lock(self.home, "claude", 0)
+        marker.acquire()
+        os.close(marker._fd)                    # the owner died: the OS lock is gone, the marker stays
+        marker._fd = None
+        self.agent_online()
+        adapter = FakeAdapter("claude")
+        with patch("timetrace.cli._adapters", lambda cfg: {"claude": adapter}):
+            code, out, err = self.run_cli("run", "--once")
+            self.assertEqual(code, 0, err)
+            self.assertIn("deferred", out)
+            self.assertEqual(adapter.calls, [])
+            self.assertEqual(self.task_state(), "runnable")                     # recoverable, not lost
+            Path(marker.path).write_text("")                                    # the operator verified and cleared it
+            code, out, err = self.run_cli("run", "--once")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(self.task_state(), DONE)
 
 
 class QueueSlotsTest(unittest.TestCase):

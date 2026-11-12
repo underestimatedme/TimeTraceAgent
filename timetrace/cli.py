@@ -51,10 +51,11 @@ def _cloud(cfg: Dict[str, Any]) -> CloudClient:
     return CloudClient(str(cfg["cloud_base_url"]), device_id=device_identity(config.home()))
 
 
-def _flock_file(path: Path):
+def _flock_file(path: Path, shared: bool = False):
+    """Open `path` and take its flock without waiting; None when someone holds a conflicting lock."""
     lock_file = open(path, "a+")
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError:
         lock_file.close()
         return None
@@ -62,41 +63,46 @@ def _flock_file(path: Path):
 
 
 def _acquire_execution_lock(home: Path):
-    """The process-wide lock of the online agent daemon (`timetrace agent run`)."""
+    """agent.lock held EXCLUSIVELY: the way every `timetrace run` and `timetrace agent run` up to 0.6.4 takes
+    it, and the way a queue running alone still takes it. Nothing else can hold agent.lock then."""
     return _flock_file(home / "agent.lock")
 
 
-_AGENT_RUN = re.compile(r"\btimetrace\b.*\bagent\s+run\b")
+class _AgentLocks:
+    """What a running agent daemon holds: agent.lock SHARED and agent-role.lock exclusive."""
+
+    def __init__(self, role, shared):
+        self._files = (shared, role)
+
+    def close(self) -> None:
+        for f in self._files:
+            f.close()
 
 
-def _agent_daemon_holds_lock(home: Path) -> bool:
-    """True when every other process that has agent.lock open is a running `timetrace agent run`.
-    Best effort and read-only (lsof, ps): anything unreadable or unrecognised is False, which keeps
-    the queue out exactly as before."""
-    try:
-        listed = subprocess.run(["lsof", "-t", "--", str(Path(home) / "agent.lock")],
-                                capture_output=True, text=True, timeout=10).stdout.split()
-        pids = sorted({int(p) for p in listed if p.isdigit()} - {os.getpid()})
-        if not pids:
-            return False
-        for pid in pids:
-            command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                                     capture_output=True, text=True, timeout=10).stdout
-            if not _AGENT_RUN.search(command):
-                return False
-        return True
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+def _acquire_agent_lock(home: Path):
+    """The agent daemon's hold on agent.lock. It is SHARED, so a queue may take it shared too and run beside
+    the agent, while an older `timetrace run` / `timetrace agent run` (exclusive, no waiting) is kept out for as
+    long as any current participant is online: no gap when the agent leaves, no `_recover_running` of an older
+    queue on a task that is being run. agent-role.lock keeps it to one agent."""
+    role = _flock_file(home / "agent-role.lock")
+    if role is None:
+        return None
+    shared = _flock_file(home / "agent.lock", shared=True)
+    if shared is None:
+        role.close()
+        return None
+    return _AgentLocks(role, shared)
 
 
 class _SchedulerGuard:
     """What lets the local queue (`timetrace run`) run.
 
-    Its own lock keeps two queues apart. Then either it takes the process-wide agent.lock, as it always
-    did (nothing else is running: mode "exclusive", which also keeps an agent from starting beside it),
-    or that lock is held by an online agent daemon and the queue runs beside it (mode "beside-agent"),
-    where it must obey the shared coding-slot limits (see scheduler._dispatch). A lock held by anything
-    that is not an agent daemon, such as another queue of an older version, keeps the queue out."""
+    Its own lock keeps two queues apart. Then it takes agent.lock either exclusively, as it always did (nothing
+    else is running: mode "exclusive", which also keeps an agent from starting beside it), or shared when a
+    current agent daemon holds it shared (mode "beside-agent"), where it must obey the shared coding-slot limits
+    (see scheduler._dispatch). It keeps that hold until it exits, so the agent leaving never opens a window for an
+    older queue. A lock held exclusively by anything else, an agent or a queue of an older version, which cannot
+    know it has company, keeps the queue out (fail closed: upgrade that agent first)."""
 
     def __init__(self, home: Path):
         self.home = Path(home)
@@ -108,23 +114,17 @@ class _SchedulerGuard:
         self._role = _flock_file(self.home / "scheduler.lock")
         if self._role is None:
             return "error: another timetrace scheduler is already running"
-        err = self.refresh()
-        if err:
-            self.release()
-        return err
-
-    def refresh(self) -> Optional[str]:
-        """Call before each pass: an agent that went away is replaced by this queue holding agent.lock itself,
-        so an older queue cannot slip in behind it; a lock taken by something else stops this queue."""
-        if self._agent is None:
-            self._agent = _acquire_execution_lock(self.home)
+        self._agent = _acquire_execution_lock(self.home)
         if self._agent is not None:
             self.mode = "exclusive"
             return None
-        if _agent_daemon_holds_lock(self.home):
+        self._agent = _flock_file(self.home / "agent.lock", shared=True)
+        if self._agent is not None:
             self.mode = "beside-agent"
             return None
-        return "error: another timetrace agent is already running"
+        self.release()
+        return ("error: another timetrace agent is already running (an agent or queue of an older version cannot "
+                "share the lock: stop it, or upgrade the agent first)")
 
     def release(self) -> None:
         for f in (self._agent, self._role):
@@ -608,9 +608,9 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) 
 
 def cmd_agent_run(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
-    lock_file = _acquire_execution_lock(home)
+    lock_file = _acquire_agent_lock(home)
     if lock_file is None:
-        print("error: another timetrace agent is already running", file=sys.stderr)
+        print("error: another timetrace agent or queue is already running", file=sys.stderr)
         return 1
     cloud = _cloud(cfg)
     state = {"sessions": SessionManager(CredentialStore(), cloud)}
@@ -1320,10 +1320,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         _recover_running(db)
         while True:
-            err = guard.refresh()
-            if err:
-                print(err, file=sys.stderr)
-                return 1
             try:
                 out = scheduler.run_once(db, adapters, cfg, home, log=_log,
                                          slots=limits if guard.mode == "beside-agent" else None)
