@@ -4,6 +4,13 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.5：本地队列可与在线 Agent 并存，登录诊断更准确
+
+- `timetrace run` 现在可以在在线的 `timetrace agent run` 旁边运行本地队列，两边共用执行槽位，合计不超过上限；Agent 与并存队列对 `agent.lock` 持共享锁，0.6.4 及更早版本的 `timetrace run`／`timetrace agent run`（独占加锁）因此在新版本在线期间拿不到锁，不会重置或重复运行正在执行的任务。**Agent 和队列都要先升到 0.6.5**；旧版 Agent 在线时队列拒绝并存。升级顺序、回滚和暂停状态的处理见 [docs/queue-beside-agent-upgrade.md](docs/queue-beside-agent-upgrade.md)。
+- `timetrace agent doctor` 区分「未登录或登录已失效」「计费方式不符」和「无法核验」，并给出对应的登录命令。
+
+不需要升级服务端，执行协议仍为 2。详见 [0.6.5 发布说明](docs/releases/0.6.5.md)。
+
 ## 0.6.4：复制任务结果文件不再被当成访问凭据
 
 AI 在工作副本里把结果写到 `.timetrace/out/`。以前用 `cp`、`mv` 等命令按相对路径处理这些文件时，会被误判为“访问凭据”而拒绝；用读写文件工具却可以。0.6.4 起，相对路径的 `.timetrace/out`（及 `.timetrace/out.prev-*`）视为工作副本内的路径；原本需要批准的命令仍需批准。`~/.timetrace`、`.timetrace` 下的其他文件、先切换目录的命令以及指向工作副本外的符号链接仍一律拒绝。不需要升级服务端。详见 [0.6.4 发布说明](docs/releases/0.6.4.md)。
