@@ -263,5 +263,69 @@ class ApprovalJobTest(Base):
         self.assertEqual(agent._renew_wait("", time.time() + 90, None), 30)
 
 
+
+
+class ApprovalDeliveryDiagnosticsTest(Base):
+    """The missing link in the 2026-11-12 trace: the Agent said nothing about
+    whether a slow upload waited on its own flush lock or on Valley."""
+
+    def test_slow_upload_is_logged_with_lock_wait_and_post_time_but_no_payload(self):
+        lines = []
+        class SlowCloud(ControlCloud):
+            def append_events(inner, token, job_id, attempt_id, epoch, events):
+                time.sleep(.25)
+                super().append_events(token, job_id, attempt_id, epoch, events)
+        cloud = SlowCloud([{"id": "j1", "plan_id": "p1", "provider": "claude", "tool_profile_id": "claude-default"}])
+        class Asking(Adapter):
+            interactive_runs = True
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None, control=None):
+                return RunResult(exit_code=0, ok=True, output="done", session_id=session_id)
+        agent = self.agent(cloud, Asking(), provider="claude", log=lines.append)
+        import timetrace.agent as module
+        old = module.SLOW_UPLOAD_LOG_SECONDS
+        module.SLOW_UPLOAD_LOG_SECONDS = .2
+        try:
+            agent.run_once()
+        finally:
+            module.SLOW_UPLOAD_LOG_SECONDS = old
+        slow = [l for l in lines if "slow upload" in l]
+        self.assertTrue(slow, lines)
+        self.assertRegex(slow[0], r"lock_wait=\d+\.\d+s post=\d+\.\d+s")
+        self.assertNotIn("SECRET-ARG", " ".join(lines))
+
+    def test_approval_request_that_waited_before_it_was_queued_is_logged(self):
+        lines = []
+        import timetrace.agent as module
+        cloud = ControlCloud([{"id": "j1", "plan_id": "p1", "provider": "claude", "tool_profile_id": "claude-default"}])
+        def lease_extra():
+            asked = [e for _, e in cloud.events if e["type"] == "approval_requested"]
+            return {"approvals": [{"request_id": e["request_id"], "decision": "approve", "remember": False}
+                                  for e in asked]}
+        cloud.lease_extra = lease_extra
+        class Asking(Adapter):
+            interactive_runs = True
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None, control=None):
+                control.permission({"tool_name": "Bash", "input": {"command": "echo SECRET-ARG"}}, threading.Event())
+                return RunResult(exit_code=0, ok=True, output="done", session_id=session_id)
+        agent = self.agent(cloud, Asking(), provider="claude", log=lines.append)
+        real_report, delayed = agent._report, []
+        def late_report(claim, events, flush=True):
+            if not delayed:
+                delayed.append(1)
+                time.sleep(.3)      # the supervising thread is busy elsewhere when the Runner asks
+            return real_report(claim, events, flush)
+        agent._report = late_report
+        old = module.SLOW_UPLOAD_LOG_SECONDS
+        module.SLOW_UPLOAD_LOG_SECONDS = .2
+        try:
+            agent.run_once()
+        finally:
+            module.SLOW_UPLOAD_LOG_SECONDS = old
+        waited = [l for l in lines if "approval request waited" in l]
+        self.assertTrue(waited, lines)
+        self.assertRegex(waited[0], r"waited \d+\.\d+s before it was queued")
+        self.assertNotIn("SECRET-ARG", " ".join(lines))
+
+
 if __name__ == "__main__":
     unittest.main()

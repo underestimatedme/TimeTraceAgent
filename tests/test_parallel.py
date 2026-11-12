@@ -38,6 +38,7 @@ class QueueCloud:
     def __init__(self, jobs):
         self.jobs = list(jobs)
         self.events = []
+        self.held = {}
         self.lock = threading.Lock()
 
     def claim(self, token):
@@ -50,8 +51,15 @@ class QueueCloud:
         return {"job": base, "attempt_id": "a-" + base["id"], "lease_epoch": 1, "lease_expires_at": lease()}
 
     def append_events(self, token, job_id, attempt_id, epoch, events):
+        # Valley skips every event at or below the sequence it already holds, so
+        # overlapping and replayed batches change nothing.
         with self.lock:
-            self.events.extend((job_id, e) for e in events)
+            held = self.held.setdefault(attempt_id, 0)
+            for e in events:
+                if e["seq"] > held:
+                    held = e["seq"]
+                    self.events.append((job_id, e))
+            self.held[attempt_id] = held
 
     def renew(self, token, attempt_id, epoch):
         return {"lease_expires_at": lease()}

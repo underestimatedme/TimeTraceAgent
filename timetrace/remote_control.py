@@ -46,8 +46,12 @@ class RunControl:
         self.renew_after: Optional[float] = None
         # Set once the job reported `running`: events may be sent from then on.
         self.started = False
+        # Set only by approval/control events (not by `running`): what the ApprovalPump waits for.
+        self.pending = threading.Event()
         self._cond = threading.Condition()
         self._events: List[Dict[str, Any]] = []
+        # request_id -> when the Runner asked (monotonic): the Agent logs how long a request waited to be queued.
+        self.emitted_at: Dict[str, float] = {}
         self._seen_controls = set()
         self._queued: List[Tuple[str, str]] = []
         self._send: Optional[Callable[[str], bool]] = None
@@ -77,12 +81,16 @@ class RunControl:
         with self._cond:
             events, self._events = self._events, []
             self.wakeup.clear()
+            self.pending.clear()
         return events
 
     def _emit(self, event: Dict[str, Any]) -> None:
         """Caller holds self._cond."""
+        if event.get("type") == "approval_requested":
+            self.emitted_at[str(event.get("request_id"))] = time.monotonic()
         self._events.append(event)
         self.wakeup.set()
+        self.pending.set()
 
     def _ack(self, control_id: str, status: str, message: str = "") -> None:
         self._emit({"type": "control_applied", "control_id": control_id, "status": status, "message": message})
@@ -162,6 +170,10 @@ class RunControl:
     @property
     def finished(self) -> bool:
         return self._finished
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def close(self) -> None:
         """The job is over: stop every wait for a decision."""

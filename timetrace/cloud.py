@@ -230,10 +230,11 @@ class CloudClient:
         self._observe_server_clock(value)
         return value
 
-    def append_events(self, token: str, job_id: str, attempt_id: str, epoch: int, events: list) -> Dict[str, Any]:
+    def append_events(self, token: str, job_id: str, attempt_id: str, epoch: int, events: list,
+                      timeout: Optional[float] = None) -> Dict[str, Any]:
         return self.request("POST", "/runner/attempts/%s/events" % _segment(attempt_id), {
             "job_id": job_id, "lease_epoch": epoch, "events": events,
-        }, token)
+        }, token, timeout=timeout)
 
     def renew(self, token: str, attempt_id: str, epoch: int) -> Dict[str, Any]:
         value = self.request("POST", "/runner/attempts/%s/renew" % _segment(attempt_id), {

@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import hashlib
+import inspect
 import os
 import re
 import shutil
@@ -20,6 +21,8 @@ from timetrace.db import Database
 from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
                        worktree)
 from timetrace.remote_control import RunControl
+from timetrace import approval_delivery
+from timetrace.approval_delivery import ApprovalPump
 from timetrace.mcp_access import parse_claim, skip_note, still_usable
 from timetrace.process import last_log_line, tail_text
 from timetrace.redact import redact
@@ -50,6 +53,10 @@ STOPPED = "runner_stopped"
 # While an AI process runs, a failed renewal or gate check is retried as long
 # as the current lease has more than this left; only then is the run stopped.
 RENEW_HOLD_MARGIN_SECONDS = 15.0
+# An upload, or an approval request waiting to be queued, that takes this long
+# is written to the Agent log (timings and ids only, never event content), so a
+# slow approval can be placed on this computer or on Valley.
+SLOW_UPLOAD_LOG_SECONDS = 2.0
 # How long shutdown waits for workers after cancelling them. launchd sends
 # SIGKILL ExitTimeOut (20 s) after SIGTERM; a killed tool group takes ≤ 2 s.
 SHUTDOWN_GRACE_SECONDS = 15
@@ -193,6 +200,10 @@ class Agent:
                  reset_credits_interval: float = RESET_CREDITS_INTERVAL_SECONDS,
                  sleep_guard: Any = None, user_home: str = None, remote_config=None):
         self.db, self.cloud, self.adapters = db, cloud, adapters
+        try:
+            self._append_timeout_kw = "timeout" in inspect.signature(cloud.append_events).parameters
+        except (TypeError, ValueError, AttributeError):
+            self._append_timeout_kw = False
         self.remote_config = remote_config
         # Protocol 2: the inventory carries protocol/agent version, the local
         # pause, the self-check and the reset credits.
@@ -233,6 +244,13 @@ class Agent:
             with token_lock:
                 return access_token()
         self._flush_lock = threading.Lock()
+        self._flush_post, self._flush_batches = 0.0, 0
+        # Sequence numbers of one attempt are allocated one caller at a time (the
+        # supervising loop and the approval pump both queue events).
+        self._report_lock = threading.Lock()
+        # attempts with an approval-path upload in flight; the normal flush waits for them (bounded)
+        self._fast_cond = threading.Condition()
+        self._fast_inflight = {}
         # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
         # (remote_outbox_retry), so a restart keeps every batch's waiting time.
         self._outbox_failures_logged = {}
@@ -838,12 +856,14 @@ class Agent:
         self._track(cancel_event)
         with self._controls_lock:
             self._controls[claim["attempt_id"]] = control
+        pump = ApprovalPump(self, claim, control).start()
         try:
             return self._execute_tracked(claim, workspace, adapter, checkpoint, plan_key, log_file,
                                          deadline, ws_lock, cancel_event, resuming, session_id,
                                          execution_job, local_id, control)
         finally:
             control.close()
+            pump.stop()
             with self._controls_lock:
                 self._controls.pop(claim["attempt_id"], None)
             self._untrack(cancel_event)
@@ -2080,27 +2100,34 @@ class Agent:
         job_id, attempt_id = claim["job"]["id"], claim["attempt_id"]
         with self._controls_lock:
             control = self._controls.get(attempt_id)
-        if control is not None and getattr(control, "started", False):
-            # Control acknowledgements and approval requests come first:
-            # they happened before whatever this call reports.
-            events = control.take_events() + list(events)
-        # A job with a control has side events (protocol 2) between
-        # `running` and its terminal event: each event takes the next
-        # sequence number. Other jobs keep their fixed numbers (a replayed
-        # event with the same seq is ignored by the outbox).
-        last = self.db.last_remote_seq(job_id, attempt_id) if events and control is not None else None
-        for event in events:
-            event = dict(event)
-            if last is not None:
-                last = max(int(event.get("seq") or 0), last + 1)
-                event["seq"] = last
-            if event.get("type") == "failed":
-                self._health_due = True  # re-check the computer after a failure
-            # Stamp the phase when observed, before durable enqueue. flush_outbox
-            # replays this payload unchanged even after restart/network delay.
-            event = self._outbound(event)
-            event.setdefault("observed_at", self._observed_now())
-            self.db.queue_remote_event(job_id, attempt_id, claim["lease_epoch"], event)
+        with self._report_lock:
+            if control is not None and getattr(control, "started", False):
+                # Control acknowledgements and approval requests come first:
+                # they happened before whatever this call reports.
+                taken = control.take_events()
+                for event in taken:
+                    if event.get("type") == "approval_requested":
+                        lag = time.monotonic() - control.emitted_at.pop(event.get("request_id"), time.monotonic())
+                        if lag >= SLOW_UPLOAD_LOG_SECONDS:
+                            self.log("approval request waited %.1fs before it was queued (job %s)" % (lag, job_id))
+                events = taken + list(events)
+            # A job with a control has side events (protocol 2) between
+            # `running` and its terminal event: each event takes the next
+            # sequence number. Other jobs keep their fixed numbers (a replayed
+            # event with the same seq is ignored by the outbox).
+            last = self.db.last_remote_seq(job_id, attempt_id) if events and control is not None else None
+            for event in events:
+                event = dict(event)
+                if last is not None:
+                    last = max(int(event.get("seq") or 0), last + 1)
+                    event["seq"] = last
+                if event.get("type") == "failed":
+                    self._health_due = True  # re-check the computer after a failure
+                # Stamp the phase when observed, before durable enqueue. flush_outbox
+                # replays this payload unchanged even after restart/network delay.
+                event = self._outbound(event)
+                event.setdefault("observed_at", self._observed_now())
+                self.db.queue_remote_event(job_id, attempt_id, claim["lease_epoch"], event)
         if not flush:
             return
         try:
@@ -2223,8 +2250,18 @@ class Agent:
 
     def flush_outbox(self) -> None:
         # Parallel jobs flush too: one batch is never sent twice at once.
+        asked = time.monotonic()
         with self._flush_lock:
-            self._flush_outbox()
+            got = time.monotonic()
+            self._flush_post = 0.0
+            self._flush_batches = 0
+            try:
+                self._flush_outbox()
+            finally:
+                lock_wait, post = got - asked, self._flush_post
+                if lock_wait + (time.monotonic() - got) >= SLOW_UPLOAD_LOG_SECONDS:
+                    self.log("slow upload: lock_wait=%.1fs post=%.1fs batches=%d (waited for this computer's own flush "
+                             "lock, then sent to Valley)" % (lock_wait, post, self._flush_batches))
 
     def _flush_outbox(self) -> None:
         batches = {}
@@ -2243,36 +2280,44 @@ class Agent:
             retry = self.db.remote_event_retry(job, attempt, epoch)
             if retry is not None and time.time() < retry["retry_at"]:
                 continue
+            if self._fast_live(key):
+                self._wait_fast(key)
+                rows = self.db.pending_remote_events_for(job, attempt, epoch)
+                if not rows:
+                    continue
             rows.sort(key=lambda row: row["seq"])
             # Pairing/refresh problems are not this batch's fault: they still
             # propagate to the claim loop's own handling.
             token = self.access_token()
+            posted = time.monotonic()
             try:
-                self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+                self._flush_batches += 1
+                try:
+                    self.cloud.append_events(token, job, attempt, epoch, [row["payload"] for row in rows])
+                finally:
+                    self._flush_post += time.monotonic() - posted
             except CloudError as exc:
                 if exc.status == 401:
                     raise
                 if exc.status != 409:
                     # Valley answered, but not with success: this attempt's
                     # problem, not the other batches' or the claim's.
-                    self._defer_failed_batch(key, rows, exc, retry)
+                    if self._still_pending(rows):
+                        self._defer_failed_batch(key, rows, exc, retry)
                     continue
                 # A stale/conflicting attempt must not block presence, claims
                 # or unrelated result batches. Never treat conflict as an ACK.
-                now = time.time()
-                self.db.defer_remote_events(job, attempt, epoch, 409, now, now + OUTBOX_REFUSED_RETRY_SECONDS)
-                if self._outbox_failures_logged.get(key) != "HTTP 409":
-                    self._outbox_failures_logged[key] = "HTTP 409"
-                    self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
-                             "事件保留在本机队列，不影响其他回报和领取新任务；不会自动丢弃，见 `timetrace agent doctor`。"
-                             % (job, epoch, attempt))
+                self._refuse_batch(key)
                 refused = refused or exc
                 continue
             except Exception as exc:
                 # No response at all (timeout, network): the next batch would
                 # wait out the same timeout, so this round ends here. The
-                # batch stays queued and is tried again after its delay.
-                self._defer_failed_batch(key, rows, exc, retry)
+                # batch stays queued and is tried again after its delay. A slow
+                # request that fails after a newer one already got these events
+                # acknowledged has nothing left to retry.
+                if self._still_pending(rows):
+                    self._defer_failed_batch(key, rows, exc, retry)
                 break
             self.db.mark_remote_events_sent([row["id"] for row in rows])
             self.db.clear_remote_event_retry(job, attempt, epoch)
@@ -2281,6 +2326,135 @@ class Agent:
             self.db.prune_sent_remote_events(time.time() - OUTBOX_RETENTION_SECONDS)
         if refused is not None:
             raise refused
+
+    def _refuse_batch(self, key) -> None:
+        """Valley answered 409 for this attempt: keep its events, retry rarely."""
+        job, attempt, epoch = key
+        now = time.time()
+        self.db.defer_remote_events(job, attempt, epoch, 409, now, now + OUTBOX_REFUSED_RETRY_SECONDS)
+        if self._outbox_failures_logged.get(key) != "HTTP 409":
+            self._outbox_failures_logged[key] = "HTTP 409"
+            self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
+                     "事件保留在本机队列，不影响其他回报和领取新任务；不会自动丢弃，见 `timetrace agent doctor`。"
+                     % (job, epoch, attempt))
+
+    def _still_pending(self, rows) -> bool:
+        ids = [row["id"] for row in rows]
+        marks = ",".join("?" for _ in ids)
+        left = self.db.conn.execute(
+            "SELECT COUNT(*) FROM remote_outbox WHERE id IN (" + marks + ") AND sent_at IS NULL", ids).fetchone()[0]
+        return bool(left)
+
+    def _append(self, token, job, attempt, epoch, payloads, timeout=None):
+        if timeout and self._append_timeout_kw:
+            return self.cloud.append_events(token, job, attempt, epoch, payloads, timeout=timeout)
+        return self.cloud.append_events(token, job, attempt, epoch, payloads)
+
+    # Result events (the end of a run) never take the approval path: they keep
+    # the normal flush, in one piece, exactly as before.
+    _RESULT_EVENT_TYPES = ("completed", "failed", "cancelled", "waiting_quota", "waiting_local_auth", "waiting_input")
+
+    def _fast_rows(self, key):
+        """The attempt's unacknowledged events up to, not including, its first result event."""
+        rows = []
+        for row in self.db.pending_remote_events_for(*key):
+            if row["payload"].get("type") in self._RESULT_EVENT_TYPES:
+                break
+            rows.append(row)
+        return rows
+
+    def _upload_due(self, claim) -> bool:
+        """Events of this attempt wait and their backoff (if any) has run out."""
+        key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        retry = self.db.remote_event_retry(*key)
+        if retry is not None and time.time() < retry["retry_at"]:
+            return False
+        return bool(self._fast_rows(key))
+
+    def fast_begin(self, claim) -> None:
+        key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        with self._fast_cond:
+            self._fast_inflight.setdefault(key, []).append(
+                time.monotonic() + approval_delivery.APPROVAL_UPLOAD_STUCK_AFTER_SECONDS)
+
+    def fast_end(self, claim) -> None:
+        key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        with self._fast_cond:
+            marks = self._fast_inflight.get(key)
+            if marks:
+                marks.pop(0)
+                if not marks:
+                    del self._fast_inflight[key]
+            self._fast_cond.notify_all()
+
+    def _fast_live(self, key):
+        """Deadlines of this attempt's approval-path uploads that still count (a stuck one expires)."""
+        now = time.monotonic()
+        with self._fast_cond:
+            return [d for d in self._fast_inflight.get(key, ()) if d > now]
+
+    def _wait_fast(self, key) -> None:
+        """The normal flush lets an approval-path upload of the same attempt finish first, so the two
+        do not send the same events side by side. The wait ends at the latest deadline: a stuck
+        upload never makes a flush wait more than APPROVAL_UPLOAD_STUCK_AFTER_SECONDS."""
+        with self._fast_cond:
+            while True:
+                now = time.monotonic()
+                live = [d for d in self._fast_inflight.get(key, ()) if d > now]
+                if not live:
+                    return
+                self._fast_cond.wait(max(.01, max(live) - now))
+
+    def _upload_attempt(self, claim, force: bool = True) -> None:
+        """Approval path (see approval_delivery): send this attempt's whole
+        unacknowledged tail now, without the global flush lock, with a short
+        timeout and one immediate retry. Replays are harmless: Valley skips
+        what it already holds. Leaves anything it cannot send to the normal
+        flush and its backoff."""
+        job, attempt, epoch = claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"]
+        key = (job, attempt, epoch)
+        retry = self.db.remote_event_retry(*key)
+        if retry is not None and time.time() < retry["retry_at"] and (retry["status"] == 409 or not force):
+            return  # refused (409), or a background retry that must wait out its backoff
+        # A new event (force) is tried at once even inside a backoff that an
+        # earlier, slower failure set: events are rare and small, and this is
+        # how "the old upload is slow" is told from "Valley is down" (the two
+        # bounded tries below fail fast when Valley is down).
+        self._upload_rows(key, retry)
+
+    def _upload_rows(self, key, retry) -> None:
+        job, attempt, epoch = key
+        rows = self._fast_rows(key)
+        if not rows:
+            return
+        payloads, failure = [row["payload"] for row in rows], None
+        for tries in range(approval_delivery.APPROVAL_UPLOAD_ATTEMPTS):
+            began = time.monotonic()
+            try:
+                self._append(self.access_token(), job, attempt, epoch, payloads,
+                             approval_delivery.APPROVAL_UPLOAD_TIMEOUT_SECONDS)
+            except CloudError as exc:
+                if exc.status == 401:
+                    return
+                if exc.status == 409:
+                    # Only a real refusal backs off: another upload may already have got these events
+                    # acknowledged (Valley then skips them, so 409 cannot come from a replay).
+                    if self._still_pending(rows):
+                        self._refuse_batch(key)
+                    return
+                failure = exc
+            except Exception as exc:
+                failure = exc
+            else:
+                self.db.mark_remote_events_sent([row["id"] for row in rows])
+                self.db.clear_remote_event_retry(*key)
+                self._outbox_failures_logged.pop(key, None)
+                return
+            self.log("approval upload %d/%d for job %s failed after %.1fs (%s)" % (
+                tries + 1, approval_delivery.APPROVAL_UPLOAD_ATTEMPTS, job, time.monotonic() - began,
+                failure.__class__.__name__))
+        if self._still_pending(rows):
+            self._defer_failed_batch(key, rows, failure, retry)
 
     def _defer_failed_batch(self, key, rows, exc, retry) -> None:
         """Keep a batch whose upload failed (anything but 409/401) and retry it
