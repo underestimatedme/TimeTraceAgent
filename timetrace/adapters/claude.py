@@ -20,6 +20,7 @@ from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IM
 from timetrace.billing import billing_env_keys, claude_verifier
 from timetrace import tiers
 from timetrace.adapters import claude_usage
+from timetrace.config import claude_quota_probe_enabled
 from timetrace.claude_stream import run_stream
 from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.redact import masking
@@ -345,10 +346,14 @@ class ClaudeAdapter(ToolAdapter):
     def read_limits(self) -> Optional[List[Sample]]:
         """On-demand read through the OAuth usage endpoint; None when the local
         login is missing, expired, or the endpoint refuses."""
+        if not claude_quota_probe_enabled(self.cfg):
+            return None
         return claude_usage.usage_samples(self._credentials(), now=time.time())
 
     def quota_unavailable_reason(self) -> str:
         """Why `can_read_quota` is false, in words the person can act on."""
+        if not claude_quota_probe_enabled(self.cfg):
+            return "已关闭 Claude 余量嗅探"
         oauth = self._credentials() or {}
         if not oauth.get("accessToken"):
             return ("本机的 Claude Code 未登录（钥匙串里没有可用令牌），读不到额度；"
@@ -362,7 +367,8 @@ class ClaudeAdapter(ToolAdapter):
         # from the billing verdict; unverified keeps the gate closed.
         return merge_capabilities({
             "can_record": True,
-            "can_read_quota": bool((self._credentials() or {}).get("accessToken")),
+            "can_read_quota": (claude_quota_probe_enabled(self.cfg)
+                               and bool((self._credentials() or {}).get("accessToken"))),
             "can_dispatch": True,
             "can_resume": True,
             "can_enforce_zero_spend": self.billing.verdict().verified,

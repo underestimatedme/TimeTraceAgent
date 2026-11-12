@@ -157,6 +157,19 @@ class StatuslineInstallTest(HookTestBase):
         self.assertEqual(code, 1)
         self.assertEqual(self.settings.read_text(), "{not json")
 
+    def test_disabled_probe_ignores_a_cached_hook_and_preserves_custom_statusline(self):
+        settings = {"statusLine": {"type": "command", "command": "echo custom"}}
+        self.write_settings(settings)
+        self.data.mkdir()
+        (self.data / "config.json").write_text('{"claude":{"quota_probe":false}}')
+        code, out, err = self.run_cli("statusline", stdin=PAYLOAD)
+        self.assertEqual((code, out, err), (0, "", ""))
+        self.assertFalse((self.data / "timetrace.db").exists())
+        self.assertFalse((self.data / "runner_state.json").exists())
+        code, _, err = self.run_cli("statusline", "--install")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_settings(), settings)
+
     def test_statusline_run_records_when_it_was_last_called(self):
         from timetrace import runner_state
         self.run_cli("statusline", stdin=PAYLOAD)
@@ -215,6 +228,19 @@ class AutoInstallTest(HookTestBase):
         self.found = False
         self.run_cli("agent", "install")
         self.assertFalse(self.settings.exists())
+
+    def test_upgrade_and_setup_keep_existing_opt_out(self):
+        self.data.mkdir()
+        (self.data / "config.json").write_text('{"claude":{"quota_probe":false}}')
+        code, _, err = self.run_cli("agent", "install")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.settings.exists())
+        _, _, asked = self.wizard([], ["", "n", ""])
+        self.assertFalse(any("状态栏钩子" in prompt for prompt in asked))
+        self.assertFalse(self.settings.exists())
+        _, out, _ = self.run_cli("agent", "doctor")
+        self.assertIn("Claude 状态栏钩子: 已关闭", out)
+        self.assertNotIn("timetrace statusline --install", out)
 
     def test_setup_asks_once_and_defaults_to_yes(self):
         # answers: repo (none), keep binding, install agent, install hook

@@ -118,6 +118,23 @@ class ClaudeAdapterQuotaTest(unittest.TestCase):
                          [("claude:five_hour", 41.0), ("claude:seven_day", 60.0)])
         self.assertTrue(adapter.capabilities()["can_read_quota"])
 
+    def test_disabled_probe_skips_oauth_read_and_keeps_execution_capabilities(self):
+        from timetrace.adapters.claude import ClaudeAdapter
+        from timetrace.billing import StaticBilling
+        credentials = unittest.mock.Mock(side_effect=AssertionError("read quota credentials"))
+        adapter = ClaudeAdapter({"quota_probe": False}, billing=StaticBilling(True, "test"),
+                                credentials=credentials)
+        with unittest.mock.patch.object(claude_usage, "usage_samples") as probe:
+            caps = adapter.capabilities()
+            self.assertFalse(caps["can_read_quota"])
+            self.assertTrue(caps["can_dispatch"])
+            self.assertTrue(caps["can_resume"])
+            self.assertTrue(caps["can_enforce_zero_spend"])
+            self.assertIn("已关闭 Claude 余量嗅探", adapter.quota_unavailable_reason())
+            self.assertIsNone(adapter.read_limits())
+            credentials.assert_not_called()
+            probe.assert_not_called()
+
     def test_says_why_quota_cannot_be_read_and_how_to_fix_it(self):
         from timetrace.adapters.claude import ClaudeAdapter
         from timetrace.billing import StaticBilling

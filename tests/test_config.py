@@ -86,6 +86,24 @@ class ConfigCommandTest(unittest.TestCase):
             code, _, _ = self.run_cli("config", "set", tool + ".model", "--model other")
             self.assertEqual(code, 2)
 
+    def test_claude_quota_probe_round_trips_and_preserves_existing_settings(self):
+        path = Path(self.tmp.name) / "config.json"
+        path.write_text(json.dumps({"claude": {"model": "existing-model"}}))
+        code, out, _ = self.run_cli("config", "get", "claude.quota_probe")
+        self.assertEqual((code, out.strip()), (0, "true"))
+        code, out, err = self.run_cli("config", "set", "claude.quota_probe", "false")
+        self.assertEqual(code, 0, err)
+        self.assertIn("restart the Runner", out)
+        self.assertEqual(json.loads(path.read_text()),
+                         {"claude": {"model": "existing-model", "quota_probe": False}})
+        code, out, _ = self.run_cli("config", "list")
+        self.assertEqual(code, 0)
+        self.assertIn("claude.quota_probe = false", out.splitlines())
+        code, _, _ = self.run_cli("config", "set", "claude.quota_probe", "maybe")
+        self.assertEqual(code, 2)
+        code, out, _ = self.run_cli("config", "get", "claude.quota_probe")
+        self.assertEqual((code, out.strip()), (0, "false"))
+
     def test_get_shows_the_effective_value(self):
         code, out, _ = self.run_cli("config", "get", "upload_output_tail")
         self.assertEqual((code, out.strip()), (0, "true"))
@@ -103,7 +121,7 @@ class ConfigCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         for key in ("upload_output_tail", "cloud_base_url", "interval_sec"):
             self.assertIn(key, out)
-        # the nested tool sections are not scalar keys; only their .bin is settable
+        # Nested tool sections are exposed as individual keys.
         self.assertFalse(any(line.startswith("claude =") for line in out.splitlines()))
         self.assertIn("claude.bin = claude", out)
         self.assertIn("codex.bin = codex", out)

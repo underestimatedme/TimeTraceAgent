@@ -1001,7 +1001,7 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
             print(line)
         if name in adapters:
             _print_tool_quota(adapters[name])
-    for line in _statusline_lines(home, db):
+    for line in _statusline_lines(home, db, cfg):
         print(line)
     print("电脑端版本: %s（协议 %d）" % (__version__, PROTOCOL_VERSION))
     local = pause.state(home)
@@ -1254,7 +1254,9 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
             out("  注意：已安装的后台 Runner 仍找不到 %s，运行 `timetrace agent install` 修复。" % "、".join(hidden))
     claude = resolutions.get("claude")
     if claude is not None and claude.path and not args.no_statusline:
-        if statusline_hook.installed(user_home, home):
+        if not config.claude_quota_probe_enabled(cfg["claude"]):
+            out("  已关闭 Claude 余量嗅探，跳过安装状态栏钩子")
+        elif statusline_hook.installed(user_home, home):
             out("  Claude 状态栏钩子：已安装")
         else:
             if args.yes:
@@ -1284,7 +1286,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("%s = %s" % (key, config.format_value(cfg.get(key))))
             for tool, value in _max_parallel_per_tool(cfg).items():
                 print("%s.%s = %d" % (config.PER_TOOL_KEY, tool, value))
-            for key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+            for key in config.TOOL_CONFIG_KEYS:
                 section, field = key.split(".", 1)
                 print("%s = %s" % (key, config.format_value((cfg.get(section) or {}).get(field))))
             return 0
@@ -1296,7 +1298,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                     config.parse_value(args.key, "1")  # raises naming the tools
                 print(limits[tool])
                 return 0
-            if args.key in config.TOOL_BIN_KEYS + config.TOOL_MODEL_KEYS:
+            if args.key in config.TOOL_CONFIG_KEYS:
                 section, field = args.key.split(".", 1)
                 print(config.format_value((config.load(home).get(section) or {}).get(field)))
                 return 0
@@ -1310,7 +1312,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 2
     print("%s = %s  (%s)" % (args.key, config.format_value(value), home / "config.json"))
     if args.key in ("cloud_base_url", "upload_output_tail", "interval_sec", "max_parallel") \
-            or args.key.startswith(config.PER_TOOL_KEY + ".") or args.key in config.TOOL_MODEL_KEYS:
+            or args.key.startswith(config.PER_TOOL_KEY + ".") \
+            or args.key in config.TOOL_MODEL_KEYS + (config.CLAUDE_QUOTA_PROBE_KEY,):
         print("restart the Runner to apply: launchctl kickstart -k gui/%d/com.atlaspaces.timetrace.agent" % os.getuid())
     if args.key in config.TOOL_BIN_KEYS:
         print("然后运行 timetrace agent install，让后台 Runner 使用它（并把它的目录加入 PATH）")
@@ -1503,12 +1506,16 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         return _install_statusline()
     if args.uninstall:
         return _uninstall_statusline()
+    home = config.home()
+    if not config.claude_quota_probe_enabled(config.load(home)["claude"]):
+        return 0
     raw = sys.stdin.read()
     try:
         doc = json.loads(raw) if raw.strip() else {}
     except ValueError:
         doc = {}
-    home, cfg, db = _open(args)
+    config.ensure_dirs(home)
+    db = Database(home / "timetrace.db")
     now = int(time.time())
     runner_state.record(home, statusline_seen_at=now)
     rl = doc.get("rate_limits") or {}
@@ -1545,6 +1552,9 @@ def _install_statusline(out=print, err=None) -> int:
     chaining (never overwriting) a status line the user already has."""
     err = err or (lambda message: print(message, file=sys.stderr))
     home = config.home()
+    if not config.claude_quota_probe_enabled(config.load(home)["claude"]):
+        out("已关闭 Claude 余量嗅探，跳过安装状态栏钩子")
+        return 0
     try:
         result, detail = statusline_hook.install(Path.home(), home, timetrace_command())
     except (OSError, ValueError) as exc:
@@ -1576,7 +1586,9 @@ def _uninstall_statusline() -> int:
     return 0
 
 
-def _statusline_lines(home: Path, db: Database) -> List[str]:
+def _statusline_lines(home: Path, db: Database, cfg: Dict[str, Any]) -> List[str]:
+    if not config.claude_quota_probe_enabled(cfg["claude"]):
+        return ["Claude 状态栏钩子: 已关闭（claude.quota_probe=false）"]
     if not statusline_hook.installed(Path.home(), home):
         return ["Claude 状态栏钩子: 未安装 → 运行 timetrace statusline --install"]
     last = db.latest_sample_at("statusline")

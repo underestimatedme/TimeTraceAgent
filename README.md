@@ -4,6 +4,12 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.7：可关闭 Claude 余量嗅探
+
+`timetrace config set claude.quota_probe false` 会关闭 Claude 后台余量查询和 TimeTrace 的 Claude 状态栏采集。设置保存在 `~/.timetrace/config.json`，Homebrew 升级会沿用。Codex 余量查询和 Claude 任务执行继续可用。详见 [0.6.7 发布说明](docs/releases/0.6.7.md)。
+
+升级：`brew update && brew upgrade timetraceagent`，然后在任务结束后执行 `timetrace agent install`。
+
 ## 0.6.6：审批请求走独立的回报通道
 
 新的审批请求不再排在其他慢上传后面：每个运行中的任务有一条独立通道，请求一产生就入队，并连同该次执行尚未确认的事件一起上传（单次 2.5 秒超时、立即重试一次，同一次执行最多 3 个上传同时进行），不再占用全局上传锁。未能发出的事件按原有退避继续重试；服务端拒绝（HTTP 409）时仍然只保留、低频重试、不丢弃。事件内容、序号和协议不变，服务端无需先升级，执行协议仍为 2。Agent 日志新增 `slow upload` 与 `approval request waited` 两类耗时行（只含耗时和任务编号），用来判断慢在本机还是服务端。服务端本身变慢或不可用时，本机无法更快送达。详见 [0.6.6 发布说明](docs/releases/0.6.6.md)。
@@ -402,6 +408,15 @@ API key、替代端点、第三方 provider 或配置问题需要按提示手动
 |---|---|---|
 | 终端（timetrace 无头运行） | `codex exec` 结束后立刻 `account/rateLimits/read` | 每次 `claude -p` 的 `rate_limit_event` |
 | 软件（你自己在 Codex 应用 / Claude Code 里用） | 同一接口，服务端真值，天然包含应用内消耗 | **`timetrace statusline`**：挂进 Claude Code 状态栏，每次刷新把 `rate_limits` 写进库 |
+
+关闭 Claude 的主动余量查询和状态栏采集：
+
+```bash
+timetrace config set claude.quota_probe false
+timetrace statusline --uninstall
+```
+
+在当前任务结束后重启 Runner（`timetrace agent install`）。设置为 `false` 时，安装和升级会跳过 TimeTrace 的状态栏钩子，已经加载的钩子调用也会跳过采集。要恢复采集，将设置改回 `true`，再重启 Runner 并安装钩子。未设置时沿用默认的 `true`。
 
 `timetrace setup`（会问一次「让刻迹读取 Claude 额度（安装状态栏钩子）？」，默认是）和 `timetrace agent install`（加 `--no-statusline` 跳过）
 在找到 `claude` 时会自动安装 Claude Code 状态栏钩子：往 `~/.claude/settings.json` 写入
