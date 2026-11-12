@@ -849,8 +849,71 @@ def _tool_version(binary: str, node: Optional[str] = None, run=subprocess.run) -
     return text[0].strip()[:80]
 
 
+def _tool_billing_details(name: str, adapters: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return adapters[name].capability_details() if name in adapters else {}
+    except Exception as exc:
+        return {"unsupported_reason": "check_failed:" + exc.__class__.__name__}
+
+
+def _billing_login_label(details: Dict[str, Any]) -> str:
+    """Doctor's explanation, without changing the protocol's coarse health states."""
+    if details.get("can_enforce_zero_spend") is True:
+        return "正常"
+    reason = details.get("unsupported_reason") or "unknown"
+    if reason == "not_logged_in":
+        return "未登录或登录已失效"
+    if reason in ("auth_method_not_subscription:unknown", "api_provider_not_first_party:unknown"):
+        return "无法核验"
+    if reason.startswith(("auth_method_not_subscription:", "api_provider_not_first_party:",
+                          "api_key_fallback_in_env:", "api_key_fallback_in_settings:")) or reason in (
+                              "api_key_helper_configured", "api_key_fallback_in_auth_file"):
+        return "计费方式不符"
+    return "无法核验"
+
+
+def _tool_recovery(name: str, binary: str, details: Dict[str, Any]) -> List[str]:
+    """Advice only: never run login or change billing settings to open the gate."""
+    reason = details.get("unsupported_reason") or "unknown"
+    label = _billing_login_label(details)
+    explanation = {
+        "not_logged_in": "工具未报告有效的订阅登录",
+        "api_key_helper_configured": "请手动检查 Claude settings.json 的 apiKeyHelper，避免按量计费",
+        "api_key_fallback_in_auth_file": "请手动检查 Codex auth.json 中的 OPENAI_API_KEY，避免 API key 计费",
+        "settings_unreadable": "无法读取 Claude settings.json；请手动检查文件权限和 JSON 格式",
+        "auth_file_unreadable": "无法读取 Codex auth.json；请手动检查文件权限和 JSON 格式",
+        "subscription_unknown": "工具未报告订阅套餐；请核对账号的订阅状态",
+        "auth_method_not_subscription:unknown": "工具未报告认证方式；请核对登录状态输出",
+        "api_provider_not_first_party:unknown": "工具未报告服务提供方；请核对登录状态输出",
+        "auth_status_unparseable": "无法识别工具的登录状态输出；请核对 CLI 版本和状态命令输出",
+    }.get(reason, "无法确认订阅登录；请先查看状态命令的具体结果")
+    if label == "计费方式不符" and reason.startswith("auth_method_not_subscription:"):
+        explanation = "当前认证方式不是订阅登录"
+    elif label == "计费方式不符" and reason.startswith("api_provider_not_first_party:"):
+        explanation = "当前使用第三方计费通道；请手动检查 Claude 的 provider 设置，使用 Claude.ai 订阅直连"
+    elif reason.startswith("api_key_fallback_in_env:"):
+        explanation = "存在 API key 或按量端点路径；请手动检查启动 Runner 的环境变量 %s" % reason.split(":", 1)[1]
+    elif reason.startswith("api_key_fallback_in_settings:"):
+        explanation = "存在 API key 或按量端点路径；请手动检查 Claude settings.json 的 env.%s" % reason.split(":", 1)[1]
+    elif reason.startswith("auth_status_unavailable:"):
+        explanation = "登录状态命令执行失败，不能据此断定未登录或过期；请先查看具体错误"
+    lines = ["  登录诊断: %s（%s）" % (label, explanation)]
+    executable = shlex.quote(binary)
+    login = executable + (" auth login" if name == "claude" else " login")
+    status = executable + (" auth status" if name == "claude" else " login status")
+    if reason == "not_logged_in" or (label == "计费方式不符" and reason.startswith("auth_method_not_subscription:")):
+        account = "Claude.ai" if name == "claude" else "ChatGPT"
+        lines.append("  修复: 在这台 Mac 上运行 %s，使用 %s 订阅账号登录" % (login, account))
+    elif reason == "auth_status_unavailable:exit_1":
+        lines.append("  若状态命令明确提示未登录或登录过期，再在这台 Mac 上运行 %s，使用订阅账号登录" % login)
+    lines.append("  复核: 运行 %s，然后 timetrace agent doctor；以零付费核验通过为准" % status)
+    lines.append("  同步: 核验通过后运行 timetrace agent sync，刷新后台 Runner 并上报工具清单；其他派活条件仍需满足")
+    return lines
+
+
 def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolution=None,
-                runner_path: Optional[str] = None, show_version: bool = False):
+                runner_path: Optional[str] = None, show_version: bool = False,
+                details: Optional[Dict[str, Any]] = None):
     """Location, Runner visibility, version and zero-spend verdict of one tool:
     (lines, verified). `runner_path` is the LaunchAgent PATH (None: not
     installed, visibility not checked)."""
@@ -877,15 +940,15 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolu
                              % "、".join(dict.fromkeys(resolution.dirs)))
     if found and show_version:
         lines.append("  版本: %s" % _tool_version(found, resolution.node if resolution is not None else None))
-    try:
-        details = adapters[name].capability_details() if name in adapters else {}
-    except Exception as exc:
-        details = {"unsupported_reason": "check_failed:" + exc.__class__.__name__}
+    if details is None:
+        details = _tool_billing_details(name, adapters)
     verified = details.get("can_enforce_zero_spend") is True
     if verified:
         lines.append("  零付费核验: 通过（%s，%s）" % (details.get("auth_method"), _iso_local(details.get("verified_at"))))
     else:
         lines.append("  零付费核验: 未通过（%s）→ 该工具不会被派发任务" % (details.get("unsupported_reason") or "unknown"))
+        if found:
+            lines.extend(_tool_recovery(name, found, details))
     return lines, verified
 
 
@@ -930,8 +993,10 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
               "（工具清单和额度仍会照常上报）")
     adapters = _adapters(cfg)
     runner_path = toolpath.installed_launch_path(user_home)
+    tool_details = {name: _tool_billing_details(name, adapters) for name in TOOLS}
     for name in TOOLS:
-        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path, show_version=True)
+        lines, _ = _tool_check(name, cfg, adapters, resolutions.get(name), runner_path,
+                              show_version=True, details=tool_details[name])
         for line in lines:
             print(line)
         if name in adapters:
@@ -948,6 +1013,12 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         report = {}
         print("  自检失败（%s）" % exc.__class__.__name__)
+    # The wire health schema cannot express an unknown check or a billing
+    # mismatch. Use the same verdict as above so doctor does not call them
+    # "not logged in" or "normal", or mistake an unknown plan for expiry.
+    report = dict(report)
+    for name, details in tool_details.items():
+        report[name + "_login"] = _billing_login_label(details)
     for line in _health_lines(report):
         print(line)
     for line in _reset_credit_lines(adapters):
