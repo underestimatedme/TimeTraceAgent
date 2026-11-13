@@ -300,6 +300,8 @@ class QueueAlongsideAgentTest(unittest.TestCase):
     # --- a task that really lost its owner ---------------------------------------------------
 
     def test_a_task_left_running_by_a_dead_queue_is_recovered_beside_an_agent(self):
+        # "recovered" no longer means "resumed by the restart": a missing slot marker is not an authorization. The
+        # restart marks the original record 待核对 and waits; the explicit retry then runs it, beside the agent
         self.queue_one_task()
         db = Database(self.home / "timetrace.db")
         db.update_task(1, state="running", session_id="sess-1")
@@ -308,9 +310,17 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         adapter = FakeAdapter("claude")
         with patch("timetrace.cli._adapters", lambda cfg: {"claude": adapter}):
             code, out, err = self.run_cli("run", "--once")
+            self.assertEqual(code, 0, err)
+            self.assertIn("was running when the scheduler ended without a record", out)
+            self.assertIn("待核对", out)
+            self.assertEqual(adapter.calls, [])                                 # not run again by itself
+            self.assertEqual(self.task_state(), "failed")
+            code, out, err = self.run_cli("retry", "1")                         # a person's decision
+            self.assertEqual(code, 0, err)
+            code, out, err = self.run_cli("run", "--once")
         self.assertEqual(code, 0, err)
-        self.assertIn("was running when the daemon stopped; will resume", out)
         self.assertEqual(len(adapter.calls), 1)
+        self.assertTrue(adapter.calls[0].startswith("You were interrupted"), adapter.calls[0])  # the recorded session
         self.assertEqual(self.task_state(), DONE)
 
     def test_a_crash_fence_left_by_the_dead_owner_defers_until_cleared_then_resumes(self):
@@ -322,12 +332,20 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         marker.acquire()
         os.close(marker._fd)                    # the owner died: the OS lock is gone, the marker stays
         marker._fd = None
+        fence = Path(marker.path).read_text()
         self.agent_online()
         adapter = FakeAdapter("claude")
         with patch("timetrace.cli._adapters", lambda cfg: {"claude": adapter}):
             code, out, err = self.run_cli("run", "--once")
             self.assertEqual(code, 0, err)
-            self.assertIn("deferred", out)
+            self.assertEqual(adapter.calls, [])                                 # the restart does not run it
+            self.assertEqual(self.task_state(), "failed")                       # 待核对, waiting for a retry
+            self.assertEqual(Path(marker.path).read_text(), fence)              # and does not touch the fence
+            code, out, err = self.run_cli("retry", "1")
+            self.assertEqual(code, 0, err)
+            code, out, err = self.run_cli("run", "--once")
+            self.assertEqual(code, 0, err)
+            self.assertIn("deferred", out)                                      # the fence still refuses the retry
             self.assertEqual(adapter.calls, [])
             self.assertEqual(self.task_state(), "runnable")                     # recoverable, not lost
             Path(marker.path).write_text("")                                    # the operator verified and cleared it

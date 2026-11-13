@@ -359,14 +359,18 @@ class SchedulerTest(unittest.TestCase):
         self.run_once({"claude": ad}, now=200)
         self.assertEqual(WORKTREE_CALLS, [(a, "HEAD"), (b, "timetrace/%d" % a)])
 
-    def test_child_fails_when_parent_fails(self):
+    def test_child_keeps_waiting_when_parent_fails(self):
+        # The parent keeps its session and worktree and a person can retry it, so the child that never ran waits
+        # for it instead of being failed (see tests/test_prerequisite_gate.py for the whole story).
         a = self.db.add_task("parent", "/repo", tool="claude")
         b = self.db.add_task("child", "/repo", tool="claude", depends_on=a)
         ad = FakeAdapter("claude", [RunResult(exit_code=1, error="x")])
         self.run_once({"claude": ad}, now=100)
         self.run_once({"claude": ad}, now=200)
-        self.assertEqual(self.db.get_task(b)["state"], FAILED)
-        self.assertIn("dependency 1 failed", self.db.get_task(b)["last_error"])
+        self.assertEqual(self.db.get_task(a)["state"], FAILED)
+        self.assertEqual(self.db.get_task(b)["state"], PENDING)
+        self.assertIsNone(self.db.get_task(b)["last_error"])
+        self.assertEqual(len(ad.calls), 1)
 
     def test_both_tools_exhausted_is_idle(self):
         limits.record_samples(self.db, [

@@ -4,6 +4,16 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.8：停止队列不再丢下工具进程，`--after` 真正等父任务，被拒收的结果不再无限重发
+
+- `timetrace run` 收到 Ctrl-C／SIGTERM 后确认工具进程组已退出才退出；任务记为 `failed`（`interrupted (SIGTERM): tool stopped`），不会自动重跑，不计入熔断，`timetrace retry <id>` 在原会话续跑。无法确认时写 `待核对` 并保持槽位封住。
+- `--after` 的任务在父任务 `done` 之前一直 `pending`；父任务失败时不再把它标成失败，`timetrace retry <父任务>` 通过后才按顺序启动，直接 `retry` 子任务也越不过父任务。见 [docs/queue-dependencies.md](docs/queue-dependencies.md)。
+- Valley 对同一批结果连续 5 次回复 HTTP 409 后，Runner 停止自动发送这一批（原始事件原样保留，不算已送达，也不算废弃）；`timetrace agent doctor` 会说明，`timetrace agent retry-results` 可手动重发。库存新增匿名的 `health.outbox` 汇总。见 [结果上报被拒收](docs/result-upload-refusals.md)。
+
+不需要升级服务端，执行协议仍为 2；数据库只新增一张表和一个带默认值的列，0.6.7 及更早版本仍可读写。详见 [0.6.8 发布说明](docs/releases/0.6.8.md)。
+
+升级：`brew update && brew upgrade timetraceagent`，然后在任务结束后执行 `timetrace agent install` 和 `timetrace agent doctor`。
+
 ## 0.6.7：可关闭 Claude 余量嗅探
 
 `timetrace config set claude.quota_probe false` 会关闭 Claude 后台余量查询和 TimeTrace 的 Claude 状态栏采集。设置保存在 `~/.timetrace/config.json`，Homebrew 升级会沿用。Codex 余量查询和 Claude 任务执行继续可用。详见 [0.6.7 发布说明](docs/releases/0.6.7.md)。
@@ -234,7 +244,7 @@ iPhone ──任务──▶ TimeTrace 云（Valley）◀──出站 HTTPS 轮�
 ```sh
 timetrace status                      # 各桶余量、重置倒计时、绑定约束（Codex 实时读，Claude 取最近采样）
 timetrace add "重构 payment 模块的错误处理" --repo ~/code/paycore --tool claude
-timetrace add "给上一步写单测" --repo ~/code/paycore --after 1 --any-tool
+timetrace add "给上一步写单测" --repo ~/code/paycore --after 1 --any-tool   # 等 #1 通过后才启动
 timetrace add "..." --repo ~/code/x --on-success "列出还需要补的重构点，每条一个任务"
 timetrace ls [--all]
 timetrace run [--once]                # 守护循环；--once 只跑一轮
@@ -245,6 +255,10 @@ timetrace events [--type task_blocked]
 ```
 
 任务状态：`pending → runnable → running → blocked → done / failed`。`blocked` 会自动恢复，`failed` 需要人看。
+
+`timetrace run` 收到 SIGINT（Ctrl-C）或 SIGTERM 时：不再认领新任务；正在执行的工具所在的进程组先收到 SIGTERM，2 秒后仍未退出就 SIGKILL，并在有限时间内确认它（及它启动的子进程）已退出，调度器才退出。确认之后，这一轮 run 写上结束信息，任务变成 `failed`、说明为 `interrupted (SIGTERM): tool stopped`（保留会话，不计入熔断的失败次数），槽位锁正常释放。**重启不会自动重跑它**：其他独立任务照常运行，`--after` 它的任务继续等待；你确认后 `timetrace retry <id>` 才会在原会话里续跑，且只启动一个工具进程。信号到来时工具恰好已经正常完成的，仍是 `done`，不会改成中断。重复发信号等同一次停止。“确认”只认内核明确回答进程组不存在（ESRCH）；进程组仍在，或回答 EPERM（组存在但无权对它发信号）及其他任何错误，都按未确认处理。若超时仍无法确认工具已退出，不会写“已停止”：任务说明含 `待核对`，槽位锁保持封住（沿用既有的人工清除规则），`timetrace run` 以退出码 1 结束。`kill -9` 之类的硬杀没有任何机会写记录：任务会留在 `running`。下次启动时它的原记录收尾为 `待核对`（没有退出码；工具是否还在运行无法证实，所以也不宣称它已停止），任务变成 `failed`，会话和工作树保留，**不会自动续跑**：槽位上有没有崩溃标记都一样——没有标记不等于已授权（标记只是某些崩溃碰巧留下的，换机器、被人清掉或来自旧数据库的情况都可能没有）。其他独立任务照常运行，`--after` 它的任务继续等待；你确认没有进程仍在写它的工作树后，`timetrace retry <id>` 才会在原会话、原工作树里续跑。槽位上若留有崩溃标记，它原样保留，retry 之后锁仍会拒绝第二个工具（`manual recovery required`），须按提示人工核对并清除后才会运行；槽位正被某个进程持有时则是 `deferred (runner busy)`。
+
+`--after` 的任务在父任务 `done` 之前一直是 `pending`（`ls` 显示 `等待前置工作 #N（…）`）：父任务失败时它不会被标成失败，`timetrace retry <父任务>`（同一工作树和会话）通过后才按顺序启动；直接 `retry` 子任务也不会越过父任务。规则和新旧版本混用见 [docs/queue-dependencies.md](docs/queue-dependencies.md)。
 
 ## 守护进程
 

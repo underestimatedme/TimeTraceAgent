@@ -5,7 +5,10 @@ pause / resume (local), interrupt, append, approval (every decision that was
 not a local auto-allow), version_rejected, and the manual set-aside of a refused
 upload batch: discard_requested (written and forced to disk BEFORE anything is
 changed), then outbox_discard (what was set aside) or discard_unchanged /
-discard_failed, all under one discard_id. The file is created 0600 and only ever
+discard_failed, all under one discard_id; and the manual retry of a batch whose
+automatic sending had stopped after repeated refusals: retry_requested (forced
+to disk BEFORE the change), then outbox_retry or retry_unchanged, under one
+retry_id. The file is created 0600 and only ever
 opened with O_APPEND; it stays on this computer.
 
 `record` is best effort and never raises. `record_durable` is for a decision that

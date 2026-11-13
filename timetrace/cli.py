@@ -10,6 +10,7 @@ import re
 import plistlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -18,16 +19,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse, parse_qsl, urlencode
 
-from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, qr, quota,
-                       render, runner_state, scheduler, statusline_hook, sync, toolpath, worktree)
+from timetrace import (__version__, audit, checks, config, folder, health, limits, pairscreen, pause, prerequisites,
+                       process, qr, quota, render, runner_state, scheduler, statusline_hook, sync, toolpath, worktree)
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
 from timetrace.dispatch import SlotLimits, adapter_capabilities, lock_diagnostics
-from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, FAILED, RUNNABLE, RUNNING, TOOLS,
-                         Sample)
+from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, EV_TASK_INTERRUPTED, EV_TASK_WAITING, FAILED,
+                         PENDING, RUNNABLE, RUNNING, TOOLS, Sample)
 
 
 def _open(args: argparse.Namespace):
@@ -725,6 +726,42 @@ def cmd_agent_discard_results(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_retry_results(args: argparse.Namespace) -> int:
+    """Put the stopped result batches of one attempt back into service: the original events are sent again.
+
+    By hand only. Nothing is rebuilt or re-run and no lease is renewed; Valley still decides. A batch that is
+    refused again stops again after the same bounded run. Never counted as delivered before an ACK."""
+    home, _, db = _open(args)
+    stopped = [p for p in db.remote_outbox_diagnostics()
+               if p["job_id"] == args.job and p["attempt_id"] == args.attempt and p.get("paused_at") is not None]
+    if not stopped:
+        print("没有任务 %s / 尝试 %s 这个已停止自动重试（连续 HTTP 409）的待上传批次。只有已停止的批次可以重新上传；"
+              "其它失败会自己恢复，见 timetrace agent doctor。" % (args.job, args.attempt))
+        return 2
+    count = sum(p["pending_events"] for p in stopped)
+    if not args.yes:
+        print("将让任务 %s / 尝试 %s 的 %d 条结果重新上传：原始事件原样再发一次，不改租约、不重新执行；"
+              "服务器仍拒收时会再次停止。确认请加 --yes。" % (args.job, args.attempt, count))
+        return 1
+    # As with discarding: the decision is on disk before anything changes.
+    ids = {"retry_id": uuid.uuid4().hex[:12], "job_id": args.job, "attempt_id": args.attempt, "source": "local"}
+    try:
+        audit.record_durable(home, "retry_requested", events=count, **ids)
+    except OSError as exc:
+        print("审计日志写不进去（%s），为了不留下没有记录的处置，没有恢复任何结果；它们仍保持停止自动重试的状态。"
+              "先让 %s 可写，再重新运行。" % (exc, audit.path(home)))
+        return 3
+    resumed = db.resume_paused_remote_events(args.job, args.attempt)
+    if not resumed:
+        audit.record(home, "retry_unchanged", reason="nothing was stopped any more", **ids)
+        print("没有可恢复的结果：这个批次刚被处理过，或已不是停止自动重试的状态。")
+        return 2
+    audit.record(home, "outbox_retry", events=resumed, **ids)
+    print("已让 %d 条结果重新上传：运行中的 Runner 会在下一轮把原始事件原样再发一次；收到服务器确认后才算已送达。"
+          "如果 Valley 仍然拒收，会再次停止并保留。" % resumed)
+    return 0
+
+
 def cmd_agent_sync(args: argparse.Namespace) -> int:
     """Have the running Runner re-check logins and report now, without a restart."""
     home, _, _ = _open(args)
@@ -789,6 +826,51 @@ def _reset_credit_lines(adapters: Dict[str, Any]) -> List[str]:
     for credit in entry.get("credits") or []:
         lines.append("    %s %s%s" % (credit.get("status"), credit.get("description") or credit.get("id"),
                                      "，%s 过期" % credit["expires_at"] if credit.get("expires_at") else ""))
+    return lines
+
+
+def _paused_batch_lines(db, batch) -> List[str]:
+    """Doctor's account of a batch the Runner stopped sending by itself: why, what is kept, what a person can do.
+
+    It claims no more than is known: a 409 does not say whether Valley already holds the events."""
+    job, attempt = batch["job_id"], batch["attempt_id"]
+    if batch.get("pause_basis") == "legacy_refused":
+        # Two facts, kept apart: what the older Runner recorded (a total, and a last answer) and the one fresh request.
+        why = ("升级前旧版本累计失败 %d 次（不区分失败类型），最后一次是 HTTP 409；升级后重新发送一次核对，"
+               "服务器在 %s 仍回复 HTTP 409" % (batch["legacy_failures"] or 0, _iso_local(batch["last_failed_at"])))
+    elif batch.get("pause_basis") == "confirmed":
+        why = "服务器连续 %d 次回复 HTTP 409，最近一次在 %s" % (batch["refused"], _iso_local(batch["last_failed_at"]))
+    else:
+        why = "按本机记录，最近一次 HTTP 409 在 %s" % _iso_local(batch["last_failed_at"])
+    first, last = db.remote_event_observed_span(job, attempt, batch["lease_epoch"])
+    spans = "，事件发生时间 %s 至 %s" % (first, last) if first else ""
+    return [
+        "结果上报已停止自动重试: 任务 %s / 尝试 %s，%s；%s 起不再自动上传。" % (
+            job, attempt, why, _iso_local(batch["paused_at"])),
+        "  原始结果完整保留在本机: %d 条（序列 %d–%d），最早入队 %s%s；没有标记为已送达，也没有被丢弃。" % (
+            batch["pending_events"], batch["first_seq"], batch["last_seq"], _iso_local(batch["oldest_event_at"]), spans),
+        "  HTTP 409 可能是这次执行的租约已失效、该尝试已结束或序列不连续；Runner 无法据此确定服务器是否已有这些结果。",
+        "  确认原因已排除后重新上传这批原始结果: timetrace agent retry-results %s %s --yes" % (job, attempt),
+        "  确认不再需要这些结果: timetrace agent discard-results %s %s --yes" % (job, attempt),
+    ]
+
+
+def _unchecked_batch_lines(batch) -> List[str]:
+    """Doctor's account of a batch an older Runner left with many failures and a last answer of 409.
+
+    Not stopped: the Runner sends the original events once more to find out. It says what the old record shows (a
+    total of failures of every kind and a last status) and no more: that is not a run of refusals."""
+    lines = [
+        "结果上报待核对: 任务 %s / 尝试 %s，升级前旧版本累计失败 %d 次（旧版不区分失败类型），最后一次是 HTTP 409；"
+        "%d 条结果完整保留在本机，最早一条产生于 %s。" % (
+            batch["job_id"], batch["attempt_id"], batch["legacy_failures"] or 0, batch["pending_events"],
+            _iso_local(batch["oldest_event_at"])),
+        "  这两个数字不能证明服务器现在仍会拒收。Runner 会把原始结果再发送一次来核对：收到确认就原样送达；"
+        "再次回复 HTTP 409 才停止自动重试并保留，由你决定；网络错误、401、429、5xx 不算拒收，按原退避继续。",
+    ]
+    if batch["status"] != 409:
+        lines.append("  升级后的核对请求还没有得到服务器的答复（最近一次: %s），下次重试 %s。" % (
+            _outbox_failure_text(batch["status"]), _iso_local(batch["retry_at"])))
     return lines
 
 
@@ -1025,6 +1107,14 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
         print(line)
     diagnostics = lock_diagnostics(home)
     for pending in db.remote_outbox_diagnostics():
+        if pending.get("paused_at") is not None:
+            for line in _paused_batch_lines(db, pending):
+                print(line)
+            continue
+        if pending.get("pause_basis") == "legacy_check":
+            for line in _unchecked_batch_lines(pending):
+                print(line)
+            continue
         if pending["status"] == 409:
             print("结果上报被服务器拒收: 任务 %s / 尝试 %s，HTTP 409，%d 条结果保留在本机，最早一条产生于 %s，已重试 %d 次；不会自动丢弃。" % (
                 pending["job_id"], pending["attempt_id"], pending["pending_events"],
@@ -1361,17 +1451,25 @@ def cmd_add(args: argparse.Namespace) -> int:
         return 2
     tid = db.add_task(prompt.strip(), repo, tool=args.tool, any_tool=args.any_tool,
                       depends_on=args.after, on_success=args.on_success, priority=args.priority)
-    print("task %d added (%s)" % (tid, "pending" if args.after is not None else "runnable"))
+    if args.after is None:
+        print("task %d added (runnable)" % tid)
+    else:
+        waits = prerequisites.check(db, db.get_task(tid))
+        print("task %d added (pending) — %s" % (tid, prerequisites.describe(waits)))
     return 0
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
     tasks = db.list_tasks(include_done=args.all)
+    # What each pending task waits for is read from the parent chain as it is now, not stored: it changes as the
+    # work before it moves, and a stored sentence would be stale the moment a parent is retried.
+    waiting = {t["id"]: prerequisites.check(db, t) for t in tasks if t["state"] == "pending"}
     if args.json:
-        print(json.dumps(tasks, ensure_ascii=False, indent=2))
+        print(json.dumps([dict(t, prerequisite=waiting[t["id"]].as_dict() if t["id"] in waiting else None)
+                          for t in tasks], ensure_ascii=False, indent=2))
     else:
-        print(render.tasks_table(tasks, int(time.time())))
+        print(render.tasks_table(tasks, int(time.time()), {i: prerequisites.describe(p) for i, p in waiting.items()}))
     return 0
 
 
@@ -1388,40 +1486,97 @@ def cmd_run(args: argparse.Namespace) -> int:
     # configuration has, so it never has to guess the agent's limits (remote configuration can lower them at
     # any time), and overall slot 0 is the slot an older `timetrace run` fences on.
     limits = SlotLimits(overall=1, per_tool={})
-    _log("timetrace %s daemon, home=%s, interval=%ss%s%s" % (
-        __version__, home, interval, ", once" if args.once else "",
-        ", beside an online agent (shared coding slots)" if guard.mode == "beside-agent" else ""))
+    # SIGINT / SIGTERM from here on are a request to stop, not a death: see _install_stop_signals.
+    stop = process.StopRequest()
+    previous_handlers = _install_stop_signals(stop)
     try:
+        _log("timetrace %s daemon, home=%s, interval=%ss%s%s" % (
+            __version__, home, interval, ", once" if args.once else "",
+            ", beside an online agent (shared coding slots)" if guard.mode == "beside-agent" else ""))
         _recover_running(db)
-        while True:
+        while not stop.is_set():
             try:
                 out = scheduler.run_once(db, adapters, cfg, home, log=_log,
-                                         slots=limits if guard.mode == "beside-agent" else None)
-            except KeyboardInterrupt:
-                raise
+                                         slots=limits if guard.mode == "beside-agent" else None, stop=stop)
+            except process.ToolExitUnconfirmed as exc:
+                # A stop was requested and a tool's exit could not be confirmed: it may still be running. Starting
+                # anything else is out of the question; the slot stays fenced for a person to check.
+                _log("stop requested (%s) but the tool's exit is NOT confirmed (待核对): %s" % (stop.reason, exc))
+                print("error: a tool may still be running; its slot lock stays fenced (manual recovery: verify "
+                      "nothing is writing in the task's worktree, then clear the marker under %s)"
+                      % (home / "locks"), file=sys.stderr)
+                return 1
             except Exception as exc:  # keep the daemon alive; the event log has the details
                 out = "loop error: %s" % exc
                 db.add_event("loop_error", payload={"error": str(exc)})
             if out != "idle":
                 _log(out)
-            if args.once:
-                return 0
-            try:
-                time.sleep(interval if out in ("idle", "circuit open") or out.startswith("loop error")
-                           else 1)
-            except KeyboardInterrupt:
-                _log("stopped")
-                return 0
+            if args.once or stop.is_set():
+                break
+            stop.wait(interval if out in ("idle", "circuit open") or out.startswith("loop error") else 1)
+        if stop.is_set():
+            _log("stopped (%s)" % stop.reason)
+        return 0
     finally:
+        restore_handlers(previous_handlers)
         guard.release()
 
 
+def _install_stop_signals(stop: "process.StopRequest") -> Dict[int, Any]:
+    """SIGINT (Ctrl-C) and SIGTERM (launchd, `kill`) ask `timetrace run` to stop instead of killing it where it
+    stands: the scheduler stops claiming, the running tool's process group is stopped within a bound, the run and
+    the task are written up, the locks are released, and only then does it exit. The handler only records the
+    request (see `process.StopRequest`); the loop and the process runner act on it. Repeated signals change
+    nothing: a second Ctrl-C must not cut the cleanup short and leave the task `running` again. Returns the
+    previous handlers; off the main thread signals cannot be taken and nothing is installed."""
+    previous: Dict[int, Any] = {}
+
+    def request_stop(signum, frame) -> None:
+        stop.request(signal.Signals(signum).name)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[signum] = signal.signal(signum, request_stop)
+        except ValueError:
+            break
+    return previous
+
+
 def _recover_running(db: Database) -> None:
-    """A task left in `running` means the previous daemon died mid-run. Make it runnable so
-    the next loop resumes it with its recorded session id."""
+    """A task still `running` when a scheduler starts was left by one that ended WITHOUT a record: a hard kill
+    (SIGKILL), a crash, a power cut. (A stop by SIGINT / SIGTERM is recorded by the scheduler itself and leaves
+    nothing running.) Whether that task's tool is still alive is unknown here, so nothing is claimed about it and
+    nothing is run again on a guess:
+
+      * the original record is closed as `待核对`: its unfinished run gets an end but NO exit code (nobody knows how
+        the tool ended) and is marked interrupted, so the circuit breaker does not count it;
+      * the task becomes `failed`, its session, worktree and branch kept, and waits for an explicit
+        `timetrace retry`. The absence of a slot crash marker is not an authorization: the marker is only what
+        happens to be left behind by some crashes, not by a home that was copied, a marker a person cleared or a
+        database from before. Independent tasks go on and what waits `--after` it keeps waiting;
+      * the slot's crash marker, if the dead scheduler left one, is not touched: after the retry it still refuses
+        a second tool until a person has verified nothing is writing and cleared it.
+
+    Each row is settled in one transaction and only while it is still `running` there, so a row that finished or
+    was changed since the list was read is left as it is."""
     for t in db.tasks_in_state(RUNNING):
-        db.update_task(t["id"], state=RUNNABLE, last_error="daemon restarted mid-run")
-        _log("task %d was running when the daemon stopped; will resume" % t["id"])
+        with db.transaction():
+            current = db.get_task(t["id"])
+            if current is None or current["state"] != RUNNING:
+                continue
+            session = current.get("session_id")
+            note = ("scheduler ended without a record (killed or crashed): whether its tool still runs is unverified "
+                    "(待核对); not run again automatically. Verify nothing is writing in %s, then `timetrace retry %d` "
+                    "resumes %s; a slot crash marker, if one was left, still refuses until it is cleared"
+                    % (current.get("worktree") or "its worktree", t["id"],
+                       "session " + session if session else "it from the start"))
+            runs = db.end_unfinished_runs(t["id"], note[:500])
+            db.move_task(t["id"], RUNNING, state=FAILED, last_error=note)
+            db.add_event(EV_TASK_INTERRUPTED, tool=current.get("tool"), payload={
+                "task_id": t["id"], "signal": None, "exit_confirmed": False, "session_id": session,
+                "reason": "scheduler ended without a record", "unfinished_runs_closed": runs})
+        _log("task %d was running when the scheduler ended without a record: whether its tool still runs is unverified "
+             "(待核对), so it is NOT resumed automatically; `timetrace retry %d` resumes it (a crash marker on the slot, "
+             "if there is one, still refuses until it is cleared)" % (t["id"], t["id"]))
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -1457,15 +1612,43 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if not t:
         print("no such task", file=sys.stderr)
         return 1
-    if t["state"] not in (FAILED, BLOCKED):
+    waiting_already = t["state"] == PENDING and t.get("depends_on") is not None
+    if t["state"] not in (FAILED, BLOCKED) and not waiting_already:
         print("task %d is %s; only failed/blocked tasks can be retried" % (t["id"], t["state"]),
               file=sys.stderr)
         return 1
     fields = {"state": RUNNABLE, "blocked_until": None}
     if args.fresh:
         fields["session_id"] = None
+    pre = prerequisites.check(db, t)
+    if pre.status in (prerequisites.MISSING, prerequisites.UNAVAILABLE):
+        print("task %d cannot be retried: %s" % (t["id"], prerequisites.describe(pre)), file=sys.stderr)
+        return 1
+    if pre.status == prerequisites.WAITING:
+        # Its parent has not finished, so it must not become runnable ahead of it. A task that never ran just waits
+        # (it starts when the work before it has passed). One that already ran is a person's call, later.
+        if prerequisites.has_executed(db, t):
+            print("task %d 已执行过，但它的前置工作还没完成：%s；前置通过后再运行 timetrace retry %d"
+                  % (t["id"], prerequisites.describe(pre), t["id"]), file=sys.stderr)
+            return 1
+        fields["state"] = PENDING
+        db.update_task(t["id"], **fields)
+        if not waiting_already:
+            db.add_event(EV_TASK_WAITING, tool=t.get("tool"), payload={
+                "task_id": t["id"], "depends_on": pre.parent, "blocker": pre.blocker,
+                "blocker_state": pre.blocker_state, "reason": "retried before its parent finished; waiting"})
+        print("task %d → %s%s" % (t["id"], prerequisites.describe(pre), " (fresh session)" if args.fresh else ""))
+        return 0
     db.update_task(t["id"], **fields)
     print("task %d → runnable%s" % (t["id"], " (fresh session)" if args.fresh else ""))
+    last = db.latest_run(t["id"])
+    if last and last.get("ended_at") is not None and last.get("exit_code") is None and last.get("interrupted"):
+        # The retry is the decision to run it again. What it cannot know is whether the earlier tool still writes.
+        print("note: the last run of task %d ended without a verified exit (待核对). Make sure nothing is still writing "
+              "in %s before it runs; it will %s. A slot crash marker, if there is one, still refuses until a person "
+              "clears it." % (t["id"], t.get("worktree") or "its worktree",
+                              "start a new session there" if args.fresh or not t.get("session_id")
+                              else "resume session %s" % t["session_id"]))
     return 0
 
 
@@ -1749,7 +1932,12 @@ def build_parser() -> argparse.ArgumentParser:
     ad.add_argument("attempt")
     ad.add_argument("--yes", action="store_true", help="really set them aside (without it only shows what would be)")
     ad.set_defaults(fn=cmd_agent_discard_results)
-    sync_p = agent_sub.add_parser("sync", help="have the running Runner re-check logins and report to Valley now")
+    ar2 = agent_sub.add_parser("retry-results", help="send the stopped results of an attempt again (the server kept refusing them, HTTP 409)")
+    ar2.add_argument("job")
+    ar2.add_argument("attempt")
+    ar2.add_argument("--yes", action="store_true", help="really send them again (without it only shows what would be)")
+    ar2.set_defaults(fn=cmd_agent_retry_results)
+    sync_p =agent_sub.add_parser("sync", help="have the running Runner re-check logins and report to Valley now")
     sync_p.add_argument("--timeout", type=int, default=120, help="seconds to wait for the Runner (default 120)")
     sync_p.set_defaults(fn=cmd_agent_sync)
     ai = agent_sub.add_parser("install", help="install the macOS LaunchAgent (and the Claude Code statusLine hook)")

@@ -66,7 +66,8 @@ def status_table(rows: List[Dict[str, Any]], binding: Optional[Dict[str, Any]], 
     return table
 
 
-def tasks_table(tasks: List[Dict[str, Any]], now: int) -> str:
+def tasks_table(tasks: List[Dict[str, Any]], now: int, waiting: Optional[Dict[int, str]] = None) -> str:
+    """`waiting` maps a pending task's id to the sentence saying what it waits for (see prerequisites.describe)."""
     if not tasks:
         return "no tasks"
     body = []
@@ -74,6 +75,8 @@ def tasks_table(tasks: List[Dict[str, Any]], now: int) -> str:
         extra = ""
         if t["state"] == "blocked" and t.get("blocked_until"):
             extra = "until %s" % local_time(t["blocked_until"])
+        elif t["state"] == "pending" and t["id"] in (waiting or {}):
+            extra = waiting[t["id"]]
         elif t["state"] == "pending" and t.get("depends_on"):
             extra = "after #%d" % t["depends_on"]
         elif t["state"] == "failed" and t.get("last_error"):

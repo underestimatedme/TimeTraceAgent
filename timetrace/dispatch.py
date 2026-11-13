@@ -179,6 +179,15 @@ class FileLock:
                 os.close(self._fd)
                 self._fd = None
 
+    def abandon(self) -> None:
+        """Close the lock WITHOUT clearing the ownership marker: what an unclean exit leaves behind. For a tool
+        whose exit could not be confirmed: the slot stays fenced until a person has verified nothing is writing."""
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = None
+
     def __enter__(self) -> "FileLock":
         return self.acquire()
 

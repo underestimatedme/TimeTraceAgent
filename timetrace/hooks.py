@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from timetrace.db import Database
 from timetrace.models import EV_HOOK_GENERATED, EV_HOOK_REJECTED, TOOLS
+from timetrace.process import ToolExitUnconfirmed
 
 OUTPUT_CONTRACT = (
     "\n\nOutput contract (strict): reply with ONE JSON array and nothing else. Each element is an"
@@ -54,8 +55,9 @@ def validate(items: List[Any], max_tasks: int) -> List[Dict[str, Any]]:
 
 
 def run_hook(db: Database, adapter, task: Dict[str, Any], home: Path, cfg: Dict[str, Any],
-             now: int, log_file: str) -> Optional[Path]:
-    """Ask the finished task's session for follow-up tasks; write them to the inbox."""
+             now: int, log_file: str, cancel_event=None) -> Optional[Path]:
+    """Ask the finished task's session for follow-up tasks; write them to the inbox. `cancel_event` (the queue's
+    stop request) is handed to the tool run so a stop reaches it too."""
     if int(task.get("generation") or 0) >= 1:
         db.add_event(EV_HOOK_REJECTED, tool=task.get("tool"),
                      payload={"task_id": task["id"], "reason": "depth limit (generation>=1)"},
@@ -63,7 +65,10 @@ def run_hook(db: Database, adapter, task: Dict[str, Any], home: Path, cfg: Dict[
         return None
     prompt = (task.get("on_success") or "").strip() + OUTPUT_CONTRACT
     try:
-        res = adapter.resume(prompt, task["worktree"], task["session_id"], log_file)
+        res = adapter.resume(prompt, task["worktree"], task["session_id"], log_file,
+                             **({} if cancel_event is None else {"cancel_event": cancel_event}))
+    except ToolExitUnconfirmed:  # a tool that may still be running is not "crashed": the caller must know
+        raise
     except Exception as exc:  # tool crashed; the parent task itself is already done
         db.add_event(EV_HOOK_REJECTED, tool=task.get("tool"),
                      payload={"task_id": task["id"], "reason": "hook run failed: %s" % exc}, at=now)
