@@ -480,7 +480,7 @@ class CliTest(unittest.TestCase):
         code, out, _ = self.run_cli("ls")
         self.assertEqual(code, 0)
         self.assertIn("fix things", out)
-        self.assertIn("after #1", out)
+        self.assertIn("等待前置工作 #1", out)
         code, out, _ = self.run_cli("ls", "--json")
         tasks = json.loads(out)
         self.assertEqual(tasks[0]["priority"], 2)

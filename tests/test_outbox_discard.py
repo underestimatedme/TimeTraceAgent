@@ -1,7 +1,8 @@
 """S3-24: a result the server refuses for good (409) stays visible and can be set aside by hand.
 
-Nothing here gives up on its own: a conflict is retried for as long as it lasts, because letting go
-of a result by mistake loses it silently. Setting one aside is a person's decision, taken through
+Nothing here gives up on its own: a conflict is retried a bounded number of times and then stays
+queued, because letting go of a result by mistake loses it silently (P0-1 stops the automatic sending
+after a run of refusals; see test_outbox_refusal_pause). Setting one aside is a person's decision, taken through
 `timetrace agent discard-results`, never counted as delivered, and only offered for a batch the
 server really refused (409), not for one that failed for a reason that may pass.
 """
@@ -15,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from timetrace import audit, cli, config
-from timetrace.db import Database
+from timetrace.db import OUTBOX_REFUSED_PAUSE_AFTER as PAUSE_AFTER, Database
 
 from tests.test_outbox_isolation import CONFLICT, READ_TIMEOUT, SERVER_ERROR, OutboxFailureFixture
 
@@ -29,12 +30,17 @@ class DiscardConflictedResultsTest(OutboxFailureFixture, unittest.TestCase):
         self.flush_at(now)
 
     def test_a_conflict_is_never_given_up_on_its_own(self):
-        # The decision behind S3-24: no age or retry count lets the agent drop a refused result.
+        # The decision behind S3-24: no age or retry count lets the agent drop a refused result. Since P0-1 the agent
+        # stops *sending* it by itself after a bounded run of refusals (test_outbox_refusal_pause), but the result
+        # is still never discarded, never marked sent and never set aside: only a person does that.
         self.conflict("old")
         for day in range(1, 40):
             self.flush_at(1000 + day * DAY)
-        self.assertEqual(len(self.attempts), 40)
+        self.assertEqual(len(self.attempts), PAUSE_AFTER, "a bounded run of confirmations, not one try a day for ever")
         self.assertEqual(self.pending_jobs(), ["old"])
+        self.assertEqual(self.db.abandoned_remote_event_count(), 0)
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM remote_outbox WHERE sent_at IS NOT NULL").fetchone()[0], 0)
+        self.assertEqual(self.db.remote_event_retry("old", "old-attempt", 3)["status"], 409)
 
     def test_discarding_sets_the_batch_aside_without_acknowledging_it(self):
         self.conflict("old")

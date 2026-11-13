@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict
 
 from timetrace import __version__
 from timetrace.cloud import CloudError
-from timetrace.db import Database
+from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
 from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
                        worktree)
 from timetrace.remote_control import RunControl
@@ -35,7 +35,9 @@ from timetrace.dispatch import (DispatchDenied, DispatchGate, LockBusy, Uncleare
 
 OUTPUT_TAIL_BYTES = 8000  # Valley accepts up to 8192
 OUTBOX_RETENTION_SECONDS = 7 * 24 * 3600  # acknowledged events kept for diagnosis
-OUTBOX_REFUSED_RETRY_SECONDS = 60  # a batch Valley answered 409 is retried this rarely
+# A batch Valley answered 409 is retried this rarely, and OUTBOX_REFUSED_PAUSE_AFTER (timetrace.db) refusals in a
+# row stop its automatic sending for good (until a person asks for another round: `agent retry-results`).
+OUTBOX_REFUSED_RETRY_SECONDS = 60
 # A batch whose upload failed (other than 409) waits 5 s, then doubles, up to the cap.
 OUTBOX_ERROR_RETRY_FIRST_SECONDS = 5
 OUTBOX_ERROR_RETRY_SECONDS = 30
@@ -67,6 +69,12 @@ PROTOCOL_VERSION = 2
 # self-check also after a failed job).
 HEALTH_INTERVAL_SECONDS = 600
 RESET_CREDITS_INTERVAL_SECONDS = 600
+# The result-outbox summary (health.outbox) is read from the database at most this often, and the inventory is pushed
+# for it only when its content changes (it holds no clock reading that changes on its own).
+OUTBOX_HEALTH_INTERVAL_SECONDS = 15
+# An inventory Valley refused (HTTP 400/422) while it carried health.outbox is sent again without the field, and the
+# field is left out for this long before it is tried once more: an older Valley must never lose the inventory over it.
+OUTBOX_HEALTH_REFUSED_SECONDS = 3600
 # Below this much free disk on the workspace volume nothing new is claimed.
 DISK_ERROR_GB = 1.0
 # Valley's "computer version not supported" error code.
@@ -184,6 +192,43 @@ def _zero_spend(inventory: Any) -> Dict[str, Any]:
         return {}
     return {t.get("id"): t.get("can_enforce_zero_spend") for t in tools or [] if isinstance(t, dict)}
 
+
+# The exact object Database.remote_outbox_health() returns (schema 1) and the type of each field.
+_OUTBOX_COUNTS = ("paused_batches", "paused_events", "retrying_batches", "retrying_events", "set_aside_events")
+_OUTBOX_TIMES = ("paused_since", "oldest_paused_event_at")
+_OUTBOX_KEYS = frozenset(("schema", "paused_reason") + _OUTBOX_COUNTS + _OUTBOX_TIMES)
+_NOT_READ_YET = object()  # the state of the summary before its first read: the first read is always recorded
+
+
+class OutboxHealthInvalid(ValueError):
+    """The database answered, but not with the schema-1 summary: nothing is sent rather than a guess."""
+
+
+def _whole(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def outbox_summary(raw: Any) -> Dict[str, Any]:
+    """`raw` as the anonymous outbox summary to report, or OutboxHealthInvalid. Counts, one reason code and epoch seconds
+    only; a copy, so nothing queued later can change what was checked."""
+    if not isinstance(raw, dict) or set(raw) != _OUTBOX_KEYS or raw["schema"] != 1 or isinstance(raw["schema"], bool):
+        raise OutboxHealthInvalid("outbox health is not the schema-1 summary")
+    if not all(_whole(raw[key]) for key in _OUTBOX_COUNTS):
+        raise OutboxHealthInvalid("outbox health count is not a whole number")
+    if not all(raw[key] is None or _whole(raw[key]) for key in _OUTBOX_TIMES):
+        raise OutboxHealthInvalid("outbox health time is not epoch seconds")
+    if raw["paused_reason"] not in (None, "http_409"):
+        raise OutboxHealthInvalid("outbox health reason is unknown")
+    return dict(raw)
+
+
+def _without_outbox(extras: Dict[str, Any]) -> Dict[str, Any]:
+    health = (extras or {}).get("health")
+    if not isinstance(health, dict) or "outbox" not in health:
+        return extras
+    return dict(extras, health={key: value for key, value in health.items() if key != "outbox"})
+
+
 class Agent:
     def __init__(self, db: Database, cloud: Any, adapters: Dict[str, Any], home: Path,
                  access_token: Callable[[], str], prepare_workspace: Callable = worktree.ensure,
@@ -218,6 +263,12 @@ class Agent:
         self._reset_credits = None
         self._last_reset_credits = None
         self._last_inventory_base = None
+        # health.outbox: the last summary read (None: not read, or the read failed -- never reported as zero), when it was
+        # read, what is wrong with it (class name only) and until when a Valley that refused it is spared.
+        self._outbox_health: Dict[str, Any] = None
+        self._outbox_read_at = None
+        self._outbox_problem = _NOT_READ_YET
+        self._outbox_withheld_until = 0.0
         # Keeps the Mac awake (caffeinate) while any job runs; None: never.
         self._sleep = sleep_guard
         # The user's home for the local permission rules (credential dirs).
@@ -254,6 +305,10 @@ class Agent:
         # (job, attempt, epoch) → the failure last written to the log. The retry state itself is in the database
         # (remote_outbox_retry), so a restart keeps every batch's waiting time.
         self._outbox_failures_logged = {}
+        # batches whose stop this process has already put in the log (one line each, whoever stopped them)
+        self._paused_noted = set()
+        # batches an older Runner left to be checked: the note that they will be sent once more is written once
+        self._unchecked_noted = set()
         self._loop_errors = set()
         self._maintain_due = False
         # config `upload_output_tail`: false keeps run logs on this computer.
@@ -375,6 +430,7 @@ class Agent:
             except Exception as exc:
                 self.log("sync: %s login check failed: %s" % (name, exc.__class__.__name__))
         self._health_due = True
+        self._outbox_read_at = None
         self._last_inventory_base = self._last_inventory = None
         self._upkeep(now, force)
         pushed = self._last_inventory is not None
@@ -413,24 +469,68 @@ class Agent:
         # Between full rounds only the protocol-2 extras (pause, self-check,
         # sleep prevention) are compared, so a pause reaches Valley at once.
         current = self._last_inventory_base
-        extras = self.inventory_extras() if self.report_protocol else None
+        extras = None
+        if self.report_protocol:
+            self._refresh_outbox_health(now)
+            extras = self.inventory_extras()
+            if now < self._outbox_withheld_until:
+                extras = _without_outbox(extras)
         # An unchanged protocol-2 inventory is still presence: Valley judges a computer alive by it.
         heartbeat_due = self.report_protocol and (self._last_inventory_push is None or
                                                   now - self._last_inventory_push >= self.heartbeat_interval)
         if (current, extras) != self._last_inventory or heartbeat_due:
             try:
-                if extras is None:
-                    self.cloud.update_inventory(self.access_token(), *current)
-                else:
-                    self.cloud.update_inventory(self.access_token(), *current, extras=extras)
+                extras = self._push_inventory(current, extras, now)
                 self._last_inventory = (current, extras)
                 self._last_inventory_push = now
                 runner_state.record(self.home, inventory_pushed_at=int(now), inventory_workspaces=len(current[0]),
-                                    inventory_tools=len(current[1]))
+                                    inventory_tools=len(current[1]),
+                                    inventory_outbox_reported="outbox" in ((extras or {}).get("health") or {}))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
             except Exception as exc:
                 self._note_cloud_error(exc, "inventory")
                 self.log("inventory push failed: %s" % exc.__class__.__name__)
+
+    def _put_inventory(self, current, extras) -> None:
+        if extras is None:
+            self.cloud.update_inventory(self.access_token(), *current)
+        else:
+            self.cloud.update_inventory(self.access_token(), *current, extras=extras)
+
+    def _push_inventory(self, current, extras, now: float):
+        """Send the inventory; returns the extras that were sent. A Valley that refuses (400/422) an inventory carrying
+        health.outbox gets the same one without it, so the computer keeps its inventory and presence either way."""
+        try:
+            self._put_inventory(current, extras)
+            return extras
+        except CloudError as exc:
+            sent = _without_outbox(extras)
+            if sent is extras or exc.status not in (400, 422) or exc.code == VERSION_REJECTED_CODE:
+                raise
+            self._outbox_withheld_until = now + OUTBOX_HEALTH_REFUSED_SECONDS
+            self.log("inventory: Valley refused health.outbox (HTTP %d); sending without it" % exc.status)
+        self._put_inventory(current, sent)
+        return sent
+
+    def _refresh_outbox_health(self, now: float) -> None:
+        """Read the outbox summary, at most every OUTBOX_HEALTH_INTERVAL_SECONDS. A failed read must never stop the loop,
+        a claim or an approval, and never becomes a zero: the summary is then left out of the inventory (not reported),
+        the rest of the health stays, and the failure is logged and recorded once per change."""
+        if self._outbox_read_at is not None and now - self._outbox_read_at < OUTBOX_HEALTH_INTERVAL_SECONDS:
+            return
+        self._outbox_read_at = now
+        try:
+            summary, problem = outbox_summary(self.db.remote_outbox_health()), None
+        except Exception as exc:
+            summary, problem = None, exc.__class__.__name__
+        self._outbox_health = summary
+        if problem == self._outbox_problem:
+            return
+        self._outbox_problem = problem
+        runner_state.record(self.home, outbox_health="unavailable" if problem else "ok", outbox_health_error=problem,
+                            outbox_health_changed_at=int(now))
+        if problem:
+            self.log("outbox health unavailable, not reported: %s" % problem)
 
     def inventory_extras(self) -> Dict[str, Any]:
         """The protocol-2 inventory fields (docs/remote-control-protocol.md §3/§4)."""
@@ -444,6 +544,8 @@ class Agent:
         if self._health is not None:
             health = dict(self._health)
             health["sleep_prevention"] = self.sleep_state()
+            if self._outbox_health is not None:
+                health["outbox"] = dict(self._outbox_health)
             extras["health"] = health
         if self._reset_credits:
             extras["reset_credits"] = self._reset_credits
@@ -2264,8 +2366,11 @@ class Agent:
                              "lock, then sent to Valley)" % (lock_wait, post, self._flush_batches))
 
     def _flush_outbox(self) -> None:
+        self._note_paused_batches()
         batches = {}
-        for row in self.db.pending_remote_events():
+        # A batch Valley kept refusing has been stopped (see _refuse_batch): it is not even looked at here, so it
+        # costs this round nothing and never delays another attempt, the claim or a heartbeat.
+        for row in self.db.sendable_remote_events():
             key = (row["job_id"], row["attempt_id"], row["lease_epoch"])
             batches.setdefault(key, []).append(row)
         # Insertion-ordered groups preserve durable attempt order (UUID lexical
@@ -2283,8 +2388,8 @@ class Agent:
             if self._fast_live(key):
                 self._wait_fast(key)
                 rows = self.db.pending_remote_events_for(job, attempt, epoch)
-                if not rows:
-                    continue
+                if not rows or self.db.remote_event_paused(job, attempt, epoch):
+                    continue  # acknowledged meanwhile, or the approval path was refused for the last time
             rows.sort(key=lambda row: row["seq"])
             # Pairing/refresh problems are not this batch's fault: they still
             # propagate to the claim loop's own handling.
@@ -2328,15 +2433,66 @@ class Agent:
             raise refused
 
     def _refuse_batch(self, key) -> None:
-        """Valley answered 409 for this attempt: keep its events, retry rarely."""
+        """Valley answered 409 for this attempt: keep its events, retry rarely, and stop after a bounded run.
+
+        A 409 is Valley's generic conflict (a lost lease, an attempt that already ended, a gap in the sequence), so
+        one answer proves neither that the events arrived nor that they never will. The batch is retried once a
+        minute; OUTBOX_REFUSED_PAUSE_AFTER refusals in a row stop its automatic sending, durably (a restart or
+        an hour later does not resume it). Stopping changes no event and marks nothing sent or discarded; a person
+        decides with `agent retry-results` or `agent discard-results`."""
         job, attempt, epoch = key
         now = time.time()
-        self.db.defer_remote_events(job, attempt, epoch, 409, now, now + OUTBOX_REFUSED_RETRY_SECONDS)
-        if self._outbox_failures_logged.get(key) != "HTTP 409":
+        state = self.db.refuse_remote_events(job, attempt, epoch, now, now + OUTBOX_REFUSED_RETRY_SECONDS,
+                                             OUTBOX_REFUSED_PAUSE_AFTER)
+        if state is None:
+            return  # acknowledged or set aside while the request was in flight
+        if state["newly_paused"]:
+            self._paused_noted.add(key)
+            kept = ("%d 条事件原样保留在本机队列，未标记为已送达，也未丢弃，不影响其他回报和领取新任务；"
+                    "处理方式见 `timetrace agent doctor`。" % state["pending_events"])
+            if state["basis"] == HOLD_LEGACY_REFUSED:
+                self.log("任务 %s 第 %s 次执行（attempt %s）的回报：升级前旧版本累计失败 %d 次（不区分失败类型），最后一次是 HTTP 409；"
+                         "升级后重新发送了一次来核对，Valley 仍回复 HTTP 409，已停止自动重试。%s"
+                         % (job, epoch, attempt, state["legacy_failures"] or 0, kept))
+            else:
+                self.log("Valley 连续 %d 次拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；已停止自动重试。%s"
+                         % (state["refused"], job, epoch, attempt, kept))
+        elif not state["paused"] and self._outbox_failures_logged.get(key) != "HTTP 409":
             self._outbox_failures_logged[key] = "HTTP 409"
             self.log("Valley 拒绝了任务 %s 第 %s 次执行（attempt %s）的回报（HTTP 409）；"
                      "事件保留在本机队列，不影响其他回报和领取新任务；不会自动丢弃，见 `timetrace agent doctor`。"
                      % (job, epoch, attempt))
+
+    def _note_paused_batches(self) -> None:
+        """Say once per process which batches are stopped, and which are about to be sent once more to be checked.
+
+        Only what the record shows is said: a stop is "N refusals in a row" (confirmed) or "an older Runner's many
+        failures, the last answer 409, and a fresh request that was refused too" (legacy_refused); the older
+        numbers alone are never worded as "Valley kept answering 409"."""
+        for batch in self.db.paused_remote_batches():
+            key = (batch["job_id"], batch["attempt_id"], batch["lease_epoch"])
+            if key in self._paused_noted:
+                continue
+            self._paused_noted.add(key)
+            if batch["basis"] == HOLD_LEGACY_REFUSED:
+                why = ("升级前旧版本累计失败 %d 次且最后一次是 HTTP 409，升级后重新发送一次核对，Valley 仍回复 HTTP 409"
+                       % (batch["legacy_failures"] or 0))
+            elif batch["basis"] == HOLD_CONFIRMED:
+                why = "Valley 连续 %d 次回复 HTTP 409" % batch["refused"]
+            else:
+                why = "按本机记录"
+            self.log("任务 %s 第 %s 次执行（attempt %s）的回报已停止自动重试（%s）；"
+                     "事件原样保留在本机队列，未标记为已送达，也未丢弃；处理方式见 `timetrace agent doctor`。"
+                     % (batch["job_id"], batch["lease_epoch"], batch["attempt_id"], why))
+        for batch in self.db.unchecked_remote_batches():
+            key = (batch["job_id"], batch["attempt_id"], batch["lease_epoch"])
+            if key in self._unchecked_noted:
+                continue
+            self._unchecked_noted.add(key)
+            self.log("任务 %s 第 %s 次执行（attempt %s）的回报在升级前的旧版本里累计失败 %d 次（不区分失败类型），最后一次是 HTTP 409；"
+                     "这不能证明 Valley 现在仍会拒收，将重新发送一次原始事件来核对：收到确认就原样送达，"
+                     "再次收到 HTTP 409 才会停止自动发送并保留；网络错误、401、429、5xx 不算拒收，按原退避重试。"
+                     % (batch["job_id"], batch["lease_epoch"], batch["attempt_id"], batch["legacy_failures"] or 0))
 
     def _still_pending(self, rows) -> bool:
         ids = [row["id"] for row in rows]
@@ -2366,6 +2522,8 @@ class Agent:
     def _upload_due(self, claim) -> bool:
         """Events of this attempt wait and their backoff (if any) has run out."""
         key = (claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"])
+        if self.db.remote_event_paused(*key):
+            return False  # stopped for good: the pump has nothing to wake up for
         retry = self.db.remote_event_retry(*key)
         if retry is not None and time.time() < retry["retry_at"]:
             return False
@@ -2413,6 +2571,8 @@ class Agent:
         flush and its backoff."""
         job, attempt, epoch = claim["job"]["id"], claim["attempt_id"], claim["lease_epoch"]
         key = (job, attempt, epoch)
+        if self.db.remote_event_paused(*key):
+            return  # Valley kept refusing this attempt; its events wait for a person (`agent retry-results`)
         retry = self.db.remote_event_retry(*key)
         if retry is not None and time.time() < retry["retry_at"] and (retry["status"] == 409 or not force):
             return  # refused (409), or a background retry that must wait out its backoff
@@ -2467,7 +2627,8 @@ class Agent:
         failures = (retry["failures"] if retry else 0) + 1
         delay = min(OUTBOX_ERROR_RETRY_SECONDS, OUTBOX_ERROR_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 8))
         now = time.time()
-        self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay)
+        if not self.db.defer_remote_events(job, attempt, epoch, status, now, now + delay):
+            return  # stopped while this upload was in flight: its late answer records nothing
         failure = "HTTP %d" % status if status else exc.__class__.__name__
         if self._outbox_failures_logged.get(key) != failure:
             self._outbox_failures_logged[key] = failure

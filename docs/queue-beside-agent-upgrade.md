@@ -79,8 +79,14 @@ undo.
    refused, which is the intended fence, not an error to work around.
 3. Check that `lsof "$H/agent.lock"` prints nothing.
 4. Switch back to the older release and start it. A task left `running` by a queue that was stopped hard is
-   reset to `runnable` by whichever queue starts next and resumes with its recorded session once any crash
-   fence on its slot files has been cleared by hand (the existing manual-recovery rule).
+   reset to `runnable` by an **older** queue when it starts, and resumes with its recorded session once any
+   crash fence on its slot files has been cleared by hand (the existing manual-recovery rule). That older queue
+   has no "unverified" state and resumes even when no fence was left, so after a hard stop run `timetrace ls`
+   first and stop the older queue before it starts if a task is `running` and its tool may still be writing.
+   The current release does not do this: it ends such a task's record as `待核对` (no exit code), marks the task
+   `failed` with its session and worktree kept, never runs it by itself whether or not a fence exists, and
+   waits for an explicit `timetrace retry <id>`; the fence, if there is one, stays and still refuses after the
+   retry until it is cleared by hand.
 5. Restore the pause state as recorded.
 
 Do not delete `agent.lock`, `agent-role.lock` or `scheduler.lock` to get past a refusal: the files are inert,
