@@ -86,6 +86,21 @@ class DirectoryTest(RootFixture):
         self.assertTrue(inventory['truncated'])
         self.assertEqual(inventory['excluded_count'], 0)
 
+    def test_checkout_inventory_keeps_branches_beyond_32_and_does_not_change_import_fingerprint(self):
+        m = self.module()
+        for index in range(34):
+            repo = self.root / f'repo-{index:02}'
+            repo.mkdir()
+            subprocess.run(['git', 'init', '-q', '-b', f'fix/branch-{index}'], cwd=repo, check=True)
+        git('config', 'user.name', 'Fixtures', cwd=repo)
+        git('config', 'user.email', 'fixtures@example.invalid', cwd=repo)
+        git('commit', '--allow-empty', '-qm', 'fixture', cwd=repo)
+        report = m.scan(str(self.root), include_checkouts=True)
+        self.assertEqual(report['checkout_version'], 1)
+        self.assertEqual(len(report['checkouts']), 34)
+        self.assertEqual(report['checkouts']['repo-33']['branch'], 'fix/branch-33')
+        self.assertEqual(report['fingerprint'], m.scan(str(self.root))['fingerprint'])
+
     def test_readme_byte_and_aggregate_limits_and_no_follow(self):
         m = self.module()
         for i in range(34):

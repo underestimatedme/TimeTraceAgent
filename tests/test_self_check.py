@@ -151,20 +151,6 @@ class HealthTest(unittest.TestCase):
             subprocess.run(["git", "switch", "-q", "--detach"], cwd=repo, check=True)
             self.assertEqual(health.git_checkout(str(repo)), {"head": head})
 
-    def test_project_root_reports_each_real_child_without_a_root_checkout(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d).resolve()
-            repo = root / "web"
-            init_repo(repo)
-            subprocess.run(["git", "switch", "-q", "-c", "fix/web-filters"], cwd=repo, check=True)
-            (root / "alias").symlink_to(repo)
-            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-            report = health.check({}, [{"id": "root", "path": str(root), "kind": "project_root"}], root)
-            self.assertEqual(report["workspaces"], [{
-                "id": "root", "exists": True, "git": False,
-                "project_checkouts": [{"directory_name": "web", "branch": "fix/web-filters", "head": head}],
-            }])
-
 
 class FakeSleep:
     def __init__(self):

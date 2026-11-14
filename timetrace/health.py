@@ -1,7 +1,7 @@
 """Self-check reported with the inventory as `health` (protocol 2).
 
 {claude_login, codex_login: ok|expired|missing, disk_free_gb (workspace
-volume), workspaces: [{id, exists, git, clean?, branch?, head?, project_checkouts?}], checked_at}. The agent adds
+volume), workspaces: [{id, exists, git, clean?, branch?, head?}], checked_at}. The agent adds
 `sleep_prevention` when it builds the inventory. Every check is read-only:
 the tools' own login status commands (as the zero-spend gate uses them) and
 `git status` in the registered main checkout with hooks and fsmonitor off.
@@ -10,15 +10,16 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from timetrace import folder, project_directories, tiers, worktree
+from timetrace import folder, tiers, worktree
 
 GIT_TIMEOUT_SECONDS = 20
 MAX_WORKSPACES = 100
-MAX_PROJECT_CHECKOUTS = 32
+CHECKOUT_BUDGET_SECONDS = 5
 
 
 def now_rfc3339() -> str:
@@ -78,56 +79,31 @@ def git_clean(path: str, run: Callable = subprocess.run) -> Optional[bool]:
     return not proc.stdout.strip()
 
 
-def git_checkout(path: str, run: Callable = subprocess.run) -> Dict[str, str]:
-    """Return the branch and commit of the checkout, when available."""
-    try:
-        proc = run(["git", "--no-optional-locks"] + list(worktree.SAFE_GIT) + [
-            "-C", path, "status", "--porcelain=v2", "--branch", "--untracked-files=no",
-        ], capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
-            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")})
-    except (OSError, UnicodeError, subprocess.SubprocessError):
-        return {}
-    if proc.returncode != 0:
-        return {}
-    report = {}
-    for line in proc.stdout.split("\n"):
-        key, _, value = line.partition(" ")
-        if key != "#":
-            break
-        field, _, data = value.partition(" ")
-        if field == "branch.oid" and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", data):
-            report["head"] = data
-        if field == "branch.head" and data != "(detached)" and 0 < len(data.encode("utf-8")) <= 200:
-            report["branch"] = data
-    return report
-
-
-def project_checkouts(workspace: Dict[str, Any], limit: int) -> tuple[List[Dict[str, str]], int]:
-    """Report direct child Git repositories by their configured directory name."""
-    if limit <= 0:
-        return [], 0
-    try:
-        names = sorted(os.listdir(workspace["path"]))
-    except OSError:
-        return [], 0
-    entries = []
-    attempted = 0
-    for name in names:
-        if attempted >= limit:
-            break
-        child = Path(workspace["path"]) / name
-        if name.casefold() in project_directories.EXCLUDED or child.is_symlink() or not (child / ".git").is_dir():
-            continue
-        attempted += 1
+def git_checkout(path: str, run: Callable = subprocess.run, *, deadline: Optional[float] = None) -> Dict[str, str]:
+    """Read only ref metadata, without walking the work tree."""
+    if deadline is None:
+        deadline = time.monotonic() + CHECKOUT_BUDGET_SECONDS
+    def read(*args: str) -> str:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return ""
         try:
-            resolved = project_directories.resolve(workspace, name)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-        if resolved["kind"] == folder.GIT:
-            checkout = git_checkout(resolved["path"])
-            if checkout:
-                entries.append({"directory_name": name, **checkout})
-    return entries, attempted
+            proc = run(["git"] + list(worktree.SAFE_GIT) + ["-C", path, *args], capture_output=True,
+                       text=True, timeout=min(1, left), stdin=subprocess.DEVNULL,
+                       env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")})
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.removesuffix("\n") if proc.returncode == 0 else ""
+
+    ref = read("symbolic-ref", "-q", "HEAD")
+    branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+    head = read("rev-parse", "--verify", ref or "HEAD")
+    report = {}
+    if branch and len(branch.encode()) <= 200:
+        report["branch"] = branch
+    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head):
+        report["head"] = head
+    return report
 
 
 def disk_free_gb(paths: List[str], home: Path, usage: Callable = shutil.disk_usage) -> Optional[float]:
@@ -150,22 +126,17 @@ def check(adapters: Dict[str, Any], workspaces: List[Dict[str, Any]], home: Path
         report["codex_login"] = codex_login(adapters["codex"])
     entries = []
     paths = []
-    available_project_checks = MAX_PROJECT_CHECKOUTS
+    checkout_deadline = time.monotonic() + CHECKOUT_BUDGET_SECONDS
     for ws in workspaces[:MAX_WORKSPACES]:
         path = str(ws.get("path") or "")
         exists = bool(path) and os.path.isdir(path)
         is_git = exists and (ws.get("kind") or folder.GIT) == folder.GIT and worktree.is_git_repo(path)
         entry = {"id": str(ws.get("id"))[:64], "exists": exists, "git": bool(is_git)}
         if is_git:
-            entry.update(git_checkout(path))
+            entry.update(git_checkout(path, deadline=checkout_deadline))
             state = clean(path)
             if state is not None:
                 entry["clean"] = state
-        if exists and ws.get("kind") == folder.PROJECT_ROOT:
-            projects, attempted = project_checkouts(ws, available_project_checks)
-            available_project_checks -= attempted
-            if projects:
-                entry["project_checkouts"] = projects
         if exists:
             paths.append(path)
         entries.append(entry)

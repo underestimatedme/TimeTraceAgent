@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -55,13 +56,13 @@ def _directory(path=None, *, parent=None, name=None):
         os.close(fd)
 
 
-def _git(fd, *args):
+def _git(fd, *args, timeout=None):
     # The descriptor pins the directory during git writes, even if a local
     # process replaces its pathname between validation and subprocess launch.
     script = 'import os,sys; os.fchdir(int(sys.argv[1])); os.execvp("git", ["git"] + sys.argv[2:])'
     return subprocess.run([sys.executable, '-c', script, str(fd)] + list(args),
                           pass_fds=(fd,), env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-                          check=True, capture_output=True, text=True).stdout.strip()
+                          check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
 
 
 def _nested_git(fd, depth=0, seen=None):
@@ -195,12 +196,15 @@ def _readme(fd, budget):
         return {'status': 'unreadable', 'filename': name}, 0
 
 
-def scan(path):
+def scan(path, *, include_checkouts=False):
     """Bounded direct-child metadata; an incomplete scan is never importable."""
     inventory = {'status': 'ok', 'checked_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                  'fingerprint': '', 'truncated': False, 'excluded_count': 0, 'entries': []}
     entries = inventory['entries']
     budget = TOTAL_README_BYTES
+    if include_checkouts:
+        inventory.update(checkout_version=1, checkouts={})
+    head_deadline = time.monotonic() + 5
     try:
         root = Path(path)
         if not root.is_absolute() or str(root.resolve()) != str(root):
@@ -218,11 +222,25 @@ def scan(path):
                     if name.casefold() in EXCLUDED:
                         raise ValueError('excluded directory')
                     with _directory(parent=parent, name=name) as child:
-                        kind, _ = _kind(child)
+                        kind, branch = _kind(child)
                         if len(entries) >= MAX_ENTRIES:
                             inventory['truncated'] = True
                             continue
                         readme, used = _readme(child, budget)
+                        if include_checkouts and kind == folder.GIT:
+                            checkout = {'branch': branch} if branch != 'HEAD' and len(branch.encode()) <= 200 else {}
+                            # Read only ref metadata. Keep the already-read branch if this optional lookup runs out of time.
+                            remaining = head_deadline - time.monotonic()
+                            if remaining > 0:
+                                try:
+                                    ref = f'refs/heads/{branch}' if branch != 'HEAD' else 'HEAD'
+                                    head = _git(child, 'rev-parse', '--verify', ref, timeout=min(1, remaining))
+                                    if re.fullmatch(r'[0-9a-f]{40}(?:[0-9a-f]{24})?', head):
+                                        checkout['head'] = head
+                                except (OSError, UnicodeError, subprocess.SubprocessError):
+                                    pass
+                            if checkout:
+                                inventory['checkouts'][name] = checkout
                 except ValueError:
                     inventory['excluded_count'] += 1
                     continue
@@ -231,6 +249,8 @@ def scan(path):
                                 'description': _description(readme.get('content', '')), 'readme': readme})
     except (OSError, ValueError):
         inventory.update(status='unreadable', entries=[], truncated=False)
+        if include_checkouts:
+            inventory['checkouts'] = {}
     canonical = json.dumps(inventory['entries'], ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     inventory['fingerprint'] = hashlib.sha256(canonical.encode()).hexdigest()
     return inventory
