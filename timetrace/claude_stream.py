@@ -78,6 +78,8 @@ class StreamSession:
       host.permission(request, cancelled) -> {"behavior": "allow"|"deny", "message"?}
          `request` is the can_use_tool body; blocking; `cancelled` is set
          when the CLI withdraws the prompt or the run ends.
+      host.observe(message)    optional: every `assistant` message (masked),
+         from the reader thread; must not block.
     Time spent waiting in host.permission does not count toward `timeout`."""
 
     def __init__(self, cmd: Sequence[str], cwd: str, log_file: str, prompt: str, host: Any = None,
@@ -160,7 +162,8 @@ class StreamSession:
                     msg = json.loads(raw)
                 except ValueError:
                     msg = None
-            shown = json.dumps(mask_structure(msg), ensure_ascii=False) if isinstance(msg, dict) else mask_timetrace_tokens(raw)
+            masked = mask_structure(msg) if isinstance(msg, dict) else None
+            shown = json.dumps(masked, ensure_ascii=False) if masked is not None else mask_timetrace_tokens(raw)
             self._log(log, shown + "\n")
             kind = msg.get("type") if isinstance(msg, dict) else None
             if kind == "control_request":
@@ -176,6 +179,8 @@ class StreamSession:
             self.lines.append(shown)
             if len(self.lines) > MAX_CAPTURED_LINES:
                 del self.lines[:len(self.lines) - MAX_CAPTURED_LINES]
+            if kind == "assistant":
+                self._observe(masked)
             with self._lock:
                 self._last_line_at = time.monotonic()
                 if kind == "result":
@@ -186,6 +191,17 @@ class StreamSession:
                         self._close_stdin_locked()
                 elif kind is not None:
                     self._last_was_result = False
+
+    def _observe(self, masked: Dict[str, Any]) -> None:
+        """Show an assistant message (masked) to a host that wants to see them (`host.observe`, optional): outside
+        self._lock, and nothing the host does can stop the reader."""
+        observe = getattr(self.host, "observe", None)
+        if not callable(observe):
+            return
+        try:
+            observe(masked)
+        except Exception:
+            pass
 
     def _read_stderr(self, stream, log) -> None:
         for line in iter(stream.readline, ""):

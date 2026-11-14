@@ -351,6 +351,9 @@ class CodexAdapter(ToolAdapter):
     adapter_version = "codex-cli/0.151"
     # Execution runs in a worktree take the job's TimeTrace MCP access (`mcp=`).
     supports_mcp = True
+    # Task runs take the job's RunControl (`control=`) only to show it each output
+    # line (AI 思路上报); Codex runs have no appended input or approvals.
+    observes_runs = True
 
     def __init__(self, cfg: Dict[str, Any], billing=None):
         self.cfg = cfg
@@ -412,39 +415,47 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             return []
 
-    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess]) -> RunResult:
+    @staticmethod
+    def _observer(control) -> Dict[str, Any]:
+        """run_streaming's `on_line` for a run whose RunControl wants to see its output lines; nothing otherwise."""
+        observe = getattr(control, "observe_line", None)
+        return {"on_line": observe} if callable(observe) else {}
+
+    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess],
+                    control=None) -> RunResult:
         """One execution run. Codex writes its final answer to the `-o` file itself, outside the streams that are masked
         as they are read, so that file is masked once the run is over however it ended (finished, failed, cancelled, an
         exception): a token the model repeated is never left in it."""
         with masking([mcp.token] if mcp is not None else []):
             try:
-                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None,
+                                 **self._observer(control))
             finally:
                 mask_file(log_file + ".last.md")
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
-              mcp: Optional[McpAccess] = None) -> RunResult:
+              mcp: Optional[McpAccess] = None, control=None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md",
                         add_dirs=self._writable_extras(cwd), mcp=mcp)
-        return self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
+        return self._masked_run(cmd, cwd, log_file, cancel_event, mcp, control)
 
     def resume(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
-               mcp: Optional[McpAccess] = None) -> RunResult:
+               mcp: Optional[McpAccess] = None, control=None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, resume=session_id,
                         last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd), mcp=mcp)
-        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
+        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp, control)
         res.session_id = res.session_id or session_id
         return res
 
     def start_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
-                     cancel_event=None) -> RunResult:
+                     cancel_event=None, control=None) -> RunResult:
         cmd = build_folder_cmd(self.cfg, prompt, cwd, last_msg_file=log_file + ".last.md")
-        return self._run(cmd, cwd, log_file, cancel_event)
+        return self._run(cmd, cwd, log_file, cancel_event, **self._observer(control))
 
     def resume_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
-                      cancel_event=None) -> RunResult:
+                      cancel_event=None, control=None) -> RunResult:
         cmd = build_folder_cmd(self.cfg, prompt, cwd, resume=session_id, last_msg_file=log_file + ".last.md")
-        res = self._run(cmd, cwd, log_file, cancel_event)
+        res = self._run(cmd, cwd, log_file, cancel_event, **self._observer(control))
         res.session_id = res.session_id or session_id
         return res
 
@@ -489,9 +500,10 @@ class CodexAdapter(ToolAdapter):
         return res
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None,
-             env: Optional[Dict[str, str]] = None) -> RunResult:
+             env: Optional[Dict[str, str]] = None, on_line=None) -> RunResult:
+        extra = {"on_line": on_line} if on_line is not None else {}
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env)
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env, **extra)
         res = parse_exec(lines)
         res.exit_code = code
         if code != 0 and not res.blocked:

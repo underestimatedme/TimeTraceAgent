@@ -23,6 +23,8 @@ Each user message runs the next turn (the last one repeats). Steps:
   {"cancel_permission": {"tool": …, "input": …}}     ask, then cancel the request
   {"sleep": seconds}
   {"rate_limit": {...rate_limit_info...}}
+  {"tool_use": {"name": "Bash", "input": {...}}}     an assistant message with one tool_use block
+  {"text": "…"}                                      an assistant message with one text block
   {"result": "text", "is_error": false, "subtype": "success"}
 Everything received, the argv and each permission answer are appended to
 $TT_FAKE_TRANSCRIPT as JSON lines. EOF on stdin ends the process once the
@@ -142,6 +144,13 @@ def main():
                 record({"decision": {"tool": ask["tool"], "reply": reply}})
                 emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
                     {"type": "text", "text": "permission %s" % reply.get("response", {}).get("behavior")}]}})
+            elif "tool_use" in step:
+                emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:12], "name": step["tool_use"]["name"],
+                     "input": step["tool_use"].get("input") or {}}]}})
+            elif "text" in step:
+                emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": step["text"]}]}})
             elif "rate_limit" in step:
                 emit({"type": "rate_limit_event", "session_id": session, "rate_limit_info": step["rate_limit"]})
             elif "result" in step:
