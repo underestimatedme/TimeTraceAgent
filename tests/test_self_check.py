@@ -134,6 +134,7 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(report["claude_login"], "ok")
         self.assertEqual(report["codex_login"], "missing")
         self.assertEqual(report["disk_free_gb"], 42.5)
+        self.assertEqual(report["checkout_version"], 1)
         self.assertEqual(report["workspaces"], [{"id": "ws1", "exists": True, "git": True, "clean": False,
                                                  "branch": "main", "head": head},
                                                 {"id": "ws2", "exists": False, "git": False},

@@ -119,7 +119,7 @@ def disk_free_gb(paths: List[str], home: Path, usage: Callable = shutil.disk_usa
 
 def check(adapters: Dict[str, Any], workspaces: List[Dict[str, Any]], home: Path,
           usage: Callable = shutil.disk_usage, clean: Callable = git_clean) -> Dict[str, Any]:
-    report: Dict[str, Any] = {}
+    report: Dict[str, Any] = {"checkout_version": 1}
     if "claude" in adapters:
         report["claude_login"] = claude_login(adapters["claude"])
     if "codex" in adapters:
