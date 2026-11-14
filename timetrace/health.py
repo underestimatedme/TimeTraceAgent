@@ -1,14 +1,16 @@
 """Self-check reported with the inventory as `health` (protocol 2).
 
 {claude_login, codex_login: ok|expired|missing, disk_free_gb (workspace
-volume), workspaces: [{id, exists, git, clean?}], checked_at}. The agent adds
+volume), workspaces: [{id, exists, git, clean?, branch?, head?}], checked_at}. The agent adds
 `sleep_prevention` when it builds the inventory. Every check is read-only:
 the tools' own login status commands (as the zero-spend gate uses them) and
 `git status` in the registered main checkout with hooks and fsmonitor off.
 """
 import os
+import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -17,6 +19,7 @@ from timetrace import folder, tiers, worktree
 
 GIT_TIMEOUT_SECONDS = 20
 MAX_WORKSPACES = 100
+CHECKOUT_BUDGET_SECONDS = 5
 
 
 def now_rfc3339() -> str:
@@ -76,6 +79,33 @@ def git_clean(path: str, run: Callable = subprocess.run) -> Optional[bool]:
     return not proc.stdout.strip()
 
 
+def git_checkout(path: str, run: Callable = subprocess.run, *, deadline: Optional[float] = None) -> Dict[str, str]:
+    """Read only ref metadata, without walking the work tree."""
+    if deadline is None:
+        deadline = time.monotonic() + CHECKOUT_BUDGET_SECONDS
+    def read(*args: str) -> str:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return ""
+        try:
+            proc = run(["git"] + list(worktree.SAFE_GIT) + ["-C", path, *args], capture_output=True,
+                       text=True, timeout=min(1, left), stdin=subprocess.DEVNULL,
+                       env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")})
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.removesuffix("\n") if proc.returncode == 0 else ""
+
+    ref = read("symbolic-ref", "-q", "HEAD")
+    branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+    head = read("rev-parse", "--verify", ref or "HEAD")
+    report = {}
+    if branch and len(branch.encode()) <= 200:
+        report["branch"] = branch
+    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head):
+        report["head"] = head
+    return report
+
+
 def disk_free_gb(paths: List[str], home: Path, usage: Callable = shutil.disk_usage) -> Optional[float]:
     """Free space of the fullest volume holding a workspace (else the home)."""
     free = []
@@ -89,19 +119,21 @@ def disk_free_gb(paths: List[str], home: Path, usage: Callable = shutil.disk_usa
 
 def check(adapters: Dict[str, Any], workspaces: List[Dict[str, Any]], home: Path,
           usage: Callable = shutil.disk_usage, clean: Callable = git_clean) -> Dict[str, Any]:
-    report: Dict[str, Any] = {}
+    report: Dict[str, Any] = {"checkout_version": 1}
     if "claude" in adapters:
         report["claude_login"] = claude_login(adapters["claude"])
     if "codex" in adapters:
         report["codex_login"] = codex_login(adapters["codex"])
     entries = []
     paths = []
+    checkout_deadline = time.monotonic() + CHECKOUT_BUDGET_SECONDS
     for ws in workspaces[:MAX_WORKSPACES]:
         path = str(ws.get("path") or "")
         exists = bool(path) and os.path.isdir(path)
         is_git = exists and (ws.get("kind") or folder.GIT) == folder.GIT and worktree.is_git_repo(path)
         entry = {"id": str(ws.get("id"))[:64], "exists": exists, "git": bool(is_git)}
         if is_git:
+            entry.update(git_checkout(path, deadline=checkout_deadline))
             state = clean(path)
             if state is not None:
                 entry["clean"] = state

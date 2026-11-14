@@ -533,7 +533,7 @@ def _runner_workspaces(db: Database) -> list:
         entry = {"id": row["id"], "name": row["name"], "default_branch": row["default_branch"],
                  "kind": kind, "checks": sorted(names.get(row["id"], []))}
         if kind == folder.PROJECT_ROOT:
-            entry["directory_inventory"] = scan(row["path"])
+            entry["directory_inventory"] = scan(row["path"], include_checkouts=True)
             entry["enabled"] = entry["directory_inventory"]["status"] == "ok"
         else:
             entry["context"] = collect_workspace_context(row["path"])

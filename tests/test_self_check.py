@@ -128,15 +128,29 @@ class HealthTest(unittest.TestCase):
                 def _auth_path(self):
                     return d / "auth.json"
 
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
             report = health.check({"claude": Claude(), "codex": Codex()}, workspaces, d,
                                   usage=lambda p: type("U", (), {"free": 42_500_000_000})())
         self.assertEqual(report["claude_login"], "ok")
         self.assertEqual(report["codex_login"], "missing")
         self.assertEqual(report["disk_free_gb"], 42.5)
-        self.assertEqual(report["workspaces"], [{"id": "ws1", "exists": True, "git": True, "clean": False},
+        self.assertEqual(report["checkout_version"], 1)
+        self.assertEqual(report["workspaces"], [{"id": "ws1", "exists": True, "git": True, "clean": False,
+                                                 "branch": "main", "head": head},
                                                 {"id": "ws2", "exists": False, "git": False},
                                                 {"id": "ws3", "exists": True, "git": False}])
         self.assertRegex(report["checked_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+    def test_checkout_changes_and_detach_are_read_from_git(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            init_repo(repo)
+            branch = "fix/independent-checkout"
+            subprocess.run(["git", "switch", "-q", "-c", branch], cwd=repo, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            self.assertEqual(health.git_checkout(str(repo)), {"branch": branch, "head": head})
+            subprocess.run(["git", "switch", "-q", "--detach"], cwd=repo, check=True)
+            self.assertEqual(health.git_checkout(str(repo)), {"head": head})
 
 
 class FakeSleep:
