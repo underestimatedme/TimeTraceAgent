@@ -4,6 +4,10 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.9：委派前可核对实际 Git 分支
+
+执行端会上报已登记 Git 仓库的分支和提交，以及项目父目录中受支持的独立 Git 子仓库的检出信息。配套 TimeTrace 控制台显示上报时间。升级沿用现有配对和工作区。详见 [0.6.9 发布说明](docs/releases/0.6.9.md)。
+
 ## 0.6.8：停止队列不再丢下工具进程，`--after` 真正等父任务，被拒收的结果不再无限重发
 
 - `timetrace run` 收到 Ctrl-C／SIGTERM 后确认工具进程组已退出才退出；任务记为 `failed`（`interrupted (SIGTERM): tool stopped`），不会自动重跑，不计入熔断，`timetrace retry <id>` 在原会话续跑。无法确认时写 `待核对` 并保持槽位封住。
