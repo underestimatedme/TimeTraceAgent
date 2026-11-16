@@ -547,5 +547,53 @@ class InterleavedStreamsTest(AcpCase):
         self.assertIn("key: [REDACTED:timetrace] end", log)
 
 
+
+# ---- review of af043e1: each fails on that commit -------------------------------------------------------------------
+
+def fragments(text, size=12):
+    return [LONG_TOKEN[i:i + size] for i in range(len(LONG_TOKEN) - size + 1) if LONG_TOKEN[i:i + size] in text]
+
+
+class SessionIdTest(AcpCase):
+    """An agent's sessionId reaches results and checkpoints: one holding a token, or of any odd shape, is refused."""
+
+    def test_a_session_id_that_holds_a_token_is_never_kept(self):
+        from timetrace.adapters.acp import run_result
+        for session in (LONG_TOKEN, "s-" + LONG_TOKEN, "has space", "a/b", "x" * 129, ""):
+            with self.subTest(session=session[:20]):
+                if self.transcript.exists():
+                    self.transcript.unlink()
+                result = self.run_session({"new_session": {"sessionId": session}, "turn": [{"chunk": "x"}]})
+                self.assertIsNone(result.session_id)
+                self.assertIn("session id", result.error or "")
+                self.assertEqual(self.received("session/prompt"), [], "no turn without an accepted session")
+                res = run_result(result, None)
+                self.assertIsNone(res.session_id)
+                self.assertEqual(fragments(json.dumps(res.__dict__, default=str)), [])
+        self.assertEqual(fragments(self.log_text()), [])
+        ok = self.run_session({"new_session": {"sessionId": "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc"}, "turn": []})
+        self.assertEqual(ok.session_id, "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc")
+
+
+class TokenAcrossToolCallTest(AcpCase):
+    """The final message starts after the last tool call; a token straddling that point must still be masked whole
+    (the review's sequence: 19 characters of a token, a tool call, the remaining 49)."""
+
+    def test_no_fragment_survives_in_the_final_message(self):
+        from timetrace.adapters.acp import run_result
+        from timetrace.redact import masking
+        self.assertEqual((len(LONG_TOKEN[:19]), len(LONG_TOKEN[19:])), (19, 49))
+        with masking([LONG_TOKEN]):
+            result = self.run_session({"turn": [
+                {"chunk": "here: " + LONG_TOKEN[:19]},
+                {"update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read x", "kind": "read"}},
+                {"chunk": LONG_TOKEN[19:] + " done"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        for where, text in (("last_message", result.last_message), ("text", result.text),
+                            ("RunResult.output", run_result(result, None).output), ("log", self.log_text())):
+            self.assertEqual(fragments(text), [], where)
+        self.assertTrue(result.last_message.endswith(" done"))
+
+
 if __name__ == "__main__":
     unittest.main()

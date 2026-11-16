@@ -7,8 +7,9 @@ TimeTrace and to report progress while they work.
 The token is a credential, so it has one road per kind of tool: for Claude Code and Codex, from the claim into the
 environment of the AI tool's own process (`TIMETRACE_MCP_TOKEN`, through `env()`); for an agent driven over ACP
 (timetrace.acp_client), into the `Authorization` header of the http MCP server entry inside that agent's
-`session/new` request on its stdin, and nowhere else (not its environment, so the model's shell commands cannot read
-it). It is never written to an argument list, a log, an uploaded text or an exception.
+`session/new`, `session/resume` or `session/load` request on its stdin, and nowhere else (not its environment, so
+the model's shell commands cannot read it). It is never written to an argument list, a log, an uploaded text or an
+exception.
 """
 import re
 import time

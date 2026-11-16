@@ -10,7 +10,7 @@ working and hardened for whoever audits an agent on a real install:
 - the binary is resolved once against that PATH and started by its absolute real path, so what was resolved is what
   runs (a relative PATH entry cannot swap in a project's own `gemini`, or `node` for a `#!/usr/bin/env node` script);
 - per-stream transcript buffers, redaction before any cut, bounded stdin writes and the MCP token only in the
-  session/new header (timetrace.acp_client).
+  MCP server header of session/new, session/resume or session/load (timetrace.acp_client).
 
 What the gates see: can_dispatch / can_resume follow the binary; can_enforce_zero_spend is the (fixed, false) billing
 verdict; can_read_quota / can_interact are false. A run receives the job's RunControl (`control=`) as its permission

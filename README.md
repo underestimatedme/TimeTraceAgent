@@ -483,7 +483,7 @@ Runner 可以用 Agent Client Protocol（ACP：JSON-RPC 2.0，经标准输入输
   - MCP OAuth 令牌缓存：`~/.gemini/mcp-oauth-tokens.json` 按 MCP 服务器名（包括 `timetrace`）读取缓存令牌，并可能向缓存里的第三方 tokenUrl 刷新；
   - PATH 与 `node` 解析、版本：`#!/usr/bin/env node` 脚本会按 PATH 找 `node`，版本要固定到审计过的那一版，且不能靠运行 `gemini --version` 获取（它会先加载设置、迁移并清理目录）。
 
-保留下来的通用加固对两者都生效：每次运行只取一次环境快照，子进程只拿到其中的 `PATH`（只保留绝对路径项）、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`；程序按这份 PATH 解析一次，并以其绝对真实路径启动；令牌只在 `session/new` 的请求头里，不进命令行参数、环境变量和日志。客户端从不调用 ACP 的 `authenticate`。
+保留下来的通用加固对两者都生效：每次运行只取一次环境快照，子进程只拿到其中的 `PATH`（只保留绝对路径项）、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`；程序按这份 PATH 解析一次，并以其绝对真实路径启动；令牌只放在发给智能体的 `session/new`、`session/resume`、`session/load` 请求中 MCP 服务器条目的请求头里，不进命令行参数、环境变量和日志；智能体返回的会话 ID 必须是保守的格式且不含令牌，否则不保留。客户端从不调用 ACP 的 `authenticate`。
 
 - **权限**：客户端声明不提供文件系统和终端能力，智能体调用 `fs/*`、`terminal/*` 或其他未知方法一律回 `-32601`。权限请求先过本机规则，再按需问手机，只回答一次性选项（`allow_once` / `reject_once`），从不选「始终允许 / 始终拒绝」；没有手机审批通道（如本地队列）时一律拒绝，切换模式的请求直接拒绝。
 - **日志**：可读的对话记录（请求、工具调用、计划、权限决定、智能体文本），每路输出各自缓冲、整段脱敏后才写入；向智能体写入经独立线程，智能体不读输入也不会卡住超时、取消和清理。续接优先 `session/resume`，其次 `session/load`（回放的历史不计入本轮）；都不支持时续接直接失败，不会悄悄开新会话。

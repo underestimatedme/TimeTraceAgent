@@ -126,7 +126,8 @@ def main():
         emit(out)
 
     init = scenario.get("initialize") or {}
-    session_id = (scenario.get("new_session") or {}).get("sessionId") or "fake-session-1"
+    new_session = scenario.get("new_session") or {}
+    session_id = new_session["sessionId"] if "sessionId" in new_session else "fake-session-1"
     while True:
         msg = incoming.get()
         if msg is None:

@@ -23,9 +23,11 @@ Safety posture, the same as the other adapters':
   environment minus the billing keys; a stop or a cancel ends the group (the queue's StopRequest semantics
   included), and whatever is left of the group is killed however the run ends.
 - The client never calls `authenticate`: choosing an auth method on the user's behalf could select an API key.
-- TimeTrace's MCP token reaches the agent inside the session/new request (an http MCP server header), never in argv
-  or the environment, so the model's shell commands cannot read it; the transcript names the servers and never a
-  header value, and everything written to it is masked (timetrace.redact).
+- TimeTrace's MCP token reaches the agent inside the session/new, session/resume or session/load request (the
+  header of an http MCP server entry), never in argv or the environment, so the model's shell commands cannot read
+  it; the transcript names the servers and never a header value, and everything written to it is masked
+  (timetrace.redact). A session id the agent answers with is kept only if it has a conservative shape and holds
+  no token.
 - Permission prompts go to the host (the job's RunControl: the worktree's local rules, then the phone) and are
   answered with allow_once / reject_once only. Nothing lasting is granted, or refused, on the user's behalf.
 """
@@ -33,6 +35,7 @@ import itertools
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -43,7 +46,7 @@ from timetrace import __version__, process
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.mcp_access import McpAccess, skip_note
 from timetrace.process import MAX_LOG_BYTES, StopRequest, ToolExitUnconfirmed, _shell_quote, child_env
-from timetrace.redact import _TIMETRACE_TOKEN, mask_structure, mask_timetrace_tokens, redact
+from timetrace.redact import _TIMETRACE_TOKEN, holds_timetrace_token, mask_structure, mask_timetrace_tokens, redact
 
 PROTOCOL_VERSION = 1
 METHOD_NOT_FOUND = -32601
@@ -64,6 +67,9 @@ _FLUSH_CHARS = 16 * 1024        # streamed text with no newline is written once 
 # How much streamed text a forced flush always keeps back: more than the longest TimeTrace token
 # (mcp_access.MAX_TOKEN_CHARS), so one still arriving is masked once it is complete, never written in two pieces.
 _HOLD_CHARS = 1024
+# The session ids this client keeps: an agent's sessionId ends up in results and checkpoints, so one of any other
+# shape (or one holding a TimeTrace token) is a protocol error and is never kept.
+SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 # The stop reasons ACP v1 defines; any other value an agent sends is reported as "other", never verbatim.
 STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
 
@@ -227,6 +233,13 @@ def _safe_cut(text: str, cut: int) -> int:
     return cut
 
 
+def acceptable_session_id(value: Any) -> bool:
+    """A session id that may be kept in a result and a checkpoint: the conservative SESSION_ID shape, and no
+    TimeTrace token (by shape, or by the value of one this process handed out)."""
+    return (isinstance(value, str) and SESSION_ID.fullmatch(value) is not None
+            and not holds_timetrace_token(value.encode("utf-8")) and mask_timetrace_tokens(value) == value)
+
+
 def stop_reason(value: Any) -> str:
     """An agent's stopReason as it may be stored and shown: one of ACP's own, "other", or "" when there is none."""
     if not isinstance(value, str) or not value:
@@ -278,11 +291,13 @@ class AcpSession:
         self._waiting = 0
         self._paused_total = 0.0
         self._paused_since: Optional[float] = None
-        # The turn's aggregates; written by the stdout reader only.
+        # The turn's aggregates; written by the stdout reader only. The agent's text is kept as one raw stream: the
+        # final message (what it said after its last tool call) is a position in it, not a separate copy, so a token
+        # that straddles a tool call is still masked as a whole.
         self._text: List[str] = []
         self._text_len = 0
-        self._last: List[str] = []
-        self._last_len = 0
+        self._dropped = 0        # characters trimmed off the front of the kept text so far
+        self._last_from = 0      # where the last message starts, counted over all text ever received
         self._tool_ids: set = set()
         self._titles: Dict[str, str] = {}
         self._plan: Optional[List[Dict[str, Any]]] = None
@@ -521,7 +536,7 @@ class AcpSession:
             self._tool_ids.add(tool_id or str(len(self._tool_ids)))
             if tool_id and len(self._titles) < 10_000:
                 self._titles[tool_id] = title
-            self._last, self._last_len = [], 0   # what the agent says after a tool call is the newer answer
+            self._last_from = self._dropped + self._text_len   # what the agent says after a tool call is newer
             self._line("[tool] %s: %s (%s)" % (update.get("kind") or "other", title, update.get("status") or "pending"))
         elif kind == "tool_call_update":
             status = update.get("status")
@@ -546,17 +561,20 @@ class AcpSession:
     def _add_text(self, text: str) -> None:
         self._text.append(text)
         self._text_len += len(text)
-        self._last.append(text)
-        self._last_len += len(text)
         # Kept raw (a token may still be arriving), so the front is cut only where no token is split.
         if self._text_len > 2 * MAX_TEXT_CHARS:
             joined = "".join(self._text)
-            self._text = [joined[_safe_cut(joined, len(joined) - MAX_TEXT_CHARS):]]
-            self._text_len = len(self._text[0])
-        if self._last_len > 2 * MAX_TEXT_CHARS:
-            joined = "".join(self._last)
-            self._last = [joined[_safe_cut(joined, len(joined) - MAX_TEXT_CHARS):]]
-            self._last_len = len(self._last[0])
+            cut = _safe_cut(joined, len(joined) - MAX_TEXT_CHARS)
+            self._text, self._text_len, self._dropped = [joined[cut:]], len(joined) - cut, self._dropped + cut
+
+    def _final_texts(self) -> "tuple":
+        """(all of the agent's text, its last message), each masked as a whole before it is cut. The last message
+        starts where the last tool call came, moved back to the start of a token that straddles that point."""
+        joined = "".join(self._text)
+        start = min(max(0, self._last_from - self._dropped), len(joined))
+        start = _safe_cut(joined, start) if 0 < start < len(joined) else start
+        return (mask_timetrace_tokens(joined)[-MAX_TEXT_CHARS:],
+                mask_timetrace_tokens(joined[start:])[-MAX_TEXT_CHARS:])
 
     # ---- requests --------------------------------------------------------------------------------------------------
     def _request(self, method: str, params: Dict[str, Any], shown: str = "") -> _Pending:
@@ -642,8 +660,8 @@ class AcpSession:
             answer = self._call("session/new", {"cwd": self.cwd, "mcpServers": servers}, self.request_timeout,
                                 " cwd=%s%s" % (self.cwd, shown))
             session = answer.get("sessionId")
-            if not isinstance(session, str) or not session.strip() or len(session) > 256:
-                raise AcpError("session/new answered without a session id", method="session/new")
+            if not acceptable_session_id(session):
+                raise AcpError("session/new answered without a session id this client accepts", method="session/new")
             self._session = session
             self._line("<- session/new: session %s" % session)
         result.session_id = self._session
@@ -765,8 +783,7 @@ class AcpSession:
             self._log = None
         result.exit_code = proc.returncode
         # The whole text is masked first, then cut (a cut inside a mask marker is harmless).
-        result.text = mask_timetrace_tokens("".join(self._text))[-MAX_TEXT_CHARS:]
-        result.last_message = mask_timetrace_tokens("".join(self._last))[-MAX_TEXT_CHARS:]
+        result.text, result.last_message = self._final_texts()
         result.tool_calls, result.plan, result.usage = len(self._tool_ids), self._plan, self._usage
         return result
 
