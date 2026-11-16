@@ -79,6 +79,33 @@ class WorkSessionRunnerTest(Base):
         self.assertIsNone(self.db.get_checkpoint("work-session:session-1"))
         self.assertTrue((Path(adapter.calls[0][0]) / "marker").is_file())
 
+    def test_append_waiting_for_approval_resumes_without_another_lease(self):
+        runner = RunControl("first", self.home, threading.Event(), root=str(self.repo),
+                            turn_id="turn-1", message_id="message-1")
+        sent = []
+        runner.attach_interactive(lambda key, text, done: (sent.append(("append", text)), done("applied")))
+        def respond(answer):
+            sent.append(("permission", answer["behavior"]))
+            return True
+        request = {"tool_name": "Bash", "input": {"command": "touch marker"}}
+        worker = threading.Thread(target=runner.permission, args=(request, threading.Event()),
+                                  kwargs={"respond": respond}, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(runner.pending.wait(2))
+            approval = runner.take_events()[0]
+            runner.apply_lease({"controls": [{"id": "append-1", "action": "append", "text": "follow up",
+                                             "work_session_turn_id": "turn-1"}]})
+            self.assertEqual(sent, [])
+            runner.apply_lease({"approvals": [{"request_id": approval["request_id"], "decision": "approve"}]})
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(sent, [("permission", "allow"), ("append", "follow up")])
+            self.assertEqual([event["type"] for event in runner.take_events()],
+                             ["approval_resolved", "control_applied"])
+        finally:
+            runner.close()
+
     def test_repeated_lease_append_waits_for_ack_and_replays_no_input(self):
         def control():
             return RunControl("first", self.home, threading.Event(), turn_id="turn-1", message_id="message-1",

@@ -282,10 +282,16 @@ class RunControl:
         self._emit({"type": "approval_resolved", "request_id": request_id, "outcome": outcome})
 
     def permission(self, request: Dict[str, Any], cancelled: threading.Event, *, respond=None) -> Dict[str, Any]:
-        decision = self._permission(request, cancelled, respond)
-        if respond is not None and decision is not None and not cancelled.is_set() and not self.cancel_event.is_set():
-            respond(decision)
-        return decision or {}
+        try:
+            decision = self._permission(request, cancelled, respond)
+            if respond is not None and decision is not None and not cancelled.is_set() and not self.cancel_event.is_set():
+                respond(decision)
+            return decision or {}
+        finally:
+            if self.turn_id:
+                # The provider has its decision. Resume messages queued during
+                # the permission wait without delaying for another renewal.
+                self._dispatch_append()
 
     def _permission(self, request: Dict[str, Any], cancelled: threading.Event, respond) -> Optional[Dict[str, Any]]:
         """Answer one `can_use_tool` prompt: local rules, then what the job
