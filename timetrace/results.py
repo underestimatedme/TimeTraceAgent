@@ -163,11 +163,14 @@ def _text(raw: Dict[str, Any], key: str, limit: int, required: bool) -> Optional
 
 
 def _report_text(value: Any, limit: int) -> str:
-    """Text as the review shows it: stripped and cut to `limit` characters (it is only ever shown, so a long account
-    is shortened rather than lost)."""
+    """Text as the review shows it: redacted, then stripped and cut to `limit` characters (it is only ever shown, so a
+    long account is shortened rather than lost).
+
+    Redaction comes first, on the whole text: a secret that straddles the cut would otherwise lose the tail the
+    patterns recognise it by and go out nearly whole (the later redact_all of the upload cannot see it any more)."""
     if not isinstance(value, str):
         return ""
-    value = value.replace("\x00", "").strip()
+    value = redact(value.replace("\x00", "")).strip()
     return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
 
 

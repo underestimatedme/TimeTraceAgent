@@ -137,6 +137,22 @@ class CollectTest(unittest.TestCase):
         self.assertTrue(report["unfinished"][1].endswith("…"))
         self.assertEqual(report["review_focus"], [])
 
+    def test_a_secret_across_the_cut_is_redacted_before_the_cut(self):
+        # A token that ends past the limit would lose the tail its pattern needs if the text were cut first.
+        token = "ghp_" + "A" * 36
+        self.assertIn("[REDACTED", results.redact(token))
+        summary_pad = "x" * (results.REPORT_SUMMARY_CHARS - 41) + " "
+        item_pad = "y" * (results.REPORT_ITEM_CHARS - 41) + " "
+        self.write({"report": {"verdict": "success", "summary": summary_pad + token + " trailing",
+                               "unfinished": [item_pad + token + " t"], "review_focus": [item_pad + token + " t"]}})
+        got = self.collect()
+        uploaded = json.dumps(got)
+        self.assertNotIn("A" * 20, uploaded)
+        report = got["result"]["report"]
+        self.assertLessEqual(len(report["summary"]), results.REPORT_SUMMARY_CHARS)
+        for key in ("unfinished", "review_focus"):
+            self.assertLessEqual(len(report[key][0]), results.REPORT_ITEM_CHARS)
+
     def test_an_unusable_report_is_dropped_alone(self):
         for bad in ("done", [], {"summary": "no verdict"}, {"verdict": "passed"},
                     {"verdict": "success", "summary": 3}, {"verdict": "success", "unfinished": "x"}):
