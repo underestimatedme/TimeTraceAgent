@@ -18,8 +18,8 @@ from typing import Any, Callable, Dict
 from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
-from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
-                       worktree)
+from timetrace import (approvals, audit, checks, dev_status, folder, local_sessions, pause, quota, results,
+                       runner_state, sync, worktree)
 from timetrace.remote_control import RunControl
 from timetrace import approval_delivery
 from timetrace.approval_delivery import ApprovalPump
@@ -245,8 +245,19 @@ class Agent:
                  health_interval: float = HEALTH_INTERVAL_SECONDS,
                  reset_credits: Callable[[], list] = None,
                  reset_credits_interval: float = RESET_CREDITS_INTERVAL_SECONDS,
-                 sleep_guard: Any = None, user_home: str = None, remote_config=None):
+                 sleep_guard: Any = None, user_home: str = None, remote_config=None,
+                 local_sessions: Any = None):
         self.db, self.cloud, self.adapters = db, cloud, adapters
+        # Local AI session import (timetrace.local_sessions.Importer; None: never). It runs on the quota timer, on a
+        # thread of its own, only while the last inventory answer carried `local_session_import: true`.
+        self._local_sessions = local_sessions
+        # The switch as the last inventory answer reported it, and as it is in effect (an upload refused as off turns
+        # it off until an inventory answer says on again).
+        self._local_session_reported = False
+        self._local_session_import = False
+        self._local_session_known = False
+        self._local_sessions_due = False
+        self._local_sessions_thread = None
         try:
             self._append_timeout_kw = "timeout" in inspect.signature(cloud.append_events).parameters
         except (TypeError, ValueError, AttributeError):
@@ -345,6 +356,9 @@ class Agent:
         self._stop = threading.Event()
         self._jobs_lock = threading.Lock()
         self._running = {}  # id(cancel event) → cancel event
+        self._running_since = {}  # id(cancel event) → when the job started (time.time())
+        self._run_sessions = {}  # id(cancel event) → provider session ids its tool runs produced (see _note_run_session)
+        self._unrecorded_sessions = set()  # ids of finished runs whose database write has not succeeded yet
 
     @property
     def stopping(self) -> bool:
@@ -362,6 +376,7 @@ class Agent:
     def _track(self, cancel_event: threading.Event) -> None:
         with self._jobs_lock:
             self._running[id(cancel_event)] = cancel_event
+            self._running_since.setdefault(id(cancel_event), time.time())
             first = len(self._running) == 1
         if first and self._sleep is not None:
             try:
@@ -372,9 +387,50 @@ class Agent:
         if self._stop.is_set():
             cancel_event.set()
 
+    def _note_run_session(self, cancel_event: threading.Event, *produced) -> None:
+        """Remember the provider session id of what a tracked job's tool run produced (a RunResult, or an id), whatever
+        the outcome: completed, failed, quota-blocked, interrupted or cancelled. Only memory here (this may be the
+        tool's worker thread); _untrack writes them down."""
+        ids = set()
+        for value in produced:
+            sid = value if isinstance(value, str) else getattr(value, "session_id", None)
+            if isinstance(sid, str) and sid.strip():
+                ids.add(sid.strip())
+        if ids:
+            with self._jobs_lock:
+                self._run_sessions.setdefault(id(cancel_event), set()).update(ids)
+
+    def _record_run_sessions(self, cancel_event: threading.Event = None) -> None:
+        """Every provider session id the job's runs produced, recorded as a TimeTrace run BEFORE the job stops counting
+        as running. The local session import reads the running state first and the recorded ids second, so a run that
+        ends while it reads is caught by one or the other and is never imported as one the person ran by hand.
+
+        An id is moved to the in-memory pending set first and leaves it only once the database holds it: a write that
+        fails keeps it there (the import excludes pending ids too) and it is written again at the next _untrack or
+        upkeep. Without a job (cancel_event None) only the pending ids are retried."""
+        with self._jobs_lock:
+            if cancel_event is not None:
+                self._unrecorded_sessions |= self._run_sessions.pop(id(cancel_event), set())
+            pending = sorted(self._unrecorded_sessions)
+        for sid in pending:
+            try:
+                self.db.record_provider_session(sid)
+            except Exception as exc:
+                self.log("run session id not recorded yet (kept, retried later): %s" % exc.__class__.__name__)
+                continue
+            with self._jobs_lock:
+                self._unrecorded_sessions.discard(sid)
+
+    def _pending_run_sessions(self) -> set:
+        """Run session ids not yet in the database (see _record_run_sessions)."""
+        with self._jobs_lock:
+            return set(self._unrecorded_sessions)
+
     def _untrack(self, cancel_event: threading.Event) -> None:
+        self._record_run_sessions(cancel_event)
         with self._jobs_lock:
             self._running.pop(id(cancel_event), None)
+            self._running_since.pop(id(cancel_event), None)
             idle = not self._running
         if idle and self._sleep is not None:
             try:
@@ -442,6 +498,8 @@ class Agent:
         self.log("sync: %s" % ("pushed" if pushed else "push failed"))
 
     def _upkeep(self, now: float, force: bool) -> None:
+        if self._unrecorded_sessions:
+            self._record_run_sessions()
         self._refresh_work_session_retention(now)
         self._refresh_health(now)
         self._refresh_reset_credits(now)
@@ -454,6 +512,9 @@ class Agent:
                 runner_state.record(self.home, quota_reported_at=int(now), quota_samples=sum(counts.values()))
             except Exception as exc:
                 self.log("quota report failed: %s" % exc.__class__.__name__)
+        if due or self._local_sessions_due:
+            self._local_sessions_due = False
+            self._start_local_sessions()
         if self._inventory is None:
             return
         if due or self._last_inventory_base is None:
@@ -525,9 +586,101 @@ class Agent:
 
     def _put_inventory(self, current, extras) -> None:
         if extras is None:
-            self.cloud.update_inventory(self.access_token(), *current)
+            response = self.cloud.update_inventory(self.access_token(), *current)
         else:
-            self.cloud.update_inventory(self.access_token(), *current, extras=extras)
+            response = self.cloud.update_inventory(self.access_token(), *current, extras=extras)
+        self._note_local_session_import(response)
+
+    # ---- local AI session import (timetrace.local_sessions) ------------------
+    def _note_local_session_import(self, response) -> None:
+        """Valley's answer to the inventory carries the person's switch; anything but `true` (an older Valley says
+        nothing) is off. Off stops a round that is running before its next file or batch."""
+        enabled = isinstance(response, dict) and response.get(local_sessions.PREFERENCE) is True
+        first = not self._local_session_known
+        reported, effective = self._local_session_reported, self._local_session_import
+        self._local_session_reported = self._local_session_import = enabled
+        self._local_session_known = True
+        if self._local_sessions is None:
+            return
+        if first or enabled != effective:
+            runner_state.record(self.home, local_sessions="on" if enabled else "off")
+        if first or enabled != reported:
+            # Turned on: the first round starts at the next upkeep, not up to 5 minutes later. Valley saying on again
+            # after an upload was refused as off is not a new switch: that waits for the quota timer.
+            self._local_sessions_due = enabled
+            self.log("local sessions: import %s" % ("on" if enabled else "off"))
+
+    def _busy_since(self):
+        """When the oldest running job started (None: nothing runs)."""
+        with self._jobs_lock:
+            return min(self._running_since.values()) if self._running_since else None
+
+    def _start_local_sessions(self) -> None:
+        """One import round on its own thread, so a large first scan never holds up the heartbeat, a claim or a run.
+        Never two rounds at once; nothing at all while the switch is off."""
+        if self._local_sessions is None or not self._local_session_import:
+            return
+        if not callable(getattr(self.cloud, "post_local_sessions", None)):
+            return
+        running = self._local_sessions_thread
+        if running is not None and running.is_alive():
+            return
+        try:
+            thread = threading.Thread(target=self.import_local_sessions, name="timetrace-local-sessions", daemon=True)
+            thread.start()
+            self._local_sessions_thread = thread
+        except Exception as exc:
+            self.log("local sessions: round not started: %s" % exc.__class__.__name__)
+
+    def import_local_sessions(self) -> Dict[str, Any]:
+        """One round, on the calling thread (with a database connection of its own when that is not the loop's). Never
+        raises: whatever goes wrong is one line in the log, and the files it did not finish are read again next round."""
+        stats: Dict[str, Any] = {}
+        db = None
+        try:
+            if threading.get_ident() != self._db_owner and getattr(self._db, "path", None) is not None:
+                db = Database(self._db.path)
+            stats = self._local_sessions.run(db or self.db, self._upload_local_sessions,
+                                             enabled=lambda: self._local_session_import, busy_since=self._busy_since,
+                                             pending_own=self._pending_run_sessions)
+        except Exception as exc:
+            stats = {"failed": exc.__class__.__name__}
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        try:
+            self._note_local_sessions(stats)
+        except Exception:
+            pass
+        return stats
+
+    def _upload_local_sessions(self, batch) -> Any:
+        try:
+            return self.cloud.post_local_sessions(self.access_token(), batch)
+        except CloudError as exc:
+            if exc.status == 403 and local_sessions.OFF_CODE in (getattr(exc, "reason", "") or "", str(exc)):
+                # Off until an inventory answer says otherwise.
+                self._local_session_import = False
+                runner_state.record(self.home, local_sessions="off")
+                raise local_sessions.ImportOff() from exc
+            raise
+
+    def _note_local_sessions(self, stats: Dict[str, Any]) -> None:
+        """Counts only (never a path, id or title) to the log and to runner_state.json for `agent doctor`."""
+        now = int(time.time())
+        failed = stats.get("failed") or ""
+        fields = {"local_sessions_round_at": now, "local_sessions_failed": failed or None}
+        if stats.get("uploaded"):
+            fields.update(local_sessions_uploaded_at=now, local_sessions_uploaded=stats["uploaded"])
+        runner_state.record(self.home, **fields)
+        if failed or stats.get("uploaded") or stats.get("rejected") or stats.get("off"):
+            self.log("local sessions: %d sent, %d read, %d not sent, %d deferred, %d refused%s%s" % (
+                stats.get("uploaded", 0), stats.get("read", 0), stats.get("not_sent", 0), stats.get("deferred", 0),
+                stats.get("rejected", 0), "; switched off" if stats.get("off") else "",
+                "; upload failed: %s" % failed if failed else ""))
 
     def _push_inventory(self, current, extras, now: float):
         """Send the inventory; returns the extras that were sent. A Valley that refuses (400/422) an inventory carrying
@@ -1036,6 +1189,12 @@ class Agent:
         job_id = job["id"]
         resuming = checkpoint is not None
         session_id = checkpoint.provider_session_id if resuming else str(uuid.uuid4())
+        if not resuming:
+            # Before the spawn: a Claude session started under this id is a run, never imported as a local session.
+            try:
+                self.db.record_provider_session(session_id)
+            except Exception:
+                pass
         # Reuse the original execution worktree even if recovery has a new job id.
         execution_job = checkpoint.job_id if resuming else job_id
         local_id = local_task_id(execution_job)
@@ -1069,6 +1228,7 @@ class Agent:
             pump.stop()
             with self._controls_lock:
                 self._controls.pop(claim["attempt_id"], None)
+            self._note_run_session(cancel_event, getattr(control, "provider_session_id", None))
             self._untrack(cancel_event)
 
     def _renew_running(self, claim, adapter, deadline, control):
@@ -1397,6 +1557,7 @@ class Agent:
                             return result
                         control.followup_started(control_id)
                         following = followup_run(text, execution_path, session, log_file, cancel_event)
+                        self._note_run_session(cancel_event, following)
                         following.samples = list(getattr(result, "samples", None) or []) + list(following.samples or [])
                         result = following
                     return result
@@ -1420,8 +1581,12 @@ class Agent:
                             if work_session:
                                 if not control.reserve_initial():
                                     return RunResult(error="Earlier delivery could not be confirmed")
-                                return run(prompt, execution_path, session_id, log_file, cancel_event)
-                            return with_followups(run(prompt, execution_path, session_id, log_file, cancel_event))
+                                first_run = run(prompt, execution_path, session_id, log_file, cancel_event)
+                                self._note_run_session(cancel_event, first_run)
+                                return first_run
+                            first_run = run(prompt, execution_path, session_id, log_file, cancel_event)
+                            self._note_run_session(cancel_event, first_run)
+                            return with_followups(first_run)
                         finally:
                             if control is not None:
                                 control.next_followup(ok=False)  # the run is over either way
@@ -1814,7 +1979,9 @@ class Agent:
                     observed_start = self._observed_now()
                     adapter_entered.set()
                     try:
-                        return work(cancel_event)
+                        produced = work(cancel_event)
+                        self._note_run_session(cancel_event, produced)
+                        return produced
                     finally:
                         observed_end = self._observed_now()
 

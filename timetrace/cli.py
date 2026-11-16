@@ -26,6 +26,7 @@ from timetrace.sleepguard import SleepGuard
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
+from timetrace.local_sessions import Importer as LocalSessionImporter
 from timetrace.dispatch import SlotLimits, adapter_capabilities, lock_diagnostics
 from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, EV_TASK_INTERRUPTED, EV_TASK_WAITING, FAILED,
                          PENDING, RUNNABLE, RUNNING, TOOLS, ACP_TOOLS, Sample)
@@ -651,7 +652,9 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
                   health_check=lambda: health.check(adapters, db.list_workspaces(), home),
                   reset_credits=lambda: _reset_credits(adapters),
                   sleep_guard=SleepGuard() if cfg.get("prevent_sleep", True) else None,
-                  user_home=str(Path.home()))
+                  user_home=str(Path.home()),
+                  # Scans nothing until Valley says the person turned it on (the web 设备 page).
+                  local_sessions=LocalSessionImporter(home, log=_log))
     # Startup upkeep pushes the inventory once and reports quota right away.
     agent.maintain(force=True)
     if args.once:
@@ -1065,6 +1068,20 @@ def _acp_tool_lines(name: str, adapter: Any, details: Dict[str, Any]) -> List[st
     return lines
 
 
+def _local_sessions_line(home: Path) -> str:
+    """The local AI session import as the running Runner last saw it (runner_state.json)."""
+    st = runner_state.load(home)
+    if st.get("local_sessions") != "on":
+        return "本机 AI 会话记入: 未开启（默认关闭；在 TimeTrace 网页「设备」页开启，只上传会话元数据）"
+    if st.get("local_sessions_failed"):
+        last = "上次上传失败（%s），下轮重试" % st["local_sessions_failed"]
+    elif st.get("local_sessions_uploaded_at"):
+        last = "上次上传 %s，%s 段" % (_iso_local(st["local_sessions_uploaded_at"]), st.get("local_sessions_uploaded", "?"))
+    else:
+        last = "还没有需要上传的会话"
+    return "本机 AI 会话记入: 已开启（只含登记工作区内的会话）；%s" % last
+
+
 def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
     """LaunchAgent installed / running, and when the Runner last reached Valley."""
     lines = []
@@ -1098,6 +1115,7 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
     print("配对: %s" % ("已完成" if paired else "未完成 → 运行 timetrace cloud login"))
     for line in _runner_lines(home, user_home):
         print(line)
+    print(_local_sessions_line(home))
     workspaces = db.list_workspaces()
     if workspaces:
         print("工作区: %d" % len(workspaces))

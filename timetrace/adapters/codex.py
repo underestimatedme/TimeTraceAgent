@@ -339,6 +339,28 @@ def parse_exec(lines: List[str]) -> RunResult:
     return res
 
 
+class ThreadWatch:
+    """The thread id of the first `thread.started` event, kept as the stream is read. run_streaming returns only the
+    last MAX_CAPTURED_LINES lines, so a long run (or a long failure) would otherwise lose the one line that says which
+    session it was: a new thread has no other source for its id, and without it the Runner cannot tell its own run
+    from a session the person ran (timetrace.local_sessions)."""
+
+    def __init__(self):
+        self.thread_id = None
+
+    def __call__(self, line: str) -> None:
+        if self.thread_id is not None or '"thread.started"' not in line:
+            return
+        try:
+            msg = json.loads(line.strip())
+        except ValueError:
+            return
+        if isinstance(msg, dict) and msg.get("type") == "thread.started":
+            thread_id = msg.get("thread_id")
+            if isinstance(thread_id, str) and thread_id.strip():
+                self.thread_id = thread_id.strip()
+
+
 def _int_or_none(v: Any) -> Optional[int]:
     try:
         return int(v) if v is not None else None
@@ -530,9 +552,13 @@ class CodexAdapter(ToolAdapter):
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None,
              env: Optional[Dict[str, str]] = None) -> RunResult:
+        watch = ThreadWatch()
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env)
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env,
+                                    on_line=watch)
         res = parse_exec(lines)
+        # Every Codex exec run (task, resume, folder, chat, review, plan, import) passes here.
+        res.session_id = watch.thread_id or res.session_id
         res.exit_code = code
         if code != 0 and not res.blocked:
             res.ok = False

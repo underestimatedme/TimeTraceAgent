@@ -247,6 +247,15 @@ iPhone ──任务──▶ TimeTrace 云（Valley）◀──出站 HTTPS 轮�
 
 完整的威胁模型和审查结论见 `docs/SECURITY_REVIEW.md`，数据清单见 `SECURITY.md`。
 
+## 本机 AI 会话记入（默认关闭）
+
+你在终端或桌面端直接用 Claude Code / Codex 做的事，可以记入 TimeTrace 的「按日回顾」。这个功能**默认关闭**，只在你于 TimeTrace 网页的「设备」页打开开关后生效；Runner 每次心跳读取开关，关掉后立即停止扫描和上传（已上传的记录在同一页面删除）。
+
+- **读取范围**：只读 `$CLAUDE_CONFIG_DIR`（缺省 `~/.claude`）下的 `projects/*/*.jsonl` 和 `$CODEX_HOME`（缺省 `~/.codex`）下的 `sessions/**/rollout-*.jsonl`；这两个目录本身或其中的 `projects` / `sessions` 是符号链接时不读，目录内的符号链接也不跟随；不读凭据文件（`.claude/.credentials.json`、`.codex/auth.json`）。超过 64 MB 的文件跳过；每 5 分钟（与额度上报同一个定时）最多处理 200 个有变化的文件，未变化的文件不重读。
+- **上传什么**：每段会话一条元数据——来源工具、会话 id 的 SHA-256 摘要（id 本身不上传）、所属工作区、用得最多的模型名、git 分支、起止时间、提问次数、四项 token 合计、改动过的文件**数量**。
+- **不上传什么**：任何对话文字，连标题也不上传（记录里的标题始终为空；提问内容只在本机用来区分你的提问和工具自动插入的消息，不保存）；命令输出、文件路径与文件内容；工作目录不在 `timetrace workspace add` 登记的工作区之内的会话；TimeTrace 自己派发的运行（避免和执行记录重复计算）；Codex 的子 Agent 线程。
+- `timetrace agent doctor` 会显示一行「本机 AI 会话记入」的状态和上次上传时间。
+
 ## 用法
 
 ```sh

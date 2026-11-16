@@ -154,6 +154,28 @@ CREATE TABLE IF NOT EXISTS remote_plan_started (
     job_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL
 );
+-- Local AI session import (timetrace/local_sessions.py): one row per Claude Code / Codex session file already handled.
+--   mtime_ns, size  the file as it was when handled: an unchanged file is not read again
+--   scope           the registered workspaces it was judged against (a newly registered workspace re-reads every file)
+--   session_key     the session's upload key ('' when nothing of it is sent)
+--   fingerprint     '' (nothing to send), the digest of the record Valley accepted, or 'rejected:' + the digest of a
+--                   record Valley refused as out of bounds. Written only after the upload succeeded.
+CREATE TABLE IF NOT EXISTS local_session_file (
+    path        TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    mtime_ns    INTEGER NOT NULL,
+    size        INTEGER NOT NULL,
+    scope       TEXT NOT NULL,
+    session_key TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    updated_at  INTEGER NOT NULL
+);
+-- Provider session ids of runs TimeTrace started (kept after the outbox and checkpoints that also hold them are
+-- cleaned up): such a session is a run, never imported as one the person ran by hand.
+CREATE TABLE IF NOT EXISTS own_provider_session (
+    session_id  TEXT PRIMARY KEY,
+    recorded_at INTEGER NOT NULL
+);
 """
 
 
@@ -356,6 +378,7 @@ class Database:
 
     def queue_remote_event(self, job_id: str, attempt_id: str, lease_epoch: int,
                            event: Dict[str, Any], now: Optional[int] = None) -> None:
+        self.record_provider_session(event.get("provider_session_id"), now)
         self.conn.execute(
             "INSERT OR IGNORE INTO remote_outbox (job_id,attempt_id,lease_epoch,seq,payload,created_at)"
             " VALUES (?,?,?,?,?,?)",
@@ -694,6 +717,7 @@ class Database:
     def save_checkpoint(self, checkpoint: Any, now: Optional[int] = None) -> None:
         """Atomically persist one checkpoint per plan (INSERT OR REPLACE is a
         single autocommit statement). Stores no secrets or CLI environment."""
+        self.record_provider_session(getattr(checkpoint, "provider_session_id", None), now)
         self.conn.execute(
             "INSERT OR REPLACE INTO checkpoint (plan_id,data,updated_at) VALUES (?,?,?)",
             (checkpoint.plan_id, json.dumps(checkpoint.to_row(), ensure_ascii=False, sort_keys=True), now or _now()),
@@ -711,6 +735,52 @@ class Database:
 
     def delete_checkpoint(self, plan_id: str) -> None:
         self.conn.execute("DELETE FROM checkpoint WHERE plan_id=?", (plan_id,))
+
+    # ---- local AI session import ----------------------------------------
+    def record_provider_session(self, session_id: Any, now: Optional[int] = None) -> None:
+        """Remember a provider session id of a run TimeTrace started (no-op for anything but a non-empty string)."""
+        if isinstance(session_id, str) and session_id.strip():
+            self.conn.execute("INSERT OR IGNORE INTO own_provider_session (session_id, recorded_at) VALUES (?,?)",
+                              (session_id.strip(), now or _now()))
+
+    def own_provider_session_ids(self) -> set:
+        """Every provider session id this Runner knows it ran: the durable list, the local queue's tasks and runs, and
+        what checkpoints and the result outbox still hold (both are cleaned up over time; the list is not)."""
+        ids = set()
+        for row in self.conn.execute(
+                "SELECT session_id FROM own_provider_session UNION SELECT session_id FROM task"
+                " UNION SELECT session_id FROM run"):
+            if isinstance(row[0], str) and row[0].strip():
+                ids.add(row[0].strip())
+        for (raw,) in self.conn.execute("SELECT data FROM checkpoint").fetchall() + self.conn.execute(
+                "SELECT payload FROM remote_outbox WHERE payload LIKE '%provider_session_id%'").fetchall():
+            try:
+                value = json.loads(raw).get("provider_session_id")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if isinstance(value, str) and value.strip():
+                ids.add(value.strip())
+        return ids
+
+    def local_session_files(self) -> Dict[str, Dict[str, Any]]:
+        return {row["path"]: dict(row) for row in self.conn.execute("SELECT * FROM local_session_file")}
+
+    def save_local_session_files(self, rows: List[Dict[str, Any]], now: Optional[int] = None) -> None:
+        if not rows:
+            return
+        with self._transaction():
+            for row in rows:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO local_session_file"
+                    " (path,provider,mtime_ns,size,scope,session_key,fingerprint,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (row["path"], row["provider"], int(row["mtime_ns"]), int(row["size"]), row["scope"],
+                     row.get("session_key") or "", row.get("fingerprint") or "", now or _now()))
+
+    def forget_local_session_files(self, paths: List[str]) -> None:
+        """Files that are gone: their rows go too (the records already uploaded stay on Valley)."""
+        with self._transaction():
+            for path in paths:
+                self.conn.execute("DELETE FROM local_session_file WHERE path=?", (path,))
 
     # ---- task -------------------------------------------------------------
     def add_task(
@@ -800,6 +870,7 @@ class Database:
         self, task_id: int, tool: str, session_id: Optional[str], log_path: str,
         now: Optional[int] = None,
     ) -> int:
+        self.record_provider_session(session_id, now)
         cur = self.conn.execute(
             "INSERT INTO run (task_id, tool, started_at, session_id, log_path)"
             " VALUES (?,?,?,?,?)",
@@ -812,6 +883,7 @@ class Database:
         session_id: Optional[str] = None, now: Optional[int] = None, interrupted: bool = False,
     ) -> None:
         """`exit_code` None: how the tool ended is not known (a stop whose exit was not confirmed)."""
+        self.record_provider_session(session_id, now)
         self.conn.execute(
             "UPDATE run SET ended_at=?, exit_code=?, blocked=?, summary=?,"
             " session_id=COALESCE(?, session_id), interrupted=? WHERE id=?",
