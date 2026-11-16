@@ -29,6 +29,14 @@ FILE_DROPPED_NOTE = "%d 个文件未能上传"
 INVALID_NOTE = "结构化结果无效"
 DROPPED_NOTE = "忽略 %d 项格式无效的产出物"
 DROPPED_DRAFT_NOTE = "忽略格式无效的 pipeline_draft"
+DROPPED_REPORT_NOTE = "忽略格式无效的 report"
+# `report`: the run's own account of its work (verdict, what it did, what it left out, where to look first). Valley
+# shows it on the review of this run marked as not verified; it decides nothing. The limits match Valley's
+# (self_report.go), which bounds it again when it shows it.
+REPORT_VERDICTS = ("success", "needs_review", "blocked")
+REPORT_SUMMARY_CHARS = 1000
+REPORT_ITEMS_MAX = 10
+REPORT_ITEM_CHARS = 300
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SUBTASKS_MAX = 30
 # Keys end up in branch names (`timetrace/<stage>/<key>`), which are lowercase:
@@ -152,6 +160,39 @@ def _text(raw: Dict[str, Any], key: str, limit: int, required: bool) -> Optional
     if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
         raise Invalid("bad subtask %s" % key)
     return value
+
+
+def _report_text(value: Any, limit: int) -> str:
+    """Text as the review shows it: stripped and cut to `limit` characters (it is only ever shown, so a long account
+    is shortened rather than lost)."""
+    if not isinstance(value, str):
+        return ""
+    value = value.replace("\x00", "").strip()
+    return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
+
+
+def _report_items(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise Invalid("report list is not a list")
+    out = [text for text in (_report_text(item, REPORT_ITEM_CHARS) for item in value) if text]
+    return out[:REPORT_ITEMS_MAX]
+
+
+def _report(raw: Any) -> Dict[str, Any]:
+    """`report`: {verdict, summary?, unfinished?, review_focus?}. A verdict outside REPORT_VERDICTS, or a part of the
+    wrong type, makes it no report (Invalid); the caller drops it alone, never the result."""
+    if not isinstance(raw, dict):
+        raise Invalid("report is not an object")
+    verdict = raw.get("verdict")
+    if not isinstance(verdict, str) or verdict.strip() not in REPORT_VERDICTS:
+        raise Invalid("report verdict unknown")
+    summary = raw.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        raise Invalid("report summary is not text")
+    return {"verdict": verdict.strip(), "summary": _report_text(summary, REPORT_SUMMARY_CHARS),
+            "unfinished": _report_items(raw.get("unfinished")), "review_focus": _report_items(raw.get("review_focus"))}
 
 
 def _subtasks(raw: Any) -> List[Dict[str, Any]]:
@@ -318,8 +359,8 @@ def _artifacts(raw: Any):
 
 def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Optional[Dict[str, Any]]:
     """None when the run wrote no result.json; otherwise
-    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...]} | None,
-     "dropped_artifacts": int, "dropped_draft": bool (valid only)}.
+    {"valid": bool, "artifacts": [...], "result": {"pipeline_draft"?: {...}, "subtasks"?: [...], "report"?: {...}} | None,
+     "dropped_artifacts": int, "dropped_draft": bool, "dropped_report": bool (valid only)}.
     An invalid file yields valid=False with no artifacts and no result; bad
     artifact entries alone only raise dropped_artifacts."""
     base = Path(root)
@@ -347,6 +388,13 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
             # when it is missing; a stray non-object never voids sub-tasks.
             draft = None
         subtasks = _subtasks(parsed["subtasks"]) if parsed.get("subtasks") is not None else None
+        report, dropped_report = None, False
+        if parsed.get("report") is not None:
+            # Side information like an artifact: an unusable account is dropped on its own and noted.
+            try:
+                report = _report(parsed["report"])
+            except Invalid:
+                dropped_report = True
         _attach_docs(base, artifacts, head)
         artifacts = redact_all(artifacts)
         _fit(artifacts)
@@ -355,9 +403,11 @@ def collect(root: str, head: Callable[[], Optional[str]] = lambda: None) -> Opti
             result["pipeline_draft"] = redact_all(draft)
         if subtasks is not None:
             result["subtasks"] = redact_all(subtasks)
+        if report is not None:
+            result["report"] = redact_all(report)
         result = result or None
         return {"valid": True, "artifacts": artifacts, "result": result, "dropped_artifacts": dropped,
-                "dropped_draft": dropped_draft}
+                "dropped_draft": dropped_draft, "dropped_report": dropped_report}
     except (Invalid, RecursionError):
         return {"valid": False, "artifacts": [], "result": None}
 

@@ -1598,6 +1598,8 @@ class Agent:
                         event["message"] += "; " + results.DROPPED_NOTE % structured["dropped_artifacts"]
                     if structured.get("dropped_draft"):
                         event["message"] += "; " + results.DROPPED_DRAFT_NOTE
+                    if structured.get("dropped_report"):
+                        event["message"] += "; " + results.DROPPED_REPORT_NOTE
                     event["artifacts"], failed = self._upload_files(job["id"], execution_path, event["artifacts"])
                     if failed:
                         event["message"] += "; " + results.FILE_DROPPED_NOTE % failed
