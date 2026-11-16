@@ -78,36 +78,79 @@ def session_key(provider: str, session_id: str) -> str:
     return hashlib.sha256(("%s:%s" % (provider, session_id)).encode("utf-8")).hexdigest()
 
 
-# What a title must not carry besides secrets (the contract uploads no file paths): replaced in the whole text, in this
-# order, before the cut. A path ends at whitespace or a quote/bracket; the left guards keep a URL's own path, "and/or",
-# fractions and ordinary words intact. Anything not ASCII-alphanumeric (CJK included) may stand right before a path.
-PATH_MARK = "[路径]"
-EMAIL_MARK = "[邮箱]"
-_PATH_END = r"[^\s\"'`<>()\[\]{}]"
-_NOT_IN_WORD = r"(?<![A-Za-z0-9_.~:/\\-])"
-_TITLE_MASKS = [
-    (re.compile(r"(?i)\bfile:/" + _PATH_END + "*"), PATH_MARK),                         # file:///x, file:/x
-    (re.compile(r"(?<![A-Za-z0-9_])\\\\" + _PATH_END + "+"), PATH_MARK),             # \\server\share\x
-    (re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]" + _PATH_END + "*"), PATH_MARK),      # C:\x, C:/x
-    (re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9_.-]*[/\\]" + _PATH_END + "*"), PATH_MARK),  # ~/x, ~user/x
-    (re.compile(_NOT_IN_WORD + r"/[^\s/\"'`<>()\[\]{}]+/" + _PATH_END + "*"), PATH_MARK),  # /x/y...
-    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"), EMAIL_MARK),
-    # relative: at least one directory separator and an extension-like tail (src/app/main.py, docs\\a.md)
-    (re.compile(_NOT_IN_WORD + r"(?:[^\s/\\\"'`<>()\[\]{}@]+[/\\])+[^\s/\\\"'`<>()\[\]{}@]*\.[A-Za-z][A-Za-z0-9]{0,7}"
-                r"(?![A-Za-z0-9])"), PATH_MARK),
-]
+# What a title must not carry besides secrets: file paths, file names, links, e-mail addresses. Masked aggressively
+# (a readable title matters less than a leaked path), after secret redaction and before the cut:
+#   1. a quoted span ("…" '…' `…` “…” ‘…’ 「…」 『…』) whose content has a / or \\ or a file name: the whole span
+#   2. then each whitespace-separated token: a link (scheme://…, www.…) -> [链接]; a file: link or a token with an
+#      encoded separator (%2F, %5C) -> [路径]; an e-mail address -> [邮箱]; any / or \\ -> [路径], except a slash
+#      command as the very first token (/review); a token ending in a file name (name.ext) -> [文件]
+#   3. a run of adjacent markers becomes one ([路径] when any of them is one)
+# Version-like words (v1.2, node.js) become [文件] too; a plain number such as 3.5 stays.
+PATH_MARK, FILE_MARK, LINK_MARK, EMAIL_MARK = "[路径]", "[文件]", "[链接]", "[邮箱]"
+_MARKS = (PATH_MARK, FILE_MARK, LINK_MARK, EMAIL_MARK)
+_QUOTES = [re.compile(pattern, re.S) for pattern in (
+    r'"[^"]*"', r"`[^`]*`", r"“[^”]*”", r"「[^」]*」", r"『[^』]*』", r"‘[^’]*’", r"'[^']*'")]
+_FILE_IN = re.compile(r"[\w.@-]+\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])")
+_FILE_AT_END = re.compile(r"[\w.@-]+\.[A-Za-z0-9]{1,8}$")
+_NUMBER = re.compile(r"\d+(?:\.\d+)+")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_LINK = re.compile(r"(?i)(?:\b[a-z][a-z0-9+.-]*://|\bwww\.)")
+_FILE_LINK = re.compile(r"(?i)\bfile:")
+_ENCODED_SEPARATOR = re.compile(r"(?i)%2f|%5c")
+_SLASH_COMMAND = re.compile(r"^/[a-z][a-z0-9_-]*$")
+_TRAILING = ".,;:!?。，；：！？、)]}）】」』\"'”’`>"
+
+
+def _names_a_file(text: str) -> bool:
+    return any(not _NUMBER.fullmatch(found) for found in _FILE_IN.findall(text))
+
+
+def _quoted(match: "re.Match") -> str:
+    inner = match.group(0)[1:-1]
+    return PATH_MARK if ("/" in inner or "\\" in inner or _names_a_file(inner)) else match.group(0)
+
+
+def _masked_token(token: str, first: bool) -> str:
+    if token in _MARKS:
+        return token
+    if _FILE_LINK.search(token):
+        return PATH_MARK
+    if _LINK.search(token):
+        return LINK_MARK
+    if _ENCODED_SEPARATOR.search(token):
+        return PATH_MARK
+    if _EMAIL.search(token):
+        return EMAIL_MARK
+    if "/" in token or "\\" in token:
+        return token if first and _SLASH_COMMAND.match(token) else PATH_MARK
+    found = _FILE_AT_END.search(token.rstrip(_TRAILING))
+    if found and not _NUMBER.fullmatch(found.group(0)):
+        return FILE_MARK
+    return token
+
+
+def mask_title(text: str) -> str:
+    """Steps 1-3 above on already redacted text; whitespace comes out collapsed."""
+    for quote in _QUOTES:
+        text = quote.sub(_quoted, text)
+    out: List[str] = []
+    for index, token in enumerate(text.split()):
+        token = _masked_token(token, index == 0)
+        if token in _MARKS and out and out[-1] in _MARKS:
+            if token == PATH_MARK:
+                out[-1] = PATH_MARK
+            continue
+        out.append(token)
+    return " ".join(out)
 
 
 def safe_title(text: Any) -> str:
-    """The title as it may leave this computer: secrets masked in the WHOLE text first, then file paths and e-mail
-    addresses replaced by a marker, then whitespace collapsed, and only then cut to TITLE_CHARS. Cutting first could
-    split a secret or a path so that what remains no longer looks like one."""
+    """The title as it may leave this computer: secrets masked in the WHOLE text first, then paths, file names, links
+    and e-mail addresses (mask_title), and only then cut to TITLE_CHARS. Cutting first could split a secret or a path
+    so that what remains no longer looks like one."""
     if not isinstance(text, str):
         return ""
-    text = redact(text)
-    for pattern, mark in _TITLE_MASKS:
-        text = pattern.sub(mark, text)
-    return " ".join(text.split())[:TITLE_CHARS]
+    return mask_title(redact(text))[:TITLE_CHARS]
 
 
 def parse_time(value: Any) -> Optional[float]:
@@ -664,11 +707,14 @@ class Importer:
             # Decided on the run state as it is NOW: a TimeTrace run may have started, or ended and recorded its
             # provider session id, while this round was reading (a folder-workspace run's session lies inside the
             # workspace, so only its id tells it apart).
+            # Order matters: the run state FIRST, the recorded ids SECOND. A run records its provider session id before
+            # it stops counting as running, so whatever ends in between is caught by one read or the other.
             busy = busy_since()
             if busy is not None and info.st_mtime >= busy - 1:
                 stats["deferred"] += 1
                 continue
-            payload = self._payload(summary, workspaces, db.own_provider_session_ids(), home)
+            own = db.own_provider_session_ids()
+            payload = self._payload(summary, workspaces, own, home)
             if payload is None:
                 stats["not_sent"] += 1
                 settled.append(row)
@@ -740,8 +786,10 @@ class Importer:
         session id was recorded: settled unsent) or been written while a run is going (left for a later round)."""
         if not enabled():
             raise ImportOff()
-        own = db.own_provider_session_ids()
+        # The run state FIRST, the recorded ids SECOND (see run()): a run that ends between the two reads recorded its
+        # id before it stopped running, so it is either still running in the first read or recorded in the second.
         busy = busy_since()
+        own = db.own_provider_session_ids()
         sendable, settled = [], []
         for item in batch:
             row, _, session_id, mtime = item

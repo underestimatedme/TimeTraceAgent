@@ -578,15 +578,14 @@ class ReviewRegressionTest(Fixture):
             "edit src/app/main.py please": "edit [路径] please",
             "edit docs\\guide\\a.md": "edit [路径]",
             "mail alice.smith@example.co.uk today": "mail [邮箱] today",
-            "修改/Users/alice/a.py 里的问题": "修改[路径] 里的问题",
+            "修改/Users/alice/a.py 里的问题": "[路径] 里的问题",
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(ls.safe_title(text), expected)
 
     def test_title_without_paths_is_unchanged(self):
-        for text in ("refactor the parser and/or tests, 1/2 done at 30 km/h", "run /review then /tmp",
-                     "read https://example.com/docs/a.html", "版本 v1.2 的 TCP/IP 问题"):
+        for text in ("refactor the parser, then add tests.", "Claude 3.5 升级说明", "修改登录页的按钮颜色"):
             with self.subTest(text=text):
                 self.assertEqual(ls.safe_title(text), text)
 
@@ -703,6 +702,134 @@ class ReviewRegressionTest(Fixture):
         (self.codex / "sessions" / "2026").mkdir(parents=True)
         os.symlink(str(outside / "2026" / "11"), str(self.codex / "sessions" / "2026" / "11"))
         self.assert_nothing_read(outside)
+
+
+class SecondReviewRegressionTest(Fixture):
+    """Blockers found in the second review (each test fails on 1e3496a)."""
+
+    PRIVATE = ("Users", "alice", "Alice", "Acme", "customer", "secret", "Payroll", "private", "credentials", "Smith")
+
+    def assert_private_gone(self, title):
+        for word in self.PRIVATE:
+            self.assertNotIn(word, title)
+
+    def test_reviewer_examples_leave_nothing_of_the_path(self):
+        cases = {
+            'edit "/Users/alice/Acme Corp/customer secret.csv"': "edit [路径]",
+            'edit "c:\\Users\\Alice Smith\\Payroll 2026.csv"': "edit [路径]",
+            "edit src/private/customer-records": "edit [路径]",
+            "edit ../private/credentials": "edit [路径]",
+            'open "/secret.txt"': "open [路径]",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                title = ls.safe_title(text)
+                self.assertEqual(title, expected)
+                self.assert_private_gone(title)
+
+    def test_other_quotes_unquoted_spaces_and_drive_letters(self):
+        cases = {
+            "edit /Users/alice/Acme Corp/customer secret.csv now": "edit [路径] now",
+            "edit c:\\Users\\Alice Smith\\Payroll 2026.csv": "edit [路径]",
+            "open /secret.txt": "open [路径]",
+            "改「/Users/alice/Acme 客户/secret.csv」": "改[路径]",
+            "改 “/Users/alice/Acme Corp/secret.csv” 吧": "改 [路径] 吧",
+            "see `src/private/customer secret.py` and 'Payroll 2026.csv'": "see [路径] and [路径]",
+            "share \\\\srv\\Acme\\customer.doc": "share [路径]",
+            "attach customer_secret.csv": "attach [文件]",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                title = ls.safe_title(text)
+                self.assertEqual(title, expected)
+                self.assert_private_gone(title)
+
+    def test_links_encoded_separators_and_emails(self):
+        cases = {
+            "see https://drive.example/q?path=%2FUsers%2Falice%2Fsecret.csv": "see [链接]",
+            "see www.example.com/Acme/customer": "see [链接]",
+            "decode path=%2fUsers%2falice%5cPayroll": "decode [路径]",
+            "open file:///Users/alice/secret.txt": "open [路径]",
+            "ask alice.smith@acme.example about it": "ask [邮箱] about it",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                title = ls.safe_title(text)
+                self.assertEqual(title, expected)
+                self.assert_private_gone(title)
+
+    def test_a_leading_slash_command_is_kept_and_markers_collapse(self):
+        self.assertEqual(ls.safe_title("/review the parser"), "/review the parser")
+        self.assertEqual(ls.safe_title("run /review now"), "run [路径] now")
+        self.assertEqual(ls.safe_title("/secret.txt is wrong"), "[路径] is wrong")
+        self.assertEqual(ls.safe_title("/Users/alice"), "[路径]")
+        self.assertEqual(ls.safe_title("diff a/b.py c/d.py notes.md now"), "diff [路径] now")
+        self.assertEqual(ls.safe_title("mail bob@example.com, www.example.com"), "mail [邮箱]")
+
+    def test_plain_titles_are_untouched(self):
+        for text in ("Refactor the login form and add tests", "修改登录页的按钮颜色，并补测试", "it's fine, don't worry",
+                     "Claude 3.5 和 GPT 4 的对比"):
+            with self.subTest(text=text):
+                self.assertEqual(ls.safe_title(text), text)
+
+    def test_a_run_that_ends_between_the_two_reads_of_the_final_check_is_not_sent(self):
+        """The run is going when the last check before the request starts, records its provider session id and stops
+        counting as running in between the check's two reads (a real thread, held at a barrier)."""
+        self.claude_session("folder-run")
+        agent = Agent(self.db, object(), {}, self.home, lambda: "token", local_sessions=self.importer())
+        agent._local_session_import = agent._local_session_known = True
+        agent.cloud = type("Cloud", (), {})()
+        uploads = []
+        agent.cloud.post_local_sessions = lambda token, sessions: uploads.append(sessions)
+        cancel = threading.Event()
+        state = {"phase": "decide"}
+        first_read, finished = threading.Event(), threading.Event()
+
+        def run_ends():
+            first_read.wait(5)
+            run_db = Database(self.db.path)
+            run_db.record_provider_session("folder-run")  # the run reports its session...
+            run_db.close()
+            agent._untrack(cancel)                         # ...and then stops counting as running
+            finished.set()
+
+        runner = threading.Thread(target=run_ends)
+        runner.start()
+        self.addCleanup(runner.join, 5)
+        real_payload = ls.Importer._payload
+
+        def decided(*args):
+            payload = real_payload(*args)
+            # the file is decided while nothing runs; then the run starts (it resumed that session)
+            agent._track(cancel)
+            agent._running_since[id(cancel)] = time.time() - 60
+            state["phase"] = "final"
+            return payload
+
+        def at_first_read_of_final_check():
+            if state["phase"] == "final":
+                state["phase"] = "done"
+                first_read.set()
+                self.assertTrue(finished.wait(5))
+
+        real_busy, real_own = agent._busy_since, Database.own_provider_session_ids
+
+        def busy():
+            value = real_busy()
+            at_first_read_of_final_check()
+            return value
+
+        def own(db):
+            value = real_own(db)
+            at_first_read_of_final_check()
+            return value
+
+        agent._busy_since = busy
+        with patch.object(ls.Importer, "_payload", staticmethod(decided)), \
+                patch.object(Database, "own_provider_session_ids", own):
+            stats = agent.import_local_sessions()
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual((uploads, stats.get("uploaded")), ([], 0))
 
 
 class CloudLocalSessionsTest(unittest.TestCase):
