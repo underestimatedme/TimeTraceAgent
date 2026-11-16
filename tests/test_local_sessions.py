@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from timetrace.agent import Agent
 from timetrace.checkpoints import Checkpoint
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.db import Database
+from timetrace.models import RunResult
 
 
 def write_lines(path: Path, lines, garbage=()):
@@ -159,7 +161,6 @@ class ClaudeParserTest(Fixture):
             claude_user("sess-1", cwd, [{"type": "image", "source": {}}], "2026-11-16T10:00:11Z"),
         ])
         self.assertEqual(summary.turns, 3)
-        self.assertEqual(summary.title, "first real question")
 
     def test_sidechain_replies_cost_tokens_but_are_not_turns(self):
         cwd = self.cwd
@@ -171,16 +172,6 @@ class ClaudeParserTest(Fixture):
         self.assertEqual(summary.turns, 1)
         self.assertEqual(summary.output_tokens, 40)
 
-    def test_custom_title_is_preferred_and_the_last_rename_wins(self):
-        cwd = self.cwd
-        summary = self.parse([
-            claude_user("sess-1", cwd, "the first prompt", "2026-11-16T10:00:00Z"),
-            {"type": "custom-title", "sessionId": "sess-1", "customTitle": "Old name"},
-            {"type": "custom-title", "sessionId": "sess-1", "customTitle": "Renamed session"},
-            {"type": "custom-title", "sessionId": "sess-1", "customTitle": "   "},
-        ])
-        self.assertEqual(summary.title, "Renamed session")
-
     def test_copied_lines_of_another_session_do_not_count(self):
         cwd = self.cwd
         summary = self.parse([
@@ -191,7 +182,7 @@ class ClaudeParserTest(Fixture):
             claude_assistant("sess-1", cwd, "m1", "2026-11-16T10:00:01Z"),
         ])
         self.assertEqual(summary.session_id, "sess-1")
-        self.assertEqual((summary.turns, summary.title, summary.output_tokens), (1, "continued here", 20))
+        self.assertEqual((summary.turns, summary.output_tokens), (1, 20))
         self.assertEqual(summary.model, "claude-model-a")
         self.assertEqual(ls.format_time(summary.started_at), "2026-11-16T10:00:00Z")
 
@@ -268,7 +259,7 @@ class CodexParserTest(Fixture):
             codex_line("response_item", {"type": "message", "role": "user",
                                          "content": [{"type": "input_text", "text": "real question"}]}),
         ])
-        self.assertEqual((summary.turns, summary.title), (2, "real question"))
+        self.assertEqual(summary.turns, 2)
 
     def test_question_replies_the_tool_asked_for_are_not_turns(self):
         summary = self.parse([
@@ -276,7 +267,7 @@ class CodexParserTest(Fixture):
             user_item("<send_user_message_question_reply>yes</send_user_message_question_reply>"),
             user_item("please continue"),
         ])
-        self.assertEqual((summary.turns, summary.title), (1, "please continue"))
+        self.assertEqual(summary.turns, 1)
 
     def test_first_session_meta_is_the_rollouts_own(self):
         summary = self.parse([
@@ -325,23 +316,7 @@ class CodexParserTest(Fixture):
         self.assertIsNone(self.parse([user_item("no meta"), token_count(1, 0, 1)], name="rollout-x.jsonl"))
 
 
-class TitleAndMappingTest(unittest.TestCase):
-    def test_redaction_happens_before_the_cut(self):
-        secret = "ghp_" + "A1b2C3d4E5" * 4  # 44 characters; a GitHub token needs 36 after the prefix to be recognized
-        text = "deploy with this token " + "x" * 47 + " " + secret + " please"
-        cut_first = text[:ls.TITLE_CHARS]
-        self.assertIn("ghp_", cut_first)  # cutting first would keep a token fragment redact no longer recognizes
-        title = ls.safe_title(text)
-        self.assertNotIn("ghp_", title)
-        self.assertNotIn("A1b2C3d4", title)
-        self.assertEqual(title, ("deploy with this token " + "x" * 47 + " [REDACTED]")[:ls.TITLE_CHARS])
-        self.assertLessEqual(len(title), ls.TITLE_CHARS)
-
-    def test_title_whitespace_and_length(self):
-        self.assertEqual(ls.safe_title("  line one\n\n line\ttwo  "), "line one line two")
-        self.assertEqual(len(ls.safe_title("长" * 200)), 80)
-        self.assertEqual(ls.safe_title(None), "")
-
+class MappingTest(unittest.TestCase):
     def test_workspace_mapping_inside_outside_and_nested(self):
         workspaces = [("outer", "/w/proj"), ("inner", "/w/proj/sub")]
         self.assertEqual(ls.workspace_for("/w/proj", workspaces), "outer")
@@ -380,7 +355,7 @@ class ImporterTest(Fixture):
                                        "started_at", "ended_at", "turns", "input_tokens", "output_tokens",
                                        "cache_read_tokens", "cache_write_tokens", "files_touched"})
         self.assertEqual(claude["session_key"], ls.session_key("claude", "in-ws"))
-        self.assertEqual((claude["workspace_id"], claude["title"], claude["turns"]), ("ws1", "fix the bug", 1))
+        self.assertEqual((claude["workspace_id"], claude["title"], claude["turns"]), ("ws1", "", 1))
         raw = json.dumps(records)
         for leak in ("in-ws", "cx1", str(self.workspace), "src"):
             self.assertNotIn(leak, raw)
@@ -565,40 +540,6 @@ class ImporterTest(Fixture):
 class ReviewRegressionTest(Fixture):
     """Blockers found in review of the first version (each test fails on it)."""
 
-    # 1. titles carry no file paths or e-mail addresses
-    def test_title_masks_each_kind_of_path_and_email(self):
-        cases = {
-            "fix /Users/alice/private/customer.csv now": "fix [路径] now",
-            "open ~/notes/plan.md": "open [路径]",
-            "ask ~bob/notes.txt": "ask [路径]",
-            "check C:\\Users\\bob\\a.txt": "check [路径]",
-            "check C:/Users/bob/a.txt": "check [路径]",
-            "share \\\\srv\\team\\x.doc": "share [路径]",
-            "see file:///Users/a/b.txt": "see [路径]",
-            "edit src/app/main.py please": "edit [路径] please",
-            "edit docs\\guide\\a.md": "edit [路径]",
-            "mail alice.smith@example.co.uk today": "mail [邮箱] today",
-            "修改/Users/alice/a.py 里的问题": "[路径] 里的问题",
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                self.assertEqual(ls.safe_title(text), expected)
-
-    def test_title_without_paths_is_unchanged(self):
-        for text in ("refactor the parser, then add tests.", "Claude 3.5 升级说明", "修改登录页的按钮颜色"):
-            with self.subTest(text=text):
-                self.assertEqual(ls.safe_title(text), text)
-
-    def test_masking_happens_before_the_cut(self):
-        title = ls.safe_title("x" * 70 + " /Users/alice/private/customer.csv")
-        self.assertEqual(title, "x" * 70 + " [路径]")
-        self.assertNotIn("/Users", title)
-
-    def test_uploaded_title_carries_no_path(self):
-        self.claude_session("with-path", prompts=("fix /Users/alice/private/customer.csv for bob@example.com",))
-        _, sent = self.run_once()
-        self.assertEqual([r["title"] for batch in sent for r in batch], ["fix [路径] for [邮箱]"])
-
     # 2. consent is checked before every request, also inside a 422 split
     def test_switch_turned_off_during_a_split_makes_no_further_request(self):
         for index in range(3):
@@ -707,71 +648,6 @@ class ReviewRegressionTest(Fixture):
 class SecondReviewRegressionTest(Fixture):
     """Blockers found in the second review (each test fails on 1e3496a)."""
 
-    PRIVATE = ("Users", "alice", "Alice", "Acme", "customer", "secret", "Payroll", "private", "credentials", "Smith")
-
-    def assert_private_gone(self, title):
-        for word in self.PRIVATE:
-            self.assertNotIn(word, title)
-
-    def test_reviewer_examples_leave_nothing_of_the_path(self):
-        cases = {
-            'edit "/Users/alice/Acme Corp/customer secret.csv"': "edit [路径]",
-            'edit "c:\\Users\\Alice Smith\\Payroll 2026.csv"': "edit [路径]",
-            "edit src/private/customer-records": "edit [路径]",
-            "edit ../private/credentials": "edit [路径]",
-            'open "/secret.txt"': "open [路径]",
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                title = ls.safe_title(text)
-                self.assertEqual(title, expected)
-                self.assert_private_gone(title)
-
-    def test_other_quotes_unquoted_spaces_and_drive_letters(self):
-        cases = {
-            "edit /Users/alice/Acme Corp/customer secret.csv now": "edit [路径] now",
-            "edit c:\\Users\\Alice Smith\\Payroll 2026.csv": "edit [路径]",
-            "open /secret.txt": "open [路径]",
-            "改「/Users/alice/Acme 客户/secret.csv」": "改[路径]",
-            "改 “/Users/alice/Acme Corp/secret.csv” 吧": "改 [路径] 吧",
-            "see `src/private/customer secret.py` and 'Payroll 2026.csv'": "see [路径] and [路径]",
-            "share \\\\srv\\Acme\\customer.doc": "share [路径]",
-            "attach customer_secret.csv": "attach [文件]",
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                title = ls.safe_title(text)
-                self.assertEqual(title, expected)
-                self.assert_private_gone(title)
-
-    def test_links_encoded_separators_and_emails(self):
-        cases = {
-            "see https://drive.example/q?path=%2FUsers%2Falice%2Fsecret.csv": "see [链接]",
-            "see www.example.com/Acme/customer": "see [链接]",
-            "decode path=%2fUsers%2falice%5cPayroll": "decode [路径]",
-            "open file:///Users/alice/secret.txt": "open [路径]",
-            "ask alice.smith@acme.example about it": "ask [邮箱] about it",
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                title = ls.safe_title(text)
-                self.assertEqual(title, expected)
-                self.assert_private_gone(title)
-
-    def test_a_leading_slash_command_is_kept_and_markers_collapse(self):
-        self.assertEqual(ls.safe_title("/review the parser"), "/review the parser")
-        self.assertEqual(ls.safe_title("run /review now"), "run [路径] now")
-        self.assertEqual(ls.safe_title("/secret.txt is wrong"), "[路径] is wrong")
-        self.assertEqual(ls.safe_title("/Users/alice"), "[路径]")
-        self.assertEqual(ls.safe_title("diff a/b.py c/d.py notes.md now"), "diff [路径] now")
-        self.assertEqual(ls.safe_title("mail bob@example.com, www.example.com"), "mail [邮箱]")
-
-    def test_plain_titles_are_untouched(self):
-        for text in ("Refactor the login form and add tests", "修改登录页的按钮颜色，并补测试", "it's fine, don't worry",
-                     "Claude 3.5 和 GPT 4 的对比"):
-            with self.subTest(text=text):
-                self.assertEqual(ls.safe_title(text), text)
-
     def test_a_run_that_ends_between_the_two_reads_of_the_final_check_is_not_sent(self):
         """The run is going when the last check before the request starts, records its provider session id and stops
         counting as running in between the check's two reads (a real thread, held at a barrier)."""
@@ -830,6 +706,142 @@ class SecondReviewRegressionTest(Fixture):
             stats = agent.import_local_sessions()
         self.assertEqual(state["phase"], "done")
         self.assertEqual((uploads, stats.get("uploaded")), ([], 0))
+
+
+class ThirdReviewRegressionTest(Fixture):
+    """Blockers found in the third review (each test fails on 83fcb2e)."""
+
+    SOURCE = ("/Users/alice/Acme Corp/customer secret.csv", "alice@acme.example", "ghp_" + "A1b2C3d4E5" * 4,
+              "secret.txt中的内容", ".env", "Payroll 2026", "Renamed by hand ~/private/notes.md")
+
+    def test_no_conversation_text_leaves_not_even_a_title(self):
+        cwd = self.cwd
+        write_lines(self.claude / "projects" / "-p" / "talky.jsonl", [
+            claude_user("talky", cwd, "edit %s and mail %s, token %s" % self.SOURCE[:3], "2026-11-16T10:00:00Z"),
+            claude_assistant("talky", cwd, "m1", "2026-11-16T10:00:01Z"),
+            claude_user("talky", cwd, "%s / %s / %s" % self.SOURCE[3:6], "2026-11-16T10:00:02Z"),
+            {"type": "custom-title", "sessionId": "talky", "customTitle": self.SOURCE[6]},
+        ])
+        write_lines(self.codex / "sessions" / "2026" / "11" / "16" / "rollout-2026-11-16T09-00-00-cxt.jsonl",
+                    [codex_meta("cxt", cwd), user_item(" ".join(self.SOURCE)), token_count(10, 4, 3)])
+        _, sent = self.run_once()
+        records = [record for batch in sent for record in batch]
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record["title"] for record in records], ["", ""])
+        self.assertEqual(sorted(record["turns"] for record in records), [1, 2])
+        raw = json.dumps(sent, ensure_ascii=False)
+        for text in self.SOURCE + ("Acme", "alice", "customer", "secret", "Payroll", "private", "edit", "Renamed"):
+            self.assertNotIn(text, raw)
+
+    # 2. every run's provider session is a TimeTrace run, whatever the outcome
+    def lifecycle_agent(self, job, adapter):
+        import subprocess
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.cwd, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit",
+                        "--allow-empty", "-qm", "initial"], cwd=self.cwd, check=True)
+        self.db.upsert_workspace("ws1", "repo", self.cwd, "main", kind="git")
+        test = self
+
+        class Cloud:
+            uploads = []
+
+            def claim(self, token):
+                return {"job": dict(job), "attempt_id": "a1", "lease_epoch": 1,
+                        "lease_expires_at": datetime.fromtimestamp(time.time() + 90, timezone.utc).isoformat()}
+
+            def append_events(self, token, job_id, attempt_id, epoch, events):
+                pass
+
+            def renew(self, token, attempt_id, epoch):
+                return {"lease_expires_at": datetime.fromtimestamp(time.time() + 90, timezone.utc).isoformat()}
+
+            def post_quota_samples(self, token, samples):
+                return {}
+
+            def post_local_sessions(self, token, sessions):
+                Cloud.uploads.append(sessions)
+
+        agent = Agent(self.db, Cloud(), {job["provider"]: adapter}, self.home, lambda: "token",
+                      prepare_workspace=lambda *args: (test.cwd, "main"), local_sessions=self.importer())
+        agent._note_local_session_import({"local_session_import": True})
+        agent._local_sessions_due = False
+        self.addCleanup(self.join_round, agent)
+        return agent, Cloud
+
+    @staticmethod
+    def join_round(agent):
+        thread = agent._local_sessions_thread
+        if thread is not None:
+            thread.join(10)
+
+    class Tool:
+        """A tool that, like the real CLIs, leaves its session file in the run's directory and chooses its own id."""
+
+        def __init__(self, fixture, sid, **result):
+            self.fixture, self.sid, self.result = fixture, sid, result
+
+        def capabilities(self):
+            return {"can_record": True, "can_read_quota": False, "can_dispatch": True, "can_resume": True,
+                    "can_enforce_zero_spend": True}
+
+        def chat(self, prompt, cwd, session_id, log_file, cancel_event=None):
+            self.fixture.claude_session(self.sid, cwd=cwd)
+            return RunResult(session_id=self.sid, **self.result)
+
+        def start(self, prompt, cwd, session_id, log_file, cancel_event=None, **kwargs):
+            write_lines(self.fixture.codex / "sessions" / "2026" / "11" / "16" /
+                        ("rollout-2026-11-16T09-00-00-%s.jsonl" % self.sid),
+                        [codex_meta(self.sid, cwd), user_item("do it"), token_count(10, 4, 3)])
+            return RunResult(session_id=self.sid, **self.result)
+
+    def assert_run_not_imported(self, agent, cloud, sid):
+        self.join_round(agent)  # the upkeep after the run may already have started a round of its own
+        self.assertIn(sid, self.db.own_provider_session_ids())
+        stats = agent.import_local_sessions()
+        self.assertEqual((cloud.uploads, stats["uploaded"]), ([], 0))
+        rows = list(self.db.local_session_files().values())
+        self.assertEqual([(row["session_key"], row["fingerprint"]) for row in rows], [("", "")])  # settled, not sent
+
+    def test_a_failed_chat_turn_is_not_imported(self):
+        job = {"id": "c1", "kind": "chat_turn", "workspace_id": "ws1", "tool_profile_id": "claude-default",
+               "provider": "claude", "prompt": "explain"}
+        agent, cloud = self.lifecycle_agent(job, self.Tool(self, "chat-failed", exit_code=2, ok=False, error="boom"))
+        self.assertEqual(agent.run_once(), "job c1 → failed")
+        self.assert_run_not_imported(agent, cloud, "chat-failed")
+
+    def test_a_quota_blocked_chat_turn_is_not_imported(self):
+        job = {"id": "c1", "kind": "chat_turn", "workspace_id": "ws1", "tool_profile_id": "claude-default",
+               "provider": "claude", "prompt": "explain"}
+        agent, cloud = self.lifecycle_agent(job, self.Tool(self, "chat-quota", exit_code=1, blocked=True,
+                                                           error="You've hit your limit"))
+        self.assertEqual(agent.run_once(), "job c1 → waiting_quota")
+        self.assert_run_not_imported(agent, cloud, "chat-quota")
+
+    def test_a_failed_task_run_is_not_imported(self):
+        job = {"id": "j1", "workspace_id": "ws1", "tool_profile_id": "codex-default", "provider": "codex",
+               "prompt": "do it"}
+        agent, cloud = self.lifecycle_agent(job, self.Tool(self, "codex-thread-failed", exit_code=1, ok=False,
+                                                           error="tests failed"))
+        self.assertEqual(agent.run_once(), "job j1 → failed")
+        self.assert_run_not_imported(agent, cloud, "codex-thread-failed")
+
+    def test_ids_are_recorded_before_the_job_stops_counting_as_running(self):
+        agent = Agent(self.db, object(), {}, self.home, lambda: "token")
+        cancel = threading.Event()
+        agent._track(cancel)
+        agent._note_run_session(cancel, RunResult(session_id="s-1"), "s-2", None, {"not": "a result"})
+        seen = {}
+        real_record = self.db.record_provider_session
+
+        def record(sid, now=None):
+            seen.setdefault("running_at_record", agent._busy_since() is not None)
+            real_record(sid, now)
+
+        with patch.object(self.db, "record_provider_session", record):
+            agent._untrack(cancel)
+        self.assertTrue(seen["running_at_record"])
+        self.assertIsNone(agent._busy_since())
+        self.assertTrue({"s-1", "s-2"} <= self.db.own_provider_session_ids())
 
 
 class CloudLocalSessionsTest(unittest.TestCase):

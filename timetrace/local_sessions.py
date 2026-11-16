@@ -4,11 +4,13 @@ Contract: docs/superpowers/specs/2026-11-16-local-agent-sessions-design.md (Time
 Runner scans only while the last inventory answer said `local_session_import: true`.
 
 Only metadata leaves this computer, one record per session: provider, an opaque session key (sha256 of
-"<provider>:<session id>"; the id itself is never sent), the registered workspace id, a redacted title of at most 80
-characters, the most used model, the last git branch, start / end time, the number of user prompts, four token
-totals and the NUMBER of distinct files edited. Never conversation text beyond the title, command output, file paths
-or file contents. A session whose working directory is not inside a workspace registered with this Runner is never
-sent, and neither is a session TimeTrace itself ran.
+"<provider>:<session id>"; the id itself is never sent), the registered workspace id, the most used model, the last
+git branch, start / end time, the number of user prompts, four token totals and the NUMBER of distinct files edited.
+No conversation text of any kind leaves it, not even a title (the record's `title` is always ""; free text cannot be
+guaranteed free of paths, names or secrets), and neither does command output, a file path or file contents. Prompt
+text is read only to tell a question the person asked from one the tool injected, and is never kept. A session whose
+working directory is not inside a workspace registered with this Runner is never sent, and neither is a session
+TimeTrace itself ran.
 
 Read only: `$CLAUDE_CONFIG_DIR` (or ~/.claude) `projects/*/*.jsonl` and `$CODEX_HOME` (or ~/.codex)
 `sessions/**/rollout-*.jsonl`. Symbolic links below those directories are not followed and credential files are never
@@ -24,8 +26,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from timetrace.redact import redact
-
 CLAUDE = "claude"
 CODEX = "codex"
 # Valley's switch, and the refusal code of POST /runner/local-sessions while it is off.
@@ -34,7 +34,6 @@ OFF_CODE = "local_session_import_off"
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_FILES_PER_CYCLE = 200
 BATCH_SIZE = 100
-TITLE_CHARS = 80
 MODEL_CHARS = 64
 BRANCH_CHARS = 120
 # Never opened, whatever a directory listing says (they never match the session patterns either).
@@ -76,81 +75,6 @@ def codex_root(env: Optional[Dict[str, str]] = None, user_home: Optional[Path] =
 
 def session_key(provider: str, session_id: str) -> str:
     return hashlib.sha256(("%s:%s" % (provider, session_id)).encode("utf-8")).hexdigest()
-
-
-# What a title must not carry besides secrets: file paths, file names, links, e-mail addresses. Masked aggressively
-# (a readable title matters less than a leaked path), after secret redaction and before the cut:
-#   1. a quoted span ("…" '…' `…` “…” ‘…’ 「…」 『…』) whose content has a / or \\ or a file name: the whole span
-#   2. then each whitespace-separated token: a link (scheme://…, www.…) -> [链接]; a file: link or a token with an
-#      encoded separator (%2F, %5C) -> [路径]; an e-mail address -> [邮箱]; any / or \\ -> [路径], except a slash
-#      command as the very first token (/review); a token ending in a file name (name.ext) -> [文件]
-#   3. a run of adjacent markers becomes one ([路径] when any of them is one)
-# Version-like words (v1.2, node.js) become [文件] too; a plain number such as 3.5 stays.
-PATH_MARK, FILE_MARK, LINK_MARK, EMAIL_MARK = "[路径]", "[文件]", "[链接]", "[邮箱]"
-_MARKS = (PATH_MARK, FILE_MARK, LINK_MARK, EMAIL_MARK)
-_QUOTES = [re.compile(pattern, re.S) for pattern in (
-    r'"[^"]*"', r"`[^`]*`", r"“[^”]*”", r"「[^」]*」", r"『[^』]*』", r"‘[^’]*’", r"'[^']*'")]
-_FILE_IN = re.compile(r"[\w.@-]+\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])")
-_FILE_AT_END = re.compile(r"[\w.@-]+\.[A-Za-z0-9]{1,8}$")
-_NUMBER = re.compile(r"\d+(?:\.\d+)+")
-_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-_LINK = re.compile(r"(?i)(?:\b[a-z][a-z0-9+.-]*://|\bwww\.)")
-_FILE_LINK = re.compile(r"(?i)\bfile:")
-_ENCODED_SEPARATOR = re.compile(r"(?i)%2f|%5c")
-_SLASH_COMMAND = re.compile(r"^/[a-z][a-z0-9_-]*$")
-_TRAILING = ".,;:!?。，；：！？、)]}）】」』\"'”’`>"
-
-
-def _names_a_file(text: str) -> bool:
-    return any(not _NUMBER.fullmatch(found) for found in _FILE_IN.findall(text))
-
-
-def _quoted(match: "re.Match") -> str:
-    inner = match.group(0)[1:-1]
-    return PATH_MARK if ("/" in inner or "\\" in inner or _names_a_file(inner)) else match.group(0)
-
-
-def _masked_token(token: str, first: bool) -> str:
-    if token in _MARKS:
-        return token
-    if _FILE_LINK.search(token):
-        return PATH_MARK
-    if _LINK.search(token):
-        return LINK_MARK
-    if _ENCODED_SEPARATOR.search(token):
-        return PATH_MARK
-    if _EMAIL.search(token):
-        return EMAIL_MARK
-    if "/" in token or "\\" in token:
-        return token if first and _SLASH_COMMAND.match(token) else PATH_MARK
-    found = _FILE_AT_END.search(token.rstrip(_TRAILING))
-    if found and not _NUMBER.fullmatch(found.group(0)):
-        return FILE_MARK
-    return token
-
-
-def mask_title(text: str) -> str:
-    """Steps 1-3 above on already redacted text; whitespace comes out collapsed."""
-    for quote in _QUOTES:
-        text = quote.sub(_quoted, text)
-    out: List[str] = []
-    for index, token in enumerate(text.split()):
-        token = _masked_token(token, index == 0)
-        if token in _MARKS and out and out[-1] in _MARKS:
-            if token == PATH_MARK:
-                out[-1] = PATH_MARK
-            continue
-        out.append(token)
-    return " ".join(out)
-
-
-def safe_title(text: Any) -> str:
-    """The title as it may leave this computer: secrets masked in the WHOLE text first, then paths, file names, links
-    and e-mail addresses (mask_title), and only then cut to TITLE_CHARS. Cutting first could split a secret or a path
-    so that what remains no longer looks like one."""
-    if not isinstance(text, str):
-        return ""
-    return mask_title(redact(text))[:TITLE_CHARS]
 
 
 def parse_time(value: Any) -> Optional[float]:
@@ -222,15 +146,15 @@ def _touched(paths: set, cwd: str, value: Any) -> None:
 
 
 class Summary:
-    """One session as read from its file (still holding the local session id, cwd and the raw title)."""
+    """One session as read from its file (still holding the local session id and cwd, which never leave)."""
 
-    __slots__ = ("provider", "session_id", "cwd", "title", "model", "git_branch", "started_at", "ended_at", "turns",
+    __slots__ = ("provider", "session_id", "cwd", "model", "git_branch", "started_at", "ended_at", "turns",
                  "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "files_touched")
 
     def __init__(self, provider: str, session_id: str, **fields: Any):
         self.provider, self.session_id = provider, session_id
         for name in self.__slots__[2:]:
-            setattr(self, name, fields.get(name, "" if name in ("cwd", "title", "model", "git_branch") else 0))
+            setattr(self, name, fields.get(name, "" if name in ("cwd", "model", "git_branch") else 0))
         self.started_at = fields.get("started_at")
         self.ended_at = fields.get("ended_at")
 
@@ -243,7 +167,7 @@ class Summary:
 class _ClaudeSession:
     def __init__(self):
         self.first = self.last = None
-        self.cwd = self.branch = self.title = self.prompt = ""
+        self.cwd = self.branch = ""
         self.prompts = 0
         self.usage: Dict[Any, Dict[str, Any]] = {}
         self.models: Dict[Any, str] = {}
@@ -256,10 +180,6 @@ class _ClaudeSession:
             self.first = moment if self.first is None else min(self.first, moment)
             self.last = moment if self.last is None else max(self.last, moment)
         kind = line.get("type")
-        if kind == "custom-title":
-            if _text(line.get("customTitle")).strip():
-                self.title = line["customTitle"]  # renamed again later: the last name wins
-            return
         if kind not in ("user", "assistant"):
             return
         if not self.cwd and _text(line.get("cwd")):
@@ -290,12 +210,8 @@ class _ClaudeSession:
                 _touched(self.files, self.cwd, arguments.get("file_path") or arguments.get("notebook_path"))
 
     def _user(self, line: Dict[str, Any], message: Dict[str, Any]) -> None:
-        text = _claude_prompt(line, message)
-        if text is None:
-            return
-        self.prompts += 1
-        if not self.prompt and text.strip():
-            self.prompt = text
+        if _claude_asked(line, message):
+            self.prompts += 1
 
     def summary(self, session_id: str) -> Summary:
         totals = Counter()
@@ -305,7 +221,7 @@ class _ClaudeSession:
             totals["read"] += _count(usage.get("cache_read_input_tokens"))
             totals["write"] += _count(usage.get("cache_creation_input_tokens"))
         model = Counter(self.models.values()).most_common(1)
-        return Summary(CLAUDE, session_id, cwd=self.cwd, title=self.title or self.prompt,
+        return Summary(CLAUDE, session_id, cwd=self.cwd,
                        model=model[0][0] if model else "", git_branch=self.branch,
                        started_at=self.first, ended_at=self.last, turns=self.prompts,
                        input_tokens=totals["input"], output_tokens=totals["output"],
@@ -313,35 +229,33 @@ class _ClaudeSession:
                        files_touched=len(self.files))
 
 
-def _claude_prompt(line: Dict[str, Any], message: Dict[str, Any]) -> Optional[str]:
-    """The text of a question the person asked, or None for every other kind of user line: tool results, meta and
-    side-chain (sub-agent) lines, compaction summaries, slash-command echoes and what the tool injected itself."""
+def _claude_asked(line: Dict[str, Any], message: Dict[str, Any]) -> bool:
+    """Whether a user line is a question the person asked (not a tool result, a meta or side-chain (sub-agent) line, a
+    compaction summary, a slash-command echo or something the tool injected). The text is looked at, never kept."""
     if line.get("isSidechain") is True or line.get("isMeta") is True:
-        return None
+        return False
     if line.get("isCompactSummary") is True or line.get("isVisibleInTranscriptOnly") is True:
-        return None
+        return False
     if "toolUseResult" in line or line.get("promptSource") == "system":
-        return None
+        return False
     if line.get("turnOrigin") in _CLAUDE_NOT_ASKED:
-        return None
+        return False
     origin = line.get("origin")
     if isinstance(origin, dict) and origin.get("kind") is not None and origin.get("kind") != "human":
-        return None
+        return False
     if message.get("role") not in (None, "user"):
-        return None
+        return False
     content = message.get("content")
     if isinstance(content, str):
         text = content
     elif isinstance(content, list) and content:
         blocks = [block for block in content if isinstance(block, dict)]
         if not blocks or any(block.get("type") == "tool_result" for block in blocks):
-            return None
+            return False
         text = "\n".join(_text(block.get("text")) for block in blocks if block.get("type") == "text")
     else:
-        return None
-    if _synthetic(text) or (not text.strip() and isinstance(content, str)):
-        return None
-    return text
+        return False
+    return not (_synthetic(text) or (not text.strip() and isinstance(content, str)))
 
 
 def parse_claude(path: str) -> Optional[Summary]:
@@ -427,7 +341,7 @@ def parse_codex(path: str) -> Optional[Summary]:
     first = last = None
     models: Counter = Counter()
     total = recorded = None
-    asked = {"event": [0, ""], "item": [0, ""]}
+    asked = {"event": 0, "item": 0}
     changed, patched = set(), set()
     structured = False
     for line in _json_lines(path):
@@ -456,12 +370,13 @@ def parse_codex(path: str) -> Optional[Summary]:
                 if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
                     total = info["total_token_usage"]
             elif event == "user_message":
-                if payload.get("kind") in (None, "plain"):
-                    _codex_asked(asked["event"], payload.get("message"))
+                if payload.get("kind") in (None, "plain") and _codex_asked(payload.get("message")):
+                    asked["event"] += 1
             elif event == "item_completed":
                 item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
                 if item.get("type") == "UserMessage":
-                    _codex_asked(asked["item"], _codex_user_text(item))
+                    if _codex_asked(_codex_user_text(item)):
+                        asked["item"] += 1
                 elif item.get("type") == "FileChange":
                     structured = True
                     _codex_changes(changed, cwd, item.get("changes"))
@@ -478,12 +393,12 @@ def parse_codex(path: str) -> Optional[Summary]:
     if isinstance(source, dict) and "subagent" in source:
         return None
     # Count the questions from one marker only, so a rollout that writes both never counts one question twice.
-    prompts, prompt = asked["event"] if asked["event"][0] else asked["item"]
+    prompts = asked["event"] or asked["item"]
     usage = total if total is not None else (recorded or {})
     inputs, cached = _count(usage.get("input_tokens")), _count(usage.get("cached_input_tokens"))
     git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
     model = models.most_common(1)
-    return Summary(CODEX, meta["id"].strip(), cwd=_text(meta.get("cwd")), title=prompt,
+    return Summary(CODEX, meta["id"].strip(), cwd=_text(meta.get("cwd")),
                    model=model[0][0] if model else "", git_branch=_text(git.get("branch")).strip(),
                    started_at=first, ended_at=last, turns=prompts,
                    input_tokens=max(0, inputs - cached), output_tokens=_count(usage.get("output_tokens")),
@@ -491,12 +406,9 @@ def parse_codex(path: str) -> Optional[Summary]:
                    files_touched=len(changed if structured else patched))
 
 
-def _codex_asked(tally: list, text: Any) -> None:
-    if not isinstance(text, str) or _synthetic(text):
-        return
-    tally[0] += 1
-    if not tally[1] and text.strip():
-        tally[1] = text
+def _codex_asked(text: Any) -> bool:
+    """Whether a user message is a question the person asked; the text is looked at, never kept."""
+    return isinstance(text, str) and not _synthetic(text)
 
 
 PARSERS: Dict[str, Callable[[str], Optional[Summary]]] = {CLAUDE: parse_claude, CODEX: parse_codex}
@@ -598,14 +510,15 @@ def workspace_for(cwd: str, workspaces: Sequence[Tuple[str, str]]) -> Optional[s
 
 
 def record(summary: Summary, workspace_id: str) -> Dict[str, Any]:
-    """The upload record (contract table): nothing else of the session leaves this computer."""
+    """The upload record (contract table): nothing else of the session leaves this computer. `title` is always ""
+    (the contract allows an empty one): no conversation text is uploaded."""
     started = summary.started_at
     ended = summary.ended_at if summary.ended_at is not None and summary.ended_at >= started else started
     return {
         "provider": summary.provider,
         "session_key": session_key(summary.provider, summary.session_id),
         "workspace_id": workspace_id,
-        "title": safe_title(summary.title),
+        "title": "",
         "model": summary.model[:MODEL_CHARS],
         "git_branch": summary.git_branch[:BRANCH_CHARS],
         "started_at": format_time(started),

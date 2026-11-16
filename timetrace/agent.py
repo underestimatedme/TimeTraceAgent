@@ -357,6 +357,7 @@ class Agent:
         self._jobs_lock = threading.Lock()
         self._running = {}  # id(cancel event) → cancel event
         self._running_since = {}  # id(cancel event) → when the job started (time.time())
+        self._run_sessions = {}  # id(cancel event) → provider session ids its tool runs produced (see _note_run_session)
 
     @property
     def stopping(self) -> bool:
@@ -385,7 +386,33 @@ class Agent:
         if self._stop.is_set():
             cancel_event.set()
 
+    def _note_run_session(self, cancel_event: threading.Event, *produced) -> None:
+        """Remember the provider session id of what a tracked job's tool run produced (a RunResult, or an id), whatever
+        the outcome: completed, failed, quota-blocked, interrupted or cancelled. Only memory here (this may be the
+        tool's worker thread); _untrack writes them down."""
+        ids = set()
+        for value in produced:
+            sid = value if isinstance(value, str) else getattr(value, "session_id", None)
+            if isinstance(sid, str) and sid.strip():
+                ids.add(sid.strip())
+        if ids:
+            with self._jobs_lock:
+                self._run_sessions.setdefault(id(cancel_event), set()).update(ids)
+
+    def _record_run_sessions(self, cancel_event: threading.Event) -> None:
+        """Every provider session id the job's runs produced, recorded as a TimeTrace run BEFORE the job stops counting
+        as running. The local session import reads the running state first and the recorded ids second, so a run that
+        ends while it reads is caught by one or the other and is never imported as one the person ran by hand."""
+        with self._jobs_lock:
+            ids = self._run_sessions.pop(id(cancel_event), set())
+        for sid in sorted(ids):
+            try:
+                self.db.record_provider_session(sid)
+            except Exception as exc:
+                self.log("run session id not recorded: %s" % exc.__class__.__name__)
+
     def _untrack(self, cancel_event: threading.Event) -> None:
+        self._record_run_sessions(cancel_event)
         with self._jobs_lock:
             self._running.pop(id(cancel_event), None)
             self._running_since.pop(id(cancel_event), None)
@@ -1183,6 +1210,7 @@ class Agent:
             pump.stop()
             with self._controls_lock:
                 self._controls.pop(claim["attempt_id"], None)
+            self._note_run_session(cancel_event, getattr(control, "provider_session_id", None))
             self._untrack(cancel_event)
 
     def _renew_running(self, claim, adapter, deadline, control):
@@ -1511,6 +1539,7 @@ class Agent:
                             return result
                         control.followup_started(control_id)
                         following = followup_run(text, execution_path, session, log_file, cancel_event)
+                        self._note_run_session(cancel_event, following)
                         following.samples = list(getattr(result, "samples", None) or []) + list(following.samples or [])
                         result = following
                     return result
@@ -1534,8 +1563,12 @@ class Agent:
                             if work_session:
                                 if not control.reserve_initial():
                                     return RunResult(error="Earlier delivery could not be confirmed")
-                                return run(prompt, execution_path, session_id, log_file, cancel_event)
-                            return with_followups(run(prompt, execution_path, session_id, log_file, cancel_event))
+                                first_run = run(prompt, execution_path, session_id, log_file, cancel_event)
+                                self._note_run_session(cancel_event, first_run)
+                                return first_run
+                            first_run = run(prompt, execution_path, session_id, log_file, cancel_event)
+                            self._note_run_session(cancel_event, first_run)
+                            return with_followups(first_run)
                         finally:
                             if control is not None:
                                 control.next_followup(ok=False)  # the run is over either way
@@ -1928,7 +1961,9 @@ class Agent:
                     observed_start = self._observed_now()
                     adapter_entered.set()
                     try:
-                        return work(cancel_event)
+                        produced = work(cancel_event)
+                        self._note_run_session(cancel_event, produced)
+                        return produced
                     finally:
                         observed_end = self._observed_now()
 

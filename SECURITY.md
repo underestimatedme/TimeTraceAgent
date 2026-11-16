@@ -44,9 +44,9 @@ computer's runner token:
 - **Local AI sessions (off by default; on only after you enable it on the
   TimeTrace web 设备 page):** for each Claude Code / Codex session you ran in a
   registered workspace, one metadata record: tool, a SHA-256 digest of the
-  session id, workspace id, a redacted title of at most 80 characters (custom
-  title or first prompt; file paths, file names, links and e-mail addresses replaced by markers), model, git branch name, start/end time, prompt count,
-  token totals and the number of files edited. No other conversation text,
+  session id, workspace id, model, git branch name, start/end time, prompt
+  count, token totals and the number of files edited. No conversation text of
+  any kind, not even a title (the record's title is always empty), and no
   command output, file paths or file contents (`timetrace/local_sessions.py`).
 
 To Anthropic: Claude Code's own OAuth access token is sent to
