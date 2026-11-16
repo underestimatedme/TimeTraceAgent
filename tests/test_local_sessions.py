@@ -562,6 +562,149 @@ class ImporterTest(Fixture):
         self.assertEqual((sent, stats["not_sent"]), ([], 1))
 
 
+class ReviewRegressionTest(Fixture):
+    """Blockers found in review of the first version (each test fails on it)."""
+
+    # 1. titles carry no file paths or e-mail addresses
+    def test_title_masks_each_kind_of_path_and_email(self):
+        cases = {
+            "fix /Users/alice/private/customer.csv now": "fix [路径] now",
+            "open ~/notes/plan.md": "open [路径]",
+            "ask ~bob/notes.txt": "ask [路径]",
+            "check C:\\Users\\bob\\a.txt": "check [路径]",
+            "check C:/Users/bob/a.txt": "check [路径]",
+            "share \\\\srv\\team\\x.doc": "share [路径]",
+            "see file:///Users/a/b.txt": "see [路径]",
+            "edit src/app/main.py please": "edit [路径] please",
+            "edit docs\\guide\\a.md": "edit [路径]",
+            "mail alice.smith@example.co.uk today": "mail [邮箱] today",
+            "修改/Users/alice/a.py 里的问题": "修改[路径] 里的问题",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ls.safe_title(text), expected)
+
+    def test_title_without_paths_is_unchanged(self):
+        for text in ("refactor the parser and/or tests, 1/2 done at 30 km/h", "run /review then /tmp",
+                     "read https://example.com/docs/a.html", "版本 v1.2 的 TCP/IP 问题"):
+            with self.subTest(text=text):
+                self.assertEqual(ls.safe_title(text), text)
+
+    def test_masking_happens_before_the_cut(self):
+        title = ls.safe_title("x" * 70 + " /Users/alice/private/customer.csv")
+        self.assertEqual(title, "x" * 70 + " [路径]")
+        self.assertNotIn("/Users", title)
+
+    def test_uploaded_title_carries_no_path(self):
+        self.claude_session("with-path", prompts=("fix /Users/alice/private/customer.csv for bob@example.com",))
+        _, sent = self.run_once()
+        self.assertEqual([r["title"] for batch in sent for r in batch], ["fix [路径] for [邮箱]"])
+
+    # 2. consent is checked before every request, also inside a 422 split
+    def test_switch_turned_off_during_a_split_makes_no_further_request(self):
+        for index in range(3):
+            self.claude_session("split%d" % index)
+        state = {"on": True}
+        requests = []
+
+        def upload(batch):
+            requests.append(len(batch))
+            state["on"] = False
+            raise CloudError("field out of range", status=422)
+
+        stats, _ = self.run_once(upload=upload, enabled=lambda: state["on"])
+        self.assertEqual(requests, [3])
+        self.assertTrue(stats["off"])
+        self.assertEqual([row for row in self.db.local_session_files().values() if row["fingerprint"]], [])
+
+    # 3. the run state is current when a file is decided and when it is sent
+    def test_a_run_that_ends_while_the_round_reads_is_not_imported(self):
+        self.claude_session("by-hand", ts="2026-11-16T10:00:00.000Z")
+        self.claude_session("folder-run", ts="2026-11-16T10:00:00.000Z")
+        real = ls.PARSERS["claude"]
+
+        def parse(path):
+            # the round has started; now a folder-workspace run records its provider session id and ends
+            self.db.record_provider_session("folder-run")
+            return real(path)
+
+        with patch.dict(ls.PARSERS, {"claude": parse}):
+            _, sent = self.run_once()
+        self.assertEqual([r["session_key"] for batch in sent for r in batch], [ls.session_key("claude", "by-hand")])
+
+    def test_a_run_recorded_between_two_requests_is_not_sent(self):
+        self.claude_session("first")
+        self.claude_session("second")
+        requests = []
+
+        def upload(batch):
+            requests.append([r["session_key"] for r in batch])
+            self.db.record_provider_session("second")
+            self.db.record_provider_session("first")
+
+        self.run_once(self.importer(batch_size=1), upload=upload)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(self.db.local_session_files()), 2)  # the other one is settled unsent
+
+    # 4. linked scan roots never lead outside ~/.claude and ~/.codex
+    def outside_rollout(self):
+        outside = Path(self.tmp.name) / "outside-sessions"
+        write_lines(outside / "2026" / "11" / "16" / "rollout-2026-11-16T09-00-00-cx9.jsonl",
+                    [codex_meta("cx9", self.cwd), user_item("hello"), token_count(10, 4, 3)])
+        return outside
+
+    def outside_project(self):
+        outside = Path(self.tmp.name) / "outside-projects"
+        write_lines(outside / "-p" / "linked.jsonl", [claude_user("linked", self.cwd, "q", "2026-11-16T10:00:00Z"),
+                                                    claude_assistant("linked", self.cwd, "m", "2026-11-16T10:00:01Z")])
+        return outside
+
+    def assert_nothing_read(self, outside):
+        opened = []
+        real_open = open
+
+        def watch(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=watch):
+            stats, sent = self.run_once()
+        self.assertEqual((sent, stats["read"]), ([], 0))
+        self.assertEqual([p for p in opened if p.endswith(".jsonl")], [])
+
+    def test_linked_codex_sessions_directory_is_not_read(self):
+        outside = self.outside_rollout()
+        self.codex.mkdir()
+        os.symlink(str(outside), str(self.codex / "sessions"))
+        self.assert_nothing_read(outside)
+
+    def test_linked_codex_home_is_not_read(self):
+        outside = Path(self.tmp.name) / "outside-codex"
+        outside.mkdir()
+        os.symlink(str(self.outside_rollout()), str(outside / "sessions"))
+        os.symlink(str(outside), str(self.codex))
+        self.assert_nothing_read(outside)
+
+    def test_linked_claude_projects_and_claude_dir_are_not_read(self):
+        outside = self.outside_project()
+        self.claude.mkdir()
+        os.symlink(str(outside), str(self.claude / "projects"))
+        self.assert_nothing_read(outside)
+        os.unlink(str(self.claude / "projects"))
+        self.claude.rmdir()
+        real_dir = Path(self.tmp.name) / "real-claude"
+        real_dir.mkdir()
+        os.symlink(str(outside), str(real_dir / "projects"))
+        os.symlink(str(real_dir), str(self.claude))
+        self.assert_nothing_read(outside)
+
+    def test_linked_directories_inside_codex_sessions_are_skipped(self):
+        outside = self.outside_rollout()
+        (self.codex / "sessions" / "2026").mkdir(parents=True)
+        os.symlink(str(outside / "2026" / "11"), str(self.codex / "sessions" / "2026" / "11"))
+        self.assert_nothing_read(outside)
+
+
 class CloudLocalSessionsTest(unittest.TestCase):
     class Response:
         def __init__(self, status, body):

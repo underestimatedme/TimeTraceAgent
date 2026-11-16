@@ -45,7 +45,7 @@ computer's runner token:
   TimeTrace web 设备 page):** for each Claude Code / Codex session you ran in a
   registered workspace, one metadata record: tool, a SHA-256 digest of the
   session id, workspace id, a redacted title of at most 80 characters (custom
-  title or first prompt), model, git branch name, start/end time, prompt count,
+  title or first prompt; file paths and e-mail addresses replaced by a marker), model, git branch name, start/end time, prompt count,
   token totals and the number of files edited. No other conversation text,
   command output, file paths or file contents (`timetrace/local_sessions.py`).
 

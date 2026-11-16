@@ -78,12 +78,36 @@ def session_key(provider: str, session_id: str) -> str:
     return hashlib.sha256(("%s:%s" % (provider, session_id)).encode("utf-8")).hexdigest()
 
 
+# What a title must not carry besides secrets (the contract uploads no file paths): replaced in the whole text, in this
+# order, before the cut. A path ends at whitespace or a quote/bracket; the left guards keep a URL's own path, "and/or",
+# fractions and ordinary words intact. Anything not ASCII-alphanumeric (CJK included) may stand right before a path.
+PATH_MARK = "[路径]"
+EMAIL_MARK = "[邮箱]"
+_PATH_END = r"[^\s\"'`<>()\[\]{}]"
+_NOT_IN_WORD = r"(?<![A-Za-z0-9_.~:/\\-])"
+_TITLE_MASKS = [
+    (re.compile(r"(?i)\bfile:/" + _PATH_END + "*"), PATH_MARK),                         # file:///x, file:/x
+    (re.compile(r"(?<![A-Za-z0-9_])\\\\" + _PATH_END + "+"), PATH_MARK),             # \\server\share\x
+    (re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]" + _PATH_END + "*"), PATH_MARK),      # C:\x, C:/x
+    (re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9_.-]*[/\\]" + _PATH_END + "*"), PATH_MARK),  # ~/x, ~user/x
+    (re.compile(_NOT_IN_WORD + r"/[^\s/\"'`<>()\[\]{}]+/" + _PATH_END + "*"), PATH_MARK),  # /x/y...
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"), EMAIL_MARK),
+    # relative: at least one directory separator and an extension-like tail (src/app/main.py, docs\\a.md)
+    (re.compile(_NOT_IN_WORD + r"(?:[^\s/\\\"'`<>()\[\]{}@]+[/\\])+[^\s/\\\"'`<>()\[\]{}@]*\.[A-Za-z][A-Za-z0-9]{0,7}"
+                r"(?![A-Za-z0-9])"), PATH_MARK),
+]
+
+
 def safe_title(text: Any) -> str:
-    """The title as it may leave this computer: secrets masked in the WHOLE text first, then whitespace collapsed,
-    then cut to TITLE_CHARS. Cutting first could split a secret so that what remains no longer looks like one."""
+    """The title as it may leave this computer: secrets masked in the WHOLE text first, then file paths and e-mail
+    addresses replaced by a marker, then whitespace collapsed, and only then cut to TITLE_CHARS. Cutting first could
+    split a secret or a path so that what remains no longer looks like one."""
     if not isinstance(text, str):
         return ""
-    return " ".join(redact(text).split())[:TITLE_CHARS]
+    text = redact(text)
+    for pattern, mark in _TITLE_MASKS:
+        text = pattern.sub(mark, text)
+    return " ".join(text.split())[:TITLE_CHARS]
 
 
 def parse_time(value: Any) -> Optional[float]:
@@ -125,9 +149,14 @@ def _synthetic(text: str) -> bool:
     return bool(_SYNTHETIC_TAG.match(text))
 
 
+def _no_follow(path: str, flags: int) -> int:
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
+
+
 def _json_lines(path: str) -> Iterator[Dict[str, Any]]:
-    """Every JSON object line of `path`; blank, broken (a line still being written) or non-object lines are skipped."""
-    with open(path, "rb") as handle:
+    """Every JSON object line of `path`; blank, broken (a line still being written) or non-object lines are skipped.
+    O_NOFOLLOW: a file swapped for a symbolic link after it was listed is not opened."""
+    with open(path, "rb", opener=_no_follow) as handle:
         for raw in handle:
             raw = raw.strip()
             if not raw:
@@ -450,8 +479,27 @@ def _listing(path: str) -> List["os.DirEntry"]:
         return []
 
 
+def scan_top(root: Path, child: str) -> Optional[str]:
+    """`<root>/<child>` (projects / sessions) when it is safe to read below it, else None: neither the tool's directory
+    nor that entry may be a symbolic link, and the entry must really be inside the directory (a link higher up the
+    path, such as macOS /var -> /private/var, is followed for both alike and does not count)."""
+    base = os.path.normpath(os.path.abspath(str(root)))
+    top = os.path.join(base, child)
+    try:
+        if os.path.islink(base) or os.path.islink(top) or not os.path.isdir(top):
+            return None
+        if os.path.realpath(top) != os.path.join(os.path.realpath(base), child):
+            return None
+    except (OSError, ValueError):
+        return None
+    return top
+
+
 def claude_files(root: Path) -> Iterator[Tuple[str, os.stat_result]]:
-    for project in _listing(str(Path(root) / "projects")):
+    top = scan_top(root, "projects")
+    if top is None:
+        return
+    for project in _listing(top):
         try:
             if not project.is_dir(follow_symlinks=False):
                 continue
@@ -465,7 +513,11 @@ def claude_files(root: Path) -> Iterator[Tuple[str, os.stat_result]]:
 
 
 def codex_files(root: Path) -> Iterator[Tuple[str, os.stat_result]]:
-    for folder, _, names in os.walk(str(Path(root) / "sessions"), followlinks=False):
+    top = scan_top(root, "sessions")
+    if top is None:
+        return
+    # followlinks=False: a linked sub-directory is listed but never entered; a linked file fails the lstat check.
+    for folder, _, names in os.walk(top, followlinks=False):
         for name in names:
             if not (name.startswith("rollout-") and name.endswith(".jsonl")) or name in CREDENTIAL_NAMES:
                 continue
@@ -570,7 +622,6 @@ class Importer:
             if root:
                 workspaces.append((str(workspace["id"]), root))
         scope = scope_of(workspaces)
-        own = db.own_provider_session_ids()
         home = real_path(str(self.home.expanduser().absolute()))
         known = db.local_session_files()
         seen, todo = set(), []
@@ -610,7 +661,14 @@ class Importer:
                 self.log("local sessions: a %s file could not be read: %s" % (provider, exc.__class__.__name__))
                 summary = None
             stats["read"] += 1
-            payload = self._payload(summary, workspaces, own, home)
+            # Decided on the run state as it is NOW: a TimeTrace run may have started, or ended and recorded its
+            # provider session id, while this round was reading (a folder-workspace run's session lies inside the
+            # workspace, so only its id tells it apart).
+            busy = busy_since()
+            if busy is not None and info.st_mtime >= busy - 1:
+                stats["deferred"] += 1
+                continue
+            payload = self._payload(summary, workspaces, db.own_provider_session_ids(), home)
             if payload is None:
                 stats["not_sent"] += 1
                 settled.append(row)
@@ -623,15 +681,16 @@ class Importer:
                 stats["unchanged"] += 1
                 settled.append(row)
                 continue
-            pending.append((row, payload))
+            pending.append((row, payload, summary.session_id, info.st_mtime))
         db.save_local_session_files(settled)
         pending = self._one_per_session(pending, db)
+
+        def check(batch):
+            return self._still_sendable(batch, db, stats, enabled, busy_since)
+
         for start in range(0, len(pending), self.batch_size):
-            if not enabled():
-                stats["off"] = True
-                break
             try:
-                self._send(pending[start:start + self.batch_size], upload, db, stats)
+                self._send(pending[start:start + self.batch_size], upload, db, stats, check)
             except ImportOff:
                 stats["off"] = True
                 break
@@ -659,27 +718,53 @@ class Importer:
     @staticmethod
     def _one_per_session(pending, db) -> list:
         """Two files of one session in one round (a copy): send the later one; the other is settled unsent."""
-        chosen: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+        chosen: Dict[str, tuple] = {}
         dropped = []
-        for row, payload in pending:
-            key = payload["session_key"]
+        for item in pending:
+            key = item[1]["session_key"]
             other = chosen.get(key)
             if other is None:
-                chosen[key] = (row, payload)
+                chosen[key] = item
                 continue
-            keep, drop = ((row, payload), other) if payload["ended_at"] > other[1]["ended_at"] else (other, (row, payload))
+            keep, drop = (item, other) if item[1]["ended_at"] > other[1]["ended_at"] else (other, item)
             chosen[key] = keep
             dropped.append(dict(drop[0], fingerprint=""))
         if dropped:
             db.save_local_session_files(dropped)
         return list(chosen.values())
 
-    def _send(self, batch, upload, db, stats) -> None:
+    @staticmethod
+    def _still_sendable(batch, db, stats, enabled, busy_since) -> list:
+        """Checked right before EVERY request (each batch and each half of a split one): the switch is still on (else
+        ImportOff ends the round at once), and no record has meanwhile turned out to be a TimeTrace run (its provider
+        session id was recorded: settled unsent) or been written while a run is going (left for a later round)."""
+        if not enabled():
+            raise ImportOff()
+        own = db.own_provider_session_ids()
+        busy = busy_since()
+        sendable, settled = [], []
+        for item in batch:
+            row, _, session_id, mtime = item
+            if session_id in own:
+                stats["not_sent"] += 1
+                settled.append(dict(row, session_key="", fingerprint=""))
+            elif busy is not None and mtime >= busy - 1:
+                stats["deferred"] += 1
+            else:
+                sendable.append(item)
+        db.save_local_session_files(settled)
+        return sendable
+
+    def _send(self, batch, upload, db, stats, check) -> None:
         """Upload one batch; a 422 (a record Valley finds out of bounds) is split in halves until the refused record
-        is found, which is settled as REJECTED (sent again only once its file changes). Any other error propagates."""
+        is found, which is settled as REJECTED (sent again only once its file changes). Any other error propagates.
+        `check` filters the batch right before each request and raises ImportOff once the switch is off."""
         from timetrace.cloud import CloudError
+        batch = check(batch)
+        if not batch:
+            return
         try:
-            upload([payload for _, payload in batch])
+            upload([item[1] for item in batch])
         except CloudError as exc:
             if exc.status != 422:
                 raise
@@ -688,8 +773,8 @@ class Importer:
                 db.save_local_session_files([dict(batch[0][0], fingerprint=REJECTED + batch[0][0]["fingerprint"])])
                 return
             half = len(batch) // 2
-            self._send(batch[:half], upload, db, stats)
-            self._send(batch[half:], upload, db, stats)
+            self._send(batch[:half], upload, db, stats, check)
+            self._send(batch[half:], upload, db, stats, check)
             return
-        db.save_local_session_files([row for row, _ in batch])
+        db.save_local_session_files([item[0] for item in batch])
         stats["uploaded"] += len(batch)
