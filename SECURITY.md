@@ -41,6 +41,13 @@ computer's runner token:
   `upload_output_tail` is `true` (the default), up to 8000 bytes from the end of
   the run log. Every text field is passed through secret redaction first
   (`timetrace/redact.py`). Paths and code that appear in those texts are sent.
+- **Local AI sessions (off by default; on only after you enable it on the
+  TimeTrace web 设备 page):** for each Claude Code / Codex session you ran in a
+  registered workspace, one metadata record: tool, a SHA-256 digest of the
+  session id, workspace id, a redacted title of at most 80 characters (custom
+  title or first prompt), model, git branch name, start/end time, prompt count,
+  token totals and the number of files edited. No other conversation text,
+  command output, file paths or file contents (`timetrace/local_sessions.py`).
 
 To Anthropic: Claude Code's own OAuth access token is sent to
 `https://api.anthropic.com/api/oauth/usage` to read your quota, the same call

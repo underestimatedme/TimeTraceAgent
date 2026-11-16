@@ -21,10 +21,14 @@ LOOPBACK_HOSTS = ("localhost",)
 
 
 class CloudError(RuntimeError):
-    def __init__(self, message: str, status: int = 0, code: int = 0):
+    """`code`: Valley's numeric envelope code. `reason`: a named refusal reason when Valley gave one (a non-numeric
+    envelope code, or `code` / `reason_code` / `error_code` inside `data` or `details`), else ""."""
+
+    def __init__(self, message: str, status: int = 0, code: int = 0, reason: str = ""):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.reason = reason
 
 
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
@@ -143,7 +147,7 @@ class CloudClient:
             raise CloudError("invalid Valley response", status=status)
         if status >= 400 or envelope.get("code") != 0:
             raise CloudError(str(envelope.get("message") or "Valley request failed")[:300], status,
-                             _int(envelope.get("code")))
+                             _int(envelope.get("code")), _reason(envelope))
         return envelope.get("data")
 
     def upload_job_file(self, token: str, job_id: str, name: str, data: bytes) -> Dict[str, Any]:
@@ -223,6 +227,14 @@ class CloudClient:
     def ack_runner_config(self, token, revision, status, error_code=""):
         return self.request("POST", "/runner/config/ack", {"revision": revision, "status": status, "error_code": error_code}, token)
 
+    def post_local_sessions(self, token: str, sessions: list) -> Dict[str, Any]:
+        """Metadata of 1-100 Claude Code / Codex sessions the person ran on this computer (timetrace.local_sessions:
+        no conversation text, paths or file contents). Valley overwrites a session sent again under the same
+        session_key; HTTP 403 with reason local_session_import_off while the person's switch is off."""
+        if not 1 <= len(sessions) <= 100:
+            raise ValueError("local sessions are sent 1-100 at a time")
+        return self.request("POST", "/runner/local-sessions", {"sessions": list(sessions)}, token)
+
     def post_quota_samples(self, token: str, samples: list) -> Dict[str, Any]:
         """Send de-identified quota readings to Valley (dedup by sample_id).
         The payload carries only opaque pool/profile ids — never credentials."""
@@ -245,6 +257,18 @@ class CloudClient:
         }, token)
         self._observe_server_clock(value)
         return value
+
+
+def _reason(envelope: Dict[str, Any]) -> str:
+    code = envelope.get("code")
+    if isinstance(code, str) and code.strip() and not code.strip().lstrip("-").isdigit():
+        return code.strip()[:80]
+    for holder in (envelope.get("data"), envelope.get("details")):
+        if isinstance(holder, dict):
+            for key in ("code", "reason_code", "error_code"):
+                if isinstance(holder.get(key), str) and holder[key].strip():
+                    return holder[key].strip()[:80]
+    return ""
 
 
 def _int(value: Any) -> int:
