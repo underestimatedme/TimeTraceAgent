@@ -1154,7 +1154,7 @@ class Agent:
         """`note`: a folder run changed files outside its output directory
         before it was stopped; named in the event and never resumable.
         `event_type`: "failed" for a block only a person's retry resolves.
-        `result`: the run's, when one ended; a failed event carries its usage."""
+        `result`: the run's, when one ended; the event carries its usage."""
         cancelled = reason == "cancelled"
         if (cancelled and not claim["job"].get("work_session_id")) or note:
             self.db.delete_checkpoint(plan_key)
@@ -1656,7 +1656,7 @@ class Agent:
                     if not spawned or reason in ("cancelled", STOPPED):
                         return self._blocked(claim, plan_key, reason, checkpoint,
                                              seq=2 if running_announced else 1, observed_at=observed_end,
-                                             note=abort_note())
+                                             note=abort_note(), result=result)
                     return self._fenced(job_id, plan_key, reason, abort_note())
                 if checkpoint_error:
                     return self._blocked(claim, plan_key, checkpoint_error, checkpoint, seq=2,
@@ -1824,7 +1824,8 @@ class Agent:
                 )
                 self.db.save_checkpoint(cp)
             except Exception as exc:
-                return self._blocked(claim, plan_key, "checkpoint capture failed: %s" % exc, checkpoint, seq=2, observed_at=observed_end)
+                return self._blocked(claim, plan_key, "checkpoint capture failed: %s" % exc, checkpoint, seq=2,
+                                     observed_at=observed_end, result=result)
             outcome = "waiting_quota"
             event = {"seq": 2, "type": outcome, "message": redact(result.error or "quota blocked")[:1000]}
         else:
@@ -2013,7 +2014,7 @@ class Agent:
             if reason:
                 if not spawned or reason in ("cancelled", STOPPED):
                     return self._blocked(claim, job_id, reason, seq=2 if running_announced else 1,
-                                         observed_at=observed_end)
+                                         observed_at=observed_end, result=result)
                 self.db.update_remote_claim(job_id, "fenced")
                 return "job %s → fenced (%s)" % (job_id, reason)
         except Exception as exc:

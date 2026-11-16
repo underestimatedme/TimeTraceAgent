@@ -41,7 +41,8 @@ computer's runner token:
   `upload_output_tail` is `true` (the default), up to 8000 bytes from the end of
   the run log. Every text field is passed through secret redaction first
   (`timetrace/redact.py`). Paths and code that appear in those texts are sent.
-  A finished, failed or interrupted run also reports the tokens it used, as the
+  The event that ends a run (finished, failed, interrupted, paused for quota,
+  cancelled or stopped) also reports the tokens the run used, as the
   tool printed them: four counts (input, output, cache read, cache write) and
   the model name, capped at 64 characters (`timetrace/usage.py`).
 - **Local AI sessions (off by default; on only after you enable it on the

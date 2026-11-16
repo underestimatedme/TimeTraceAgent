@@ -24,6 +24,7 @@ from tests.test_remote_jobs import Adapter, Base, ControlCloud, WaitUntilCancell
 
 FIXTURES = Path(__file__).parent / "fixtures"
 THREAD = "01a167a9-1103-7440-8bd4-d7f0e0a6ba5e"
+ZERO = (0, 0, 0, 0)  # a new thread's running totals (timetrace.usage.ZERO)
 
 
 def lines(name):
@@ -54,6 +55,9 @@ class UsageShapeTest(unittest.TestCase):
         self.assertEqual(usage.model_name("m" * 100), "m" * 64)
         self.assertLessEqual(len(usage.model_name("模" * 40).encode("utf-8")), 64)
         self.assertEqual(usage.model_name(42), "")
+        # A lone surrogate (JSON "\\ud800") cannot be UTF-8: dropped, never an error.
+        self.assertEqual(usage.model_name(json.loads('"gpt-\\ud800x"')), "gpt-x")
+        self.assertEqual(usage.make(json.loads('"\\udfff"'), 5)["model"], "")
 
     def test_nothing_reported_is_no_usage_rather_than_zeros(self):
         self.assertIsNone(usage.make("claude-sonnet-5-5"))
@@ -103,6 +107,16 @@ class ClaudeUsageTest(unittest.TestCase):
             self.assertIsNone(res.error)
         res = claude.parse_stream(["[1, 2]", "{broken", "", result_line({"output_tokens": 4}, modelUsage={"m": "x", "": {}})])
         self.assertEqual(res.usage, tokens("", 0, 4, 0, 0))
+
+    def test_a_lone_surrogate_in_a_model_name_never_fails_a_run(self):
+        reported = {"input_tokens": 7, "output_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        for extra in ({"modelUsage": json.loads('{"claude-\\ud800x": {"inputTokens": 7}}')}, {}):
+            stream = ['{"type": "assistant", "message": {"model": "claude-\\udfffy", "content": []}}',
+                      result_line(reported, **extra)]
+            res = claude.parse_stream(stream)
+            self.assertTrue(res.ok)
+            self.assertIn(res.usage["model"], ("claude-x", "claude-y"))
+            json.dumps(res.usage).encode("utf-8")
 
     def run_adapter(self, call, result_lines):
         """Each Claude run path (print mode, stream-json input, work session) through its real result handling."""
@@ -171,13 +185,26 @@ class CodexUsageTest(unittest.TestCase):
         self.assertEqual(res.usage, tokens("", 1100, 90, 1400, 0))
 
     def test_a_resumed_thread_reports_only_what_this_run_added(self):
-        saved = {"input_tokens": 16000, "cached_input_tokens": 12000, "cache_write_input_tokens": 0, "output_tokens": 1000}
-        res = codex.parse_exec(lines("codex_exec_cached.jsonl"), start=saved, resumed=True)
+        res = codex.parse_exec(lines("codex_exec_cached.jsonl"), start=(16000, 12000, 0, 1000))
         self.assertEqual(res.usage, tokens("", 419 - 160, 110, 160, 0))
         # Saved totals unknown: no usage rather than the whole thread's.
-        res = codex.parse_exec(lines("codex_exec_cached.jsonl"), resumed=True)
+        res = codex.parse_exec(lines("codex_exec_cached.jsonl"), start=None)
         self.assertIsNone(res.usage)
         self.assertTrue(res.ok)
+
+    def test_totals_that_do_not_fit_together_are_no_usage_never_a_clamped_guess(self):
+        def run(*totals, start=ZERO):
+            events = [{"type": "turn.completed", "usage": t} for t in totals]
+            return codex.parse_exec([json.dumps(e) for e in events], start=start)
+        first = {"input_tokens": 2000, "cached_input_tokens": 1000, "output_tokens": 90}
+        # Ended below where it began.
+        self.assertIsNone(run(first, start=(2100, 1000, 0, 90)).usage)
+        # A running total that went down.
+        self.assertIsNone(run(first, {"input_tokens": 1500, "cached_input_tokens": 1000, "output_tokens": 95}).usage)
+        # More cached than input; one total not whole among good ones.
+        self.assertIsNone(run({"input_tokens": 10, "cached_input_tokens": 20, "output_tokens": 1}).usage)
+        self.assertIsNone(run(first, {"input_tokens": 2600, "cached_input_tokens": 1.5, "output_tokens": 95}).usage)
+        self.assertIsNone(run({"input_tokens": 2000, "output_tokens": 90}).usage)
 
     def test_missing_or_garbage_usage_is_none_and_never_fails_the_run(self):
         for reported in ("lots", None, {"input_tokens": "1200", "output_tokens": -5}, {}):
@@ -188,15 +215,25 @@ class CodexUsageTest(unittest.TestCase):
             self.assertTrue(res.ok, reported)
             self.assertIsNone(res.usage, reported)
 
+    def test_a_lone_surrogate_in_a_model_name_never_fails_a_run(self):
+        events = ['{"type": "thread.started", "thread_id": "%s", "model": "gpt-\\ud800x"}' % THREAD,
+                  json.dumps({"type": "turn.completed", "usage": {"input_tokens": 9, "cached_input_tokens": 0,
+                                                                 "output_tokens": 1}})]
+        res = codex.parse_exec(events)
+        self.assertTrue(res.ok)
+        self.assertEqual(res.usage["model"], "gpt-x")
+        json.dumps(res.usage).encode("utf-8")
 
-def write_rollout(home, thread, records, day="2026/11/16"):
+
+def write_rollout(home, thread, records, day="2026/11/16", meta_id=None, end=b""):
     folder = Path(home) / "sessions" / day
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / ("rollout-2026-11-16T09-00-00-%s.jsonl" % thread)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n")
+    with open(path, "wb") as fh:
+        fh.write(json.dumps({"type": "session_meta", "payload": {"id": meta_id or thread}}).encode() + b"\n")
         for record in records:
-            fh.write(json.dumps(record) + "\n")
+            fh.write((record if isinstance(record, bytes) else json.dumps(record).encode()) + b"\n")
+        fh.write(end)
     return path
 
 
@@ -206,36 +243,108 @@ def token_count(inputs, cached, output):
                                                                             "last_token_usage": total}}}
 
 
+TURN = {"type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}
+
+
 class CodexThreadTotalsTest(unittest.TestCase):
+    def totals(self, home, thread=THREAD):
+        return codex.thread_totals(thread, Path(home))
+
     def test_last_recorded_totals_of_the_thread(self):
         with tempfile.TemporaryDirectory() as home:
-            write_rollout(home, THREAD, [token_count(100, 50, 5), {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
-                                         token_count(16000, 12000, 1000), {"type": "response_item", "payload": {}}])
-            self.assertEqual(codex.thread_totals(THREAD, Path(home))["input_tokens"], 16000)
-            record = {"type": "token_usage_record", "payload": {"thread_token_usage": {"input_tokens": 17000}}}
-            write_rollout(home, THREAD, [token_count(16000, 12000, 1000), record])
-            self.assertEqual(codex.thread_totals(THREAD, Path(home)), {"input_tokens": 17000})
+            write_rollout(home, THREAD, [TURN, token_count(100, 50, 5), token_count(16000, 12000, 1000),
+                                         {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
+                                         {"type": "response_item", "payload": {}}])
+            self.assertEqual(self.totals(home), (16000, 12000, 0, 1000))
+            # The usual order: a usage record, then the token_count that states the same total.
+            record = {"type": "token_usage_record", "payload": {"thread_token_usage": {
+                "input_tokens": 17000, "cached_input_tokens": 12500, "output_tokens": 1100}}}
+            write_rollout(home, THREAD, [TURN, record, token_count(17000, 12500, 1100)])
+            self.assertEqual(self.totals(home), (17000, 12500, 0, 1100))
+            # Read whole, nothing but the session's own record: no turn yet, so nothing used yet.
+            write_rollout(home, THREAD, [])
+            self.assertEqual(self.totals(home), ZERO)
 
-    def test_unknown_unless_the_file_can_be_read(self):
+    def test_a_damaged_or_ambiguous_rollout_is_unknown_never_an_older_total(self):
+        half = b'{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20'
+        cases = {
+            # The reviewer's case: total 1000 complete, the newer total 2000 still half written.
+            "last line half written": dict(records=[TURN, token_count(1000, 400, 50)], end=half),
+            "last line not yet terminated": dict(records=[TURN, token_count(1000, 400, 50)],
+                                                              end=json.dumps(token_count(2000, 900, 80)).encode()),
+            "garbled line after the latest total": dict(records=[TURN, token_count(1000, 400, 50), half]),
+            "garbled total": dict(records=[TURN, {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": "1000", "cached_input_tokens": 0, "output_tokens": 1}}}}]),
+            "token_count info not an object": dict(records=[TURN, {"type": "event_msg", "payload": {
+                "type": "token_count", "info": [1]}}]),
+            "turns but no token_count": dict(records=[TURN, {"type": "response_item", "payload": {}}]),
+            "a usage record but no token_count": dict(records=[{"type": "token_usage_record", "payload": {
+                "thread_token_usage": {"input_tokens": 5, "cached_input_tokens": 0, "output_tokens": 1}}}]),
+            "a later usage record that disagrees": dict(records=[TURN, token_count(1000, 400, 50), {
+                "type": "token_usage_record", "payload": {"thread_token_usage": {
+                    "input_tokens": 2000, "cached_input_tokens": 900, "output_tokens": 80}}}]),
+            "another thread's session_meta": dict(records=[TURN, token_count(1000, 400, 50)],
+                                                  meta_id="01a167a9-1103-7440-8bd4-d7f0e0a6ba00"),
+            "a non-object line": dict(records=[TURN, token_count(1000, 400, 50), b"[1, 2]"]),
+        }
+        for name, case in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as home:
+                write_rollout(home, THREAD, **case)
+                self.assertIsNone(self.totals(home))
+
+    def test_the_session_meta_must_be_a_complete_first_line(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = write_rollout(home, THREAD, [TURN, token_count(1000, 400, 50)])
+            self.assertEqual(self.totals(home), (1000, 400, 0, 50))
+            with patch.object(codex, "ROLLOUT_HEAD_BYTES", 10):
+                self.assertIsNone(self.totals(home))
+            path.write_bytes(b"{garbled\n" + path.read_bytes().split(b"\n", 1)[1])
+            self.assertIsNone(self.totals(home))
+
+    def test_a_large_file_needs_its_latest_total_within_the_bytes_read(self):
+        filler = [{"type": "response_item", "payload": {"x": "y" * 100}}] * 50
+        with tempfile.TemporaryDirectory() as home, patch.object(codex, "ROLLOUT_TAIL_BYTES", 1000):
+            write_rollout(home, THREAD, [TURN, token_count(100, 50, 5)] + filler)
+            self.assertIsNone(self.totals(home))
+            write_rollout(home, THREAD, [TURN] + filler + [token_count(100, 50, 5)])
+            self.assertEqual(self.totals(home), (100, 50, 0, 5))
+            write_rollout(home, THREAD, [TURN] + filler)  # cut from the middle: no turn-free proof of zero
+            self.assertIsNone(self.totals(home))
+
+    def test_only_a_regular_file_inside_sessions_reached_without_links(self):
         other = "01a167a9-1103-7440-8bd4-d7f0e0a6ba5f"
         with tempfile.TemporaryDirectory() as home:
-            self.assertIsNone(codex.thread_totals(THREAD, Path(home)))  # no sessions directory
-            write_rollout(home, other, [])
-            self.assertEqual(codex.thread_totals(other, Path(home)), {})  # read: the thread recorded no usage yet
+            self.assertIsNone(self.totals(home))  # no sessions directory
             for bad in ("tid-1", "*", "../x", None, THREAD + "*"):
                 self.assertIsNone(codex.thread_totals(bad, Path(home)))
-            write_rollout(home, THREAD, [token_count(100, 50, 5)] + [{"type": "response_item", "payload": {"x": "y" * 100}}] * 50)
-            with patch.object(codex, "ROLLOUT_TAIL_BYTES", 1000):
-                self.assertIsNone(codex.thread_totals(THREAD, Path(home)))  # not within the bytes read
-            link_home = Path(home) / "linked"
-            target = write_rollout(link_home, other, [token_count(1, 0, 1)])
-            linked = target.parent / ("rollout-2026-11-16T09-00-00-%s.jsonl" % THREAD)
+            outside = Path(home) / "outside"
+            target = write_rollout(outside, THREAD, [TURN, token_count(1000, 400, 50)])
+            self.assertEqual(self.totals(outside), (1000, 400, 0, 50))
+            # A linked rollout file.
+            leaf = Path(home) / "leaf"
+            linked = leaf / "sessions" / "2026" / "11" / "16" / target.name
+            linked.parent.mkdir(parents=True)
             linked.symlink_to(target)
-            self.assertIsNone(codex.thread_totals(THREAD, link_home))
+            self.assertIsNone(self.totals(leaf))
+            # A linked day directory (the file itself is no link): outside the sessions directory.
+            day = Path(home) / "day"
+            (day / "sessions" / "2026" / "11").mkdir(parents=True)
+            (day / "sessions" / "2026" / "11" / "16").symlink_to(target.parent)
+            self.assertIsNone(self.totals(day))
+            # A linked sessions directory.
+            whole = Path(home) / "whole"
+            whole.mkdir()
+            (whole / "sessions").symlink_to(outside / "sessions")
+            self.assertIsNone(self.totals(whole))
+            # Two rollouts claiming the same thread.
+            write_rollout(outside, THREAD, [TURN, token_count(1000, 400, 50)], day="2026/11/17")
+            self.assertIsNone(self.totals(outside))
+            write_rollout(home, other, [])
+            self.assertEqual(self.totals(home, other), ZERO)
 
     def test_adapter_resume_and_chat_subtract_the_saved_totals(self):
         with tempfile.TemporaryDirectory() as home:
-            write_rollout(home, THREAD, [token_count(16000, 12000, 1000)])
+            write_rollout(home, THREAD, [TURN, token_count(16000, 12000, 1000)])
             seen = []
 
             def fake(cmd, cwd, log, **kwargs):
@@ -260,6 +369,22 @@ class CodexThreadTotalsTest(unittest.TestCase):
                 with patch.object(codex, "thread_totals", side_effect=RuntimeError("boom")):
                     self.assertTrue(adapter.resume("go", home, THREAD, log).ok)
             self.assertEqual(seen[0][:4], ["codex", "exec", "resume", THREAD])
+
+    def test_a_half_written_newer_total_is_never_subtracted_as_the_older_one(self):
+        """Old total 1000 complete, the newer total 2000 half written when the run starts; the resumed run ends at
+        2100. Only 100 were used: anything but no usage (1100 from the older total) would be a guess."""
+        half = b'{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20'
+        with tempfile.TemporaryDirectory() as home:
+            write_rollout(home, THREAD, [TURN, token_count(1000, 0, 10)], end=half)
+            ended = json.dumps({"type": "turn.completed", "usage": {"input_tokens": 2100, "cached_input_tokens": 0,
+                                                                    "output_tokens": 30}})
+            adapter = codex.CodexAdapter({"bin": "codex"}, billing=StaticBilling(True))
+            with patch.dict(os.environ, {"CODEX_HOME": home}), \
+                    patch.object(codex, "run_streaming", lambda *a, **k: (0, [ended])), \
+                    patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
+                res = adapter.resume("go", home, THREAD, str(Path(home) / "run.log"))
+            self.assertTrue(res.ok)
+            self.assertIsNone(res.usage)
 
 
 class CodexAppServerUsageTest(unittest.TestCase):
@@ -291,30 +416,58 @@ class CodexAppServerUsageTest(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIsNone(result.usage)
 
-    def test_starting_totals(self):
-        def turn(saved):
-            t = CodexTurn([], "/", None, threading.Event(), 3, False)
-            t.thread_id, t.turn_id, t.model, t.saved_totals = "th", "tu", "gpt-x", saved
-            return t
+    @staticmethod
+    def turn(saved=ZERO):
+        t = CodexTurn([], "/", None, threading.Event(), 3, False)
+        t.thread_id, t.turn_id, t.model, t.saved_totals = "th", "tu", "gpt-x", saved
+        return t
 
-        end = {"threadId": "th", "turnId": "tu",
-               "tokenUsage": {"total": {"inputTokens": 900, "cachedInputTokens": 300, "outputTokens": 40}}}
-        new = turn({})
-        new._notification("thread/tokenUsage/updated", end)
+    @staticmethod
+    def update(turn, turn_id, inputs, cached, output):
+        turn._notification("thread/tokenUsage/updated", {"threadId": "th", "turnId": turn_id, "tokenUsage": {
+            "total": {"inputTokens": inputs, "cachedInputTokens": cached, "cacheWriteInputTokens": 0,
+                      "outputTokens": output}}})
+
+    def test_starting_totals(self):
+        new = self.turn()
+        self.update(new, "tu", 900, 300, 40)
         self.assertEqual(new.turn_usage(), tokens("gpt-x", 600, 40, 300, 0))
-        # No replay: the rollout's saved totals (snake case) are the starting point.
-        resumed = turn({"input_tokens": 500, "cached_input_tokens": 200, "output_tokens": 30})
-        resumed._notification("thread/tokenUsage/updated", end)
+        # No replay: the rollout's saved totals are the starting point.
+        resumed = self.turn((500, 200, 0, 30))
+        self.update(resumed, "tu", 900, 300, 40)
         self.assertEqual(resumed.turn_usage(), tokens("gpt-x", 300, 10, 100, 0))
-        unknown = turn(None)
-        unknown._notification("thread/tokenUsage/updated", end)
+        # A replay that agrees with the rollout, or one alone when the rollout could not be read.
+        for saved in ((500, 200, 0, 30), None):
+            replayed = self.turn(saved)
+            self.update(replayed, "earlier", 500, 200, 30)
+            self.update(replayed, "tu", 900, 300, 40)
+            self.assertEqual(replayed.turn_usage(), tokens("gpt-x", 300, 10, 100, 0))
+        unknown = self.turn(None)
+        self.update(unknown, "tu", 900, 300, 40)
         self.assertIsNone(unknown.turn_usage())
-        for garbage in ({"threadId": "th", "turnId": "tu", "tokenUsage": "x"},
-                        {"threadId": "th", "turnId": "tu", "tokenUsage": {"total": [1]}},
-                        {"threadId": "other", "turnId": "tu", "tokenUsage": end["tokenUsage"]}):
-            quiet = turn({})
-            quiet._notification("thread/tokenUsage/updated", garbage)
-            self.assertIsNone(quiet.turn_usage())
+
+    def test_replayed_totals_that_do_not_fit_together_are_no_usage(self):
+        def check(name, saved, *updates):
+            turn = self.turn(saved)
+            for update in updates:
+                self.update(turn, *update)
+            self.assertIsNone(turn.turn_usage(), name)
+        check("two different replays", None, ("earlier", 500, 200, 30), ("older", 400, 200, 30), ("tu", 900, 300, 40))
+        check("a replay that disagrees with the rollout", (500, 200, 0, 30), ("earlier", 600, 200, 30), ("tu", 900, 300, 40))
+        check("a replay for a new thread", ZERO, ("earlier", 500, 200, 30), ("tu", 900, 300, 40))
+        check("an earlier turn's totals after this turn's", None, ("tu", 900, 300, 40), ("earlier", 500, 200, 30))
+        check("this turn's totals going down", ZERO, ("tu", 900, 300, 40), ("tu", 800, 300, 40))
+        check("ending below the replay", None, ("earlier", 1000, 200, 30), ("tu", 900, 300, 40))
+        for garbage in ("x", {"total": [1]}, {"total": {"inputTokens": "9", "cachedInputTokens": 0, "outputTokens": 1}}):
+            turn = self.turn()
+            self.update(turn, "tu", 900, 300, 40)
+            turn._notification("thread/tokenUsage/updated", {"threadId": "th", "turnId": "tu", "tokenUsage": garbage})
+            self.assertIsNone(turn.turn_usage(), garbage)
+        other = self.turn()
+        other._notification("thread/tokenUsage/updated", {"threadId": "other", "turnId": "tu", "tokenUsage": {
+            "total": {"inputTokens": 9, "cachedInputTokens": 0, "outputTokens": 1}}})
+        self.update(other, "tu", 900, 300, 40)
+        self.assertEqual(other.turn_usage(), tokens("gpt-x", 600, 40, 300, 0))  # another thread's is not this one's
 
 
 USED = tokens("claude-sonnet-5-5", 18, 1330, 311850, 19448)
@@ -350,11 +503,37 @@ class TerminalEventUsageTest(Base):
             else:
                 self.assertEqual(event["usage"], expected)
 
-    def test_waiting_quota_does_not_carry_usage(self):
+    def test_a_quota_pause_carries_what_the_run_used_before_it(self):
         result = RunResult(exit_code=1, blocked=True, error="usage limit", session_id="s", usage=USED)
         cloud = ControlCloud([{"id": "j1", "plan_id": "p1"}])
         self.assertEqual(self.agent(cloud, Finishes(result)).run_once(), "job j1 → waiting_quota")
-        self.assertNotIn("usage", self.events(cloud)[-1])
+        self.assertEqual(self.events(cloud)[-1]["type"], "waiting_quota")
+        self.assertEqual(self.events(cloud)[-1]["usage"], USED)
+        cloud = ControlCloud([{"id": "j2", "plan_id": "p2"}])
+        blocked = RunResult(exit_code=1, blocked=True, error="usage limit", session_id="s")
+        self.agent(cloud, Finishes(blocked)).run_once()
+        self.assertNotIn("usage", self.events(cloud, "j2")[-1])
+
+    def test_a_cancelled_run_carries_what_it_used(self):
+        class Used(WaitUntilCancelled):
+            def start(self, prompt, cwd, session_id, log_file, cancel_event=None):
+                result = super().start(prompt, cwd, session_id, log_file, cancel_event)
+                result.usage = USED
+                return result
+        adapter = Used()
+        extra = {}
+        cloud = ControlCloud([{"id": "j1", "plan_id": "p1"}], lambda: extra)
+        agent = self.agent(cloud, adapter)
+        out = []
+        worker = threading.Thread(target=lambda: out.append(agent.run_once()))
+        worker.start()
+        self.assertTrue(adapter.entered.wait(10))
+        extra["desired_action"] = "cancel"
+        worker.join(15)
+        self.assertEqual(out, ["job j1 → cancelled"])
+        last = self.events(cloud)[-1]
+        self.assertEqual(last["type"], "cancelled")
+        self.assertEqual(last["usage"], USED)
 
     def test_model_name_and_counts_are_bounded_on_the_way_out(self):
         result = RunResult(exit_code=0, ok=True, output="done", session_id="s",

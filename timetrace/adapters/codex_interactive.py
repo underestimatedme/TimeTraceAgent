@@ -55,11 +55,13 @@ class CodexTurn:
         self.initial_sent = False
         self.initial_confirmed = False
         self.ended = False
-        # Token usage: the thread's running totals before this turn (the rollout's, snake case, set by the adapter for a
-        # resumed thread: None when unknown) or as the App Server replayed them, and the last ones of this turn.
-        self.saved_totals = {}
-        self.replayed_totals = None
-        self.end_totals = None
+        # Token usage (timetrace.usage totals): the thread's running totals before this turn as its rollout recorded
+        # them (set by the adapter for a resumed thread; None when not known for certain), those the App Server
+        # replayed for an earlier turn, and this turn's. Anything that does not fit together means no usage.
+        self.saved_totals = usage.ZERO
+        self.replayed = []
+        self.turn_totals = []
+        self.usage_conflict = False
         self.model = ""
 
     def _write_locked(self, msg):
@@ -165,27 +167,34 @@ class CodexTurn:
             self._reply(item)
 
     def _token_usage(self, params):
-        """Each update carries the thread's running totals. One for an earlier turn is the App Server replaying what a
-        resumed thread had saved (the starting point); the last one for this turn is where it ended."""
+        """Each update carries the thread's running totals. One for an earlier turn, before this turn reported any, is
+        the App Server replaying what a resumed thread had saved (the starting point); this turn's last is where it
+        ended. A total that is not whole, an earlier turn's after this one's, or one that goes down is a conflict."""
         token_usage = params.get("tokenUsage")
-        totals = token_usage.get("total") if isinstance(token_usage, dict) else None
-        if not isinstance(totals, dict):
-            return
-        if self.turn_id and params.get("turnId") == self.turn_id:
-            self.end_totals = totals
-        elif self.end_totals is None:
-            self.replayed_totals = totals
+        totals = usage.codex_totals(token_usage.get("total") if isinstance(token_usage, dict) else None,
+                                    usage.CODEX_CAMEL)
+        if totals is None:
+            self.usage_conflict = True
+        elif self.turn_id and params.get("turnId") == self.turn_id:
+            if self.turn_totals and not usage.grows(self.turn_totals[-1], totals):
+                self.usage_conflict = True
+            self.turn_totals.append(totals)
+        elif self.turn_totals:
+            self.usage_conflict = True
+        elif totals not in self.replayed:
+            self.replayed.append(totals)
 
     def turn_usage(self):
-        """What this turn used, or None when it reported nothing or a resumed thread's starting totals are unknown."""
-        if self.end_totals is None:
+        """What this turn used; None when it reported nothing, when where it began is not certain (no saved or replayed
+        totals for a resumed thread, two different replays, a replay that disagrees with the rollout) or on a conflict."""
+        if self.usage_conflict or not self.turn_totals or len(self.replayed) > 1:
             return None
-        start = self.replayed_totals
-        if start is None and isinstance(self.saved_totals, dict):
-            start = {camel: self.saved_totals.get(snake) for snake, camel in zip(usage.CODEX_SNAKE, usage.CODEX_CAMEL)}
-        if start is None:
-            return None
-        return usage.codex_delta(self.end_totals, start, self.model, usage.CODEX_CAMEL)
+        start = self.saved_totals
+        if self.replayed:
+            if start is not None and start != self.replayed[0]:
+                return None
+            start = self.replayed[0]
+        return usage.codex_used(self.turn_totals[-1], start, self.model)
 
     def _reply(self, item):
         if (not isinstance(item, dict) or item.get("type") != "agentMessage"
