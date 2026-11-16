@@ -273,6 +273,11 @@ def exclude_output_dir(path: str) -> None:
             fh.write(pattern + "\n")
 
 
+def verify_branch(path: str, branch: str) -> None:
+    if not valid_task_branch(branch) or _git(*SAFE_GIT, "-C", path, "rev-parse", "--abbrev-ref", "HEAD") != branch:
+        raise ValueError("work session is on an unexpected branch")
+
+
 def head(path: str, repo: str) -> str:
     """HEAD of an execution worktree, read only after its metadata is verified
     (H-2): the model had write access to that directory."""

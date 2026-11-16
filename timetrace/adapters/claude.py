@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
+from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace.billing import billing_env_keys, claude_verifier
 from timetrace import tiers
 from timetrace.adapters import claude_usage
@@ -314,7 +314,7 @@ def remove_mcp_config(path: Optional[str]) -> None:
 
 class ClaudeAdapter(ToolAdapter):
     name = CLAUDE
-    adapter_version = "claude-code/0.5"
+    adapter_version = "claude-code/work-sessions-1"
     # Runs accept a RunControl (`control=`): stream-json input, appended
     # instructions while running, permission prompts answered by the host.
     interactive_runs = True
@@ -371,9 +371,49 @@ class ClaudeAdapter(ToolAdapter):
                                and bool((self._credentials() or {}).get("accessToken"))),
             "can_dispatch": True,
             "can_resume": True,
+            "can_interact": True,
             "can_enforce_zero_spend": self.billing.verdict().verified,
         })
 
+
+    def work_session(self, prompt, cwd, session_id, log_file, cancel_event, *,
+                     control, resuming, read_only, mcp=None) -> RunResult:
+        try:
+            uuid.UUID(session_id)
+        except (ValueError, AttributeError):
+            return RunResult(exit_code=1, error="Claude session ID is invalid")
+        session_flags = ["--resume" if resuming else "--session-id", session_id]
+        cmd = [self.cfg.get("bin", "claude"), "-p", *STREAM_IO, *session_flags, "--replay-user-messages"]
+        if self.cfg.get("model"):
+            cmd += ["--model", self.cfg["model"]]
+        cmd += ["--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
+                "--settings", '{"disableAllHooks":true}']
+        if read_only:
+            cmd += ["--permission-mode", "plan", "--permission-prompts", "none", "--tools", "Read,Glob,Grep",
+                    "--append-system-prompt", CHAT_RULES]
+        else:
+            cmd += ["--permission-mode", "default", *HOST_PROMPTS, "--disallowedTools", *PUSH_DENIED,
+                    "--append-system-prompt", WORK_SESSION_RULES]
+        if read_only:
+            mcp = None
+        config = None
+        with masking([mcp.token] if mcp is not None else []):
+            try:
+                if mcp is not None:
+                    config = write_mcp_config(os.path.dirname(os.path.abspath(log_file)), mcp)
+                    cmd += ["--mcp-config", config, "--allowedTools", MCP_ALLOWED_TOOLS]
+                code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
+                                         timeout=float(self.cfg.get("timeout_seconds", 3600)),
+                                         cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE),
+                                         env=mcp.env() if mcp is not None else None, confirm_session=session_id)
+                result = self._result(code, lines, "")
+                if result.session_id != session_id:
+                    result.ok = False
+                    result.session_id = None
+                    result.error = "Claude did not confirm the requested session"
+                return result
+            finally:
+                remove_mcp_config(config)
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               control=None, mcp: Optional[McpAccess] = None) -> RunResult:

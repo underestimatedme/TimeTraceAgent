@@ -15,7 +15,7 @@ class CapabilitiesTest(unittest.TestCase):
         for adapter in (CursorAdapter({}), GeminiAdapter({})):
             caps = adapter.capabilities()
             self.assertEqual(set(caps), {"can_record", "can_read_quota", "can_dispatch",
-                                         "can_resume", "can_enforce_zero_spend"})
+                                         "can_resume", "can_interact", "can_enforce_zero_spend"})
             self.assertTrue(caps["can_record"])
             self.assertFalse(caps["can_dispatch"])
             self.assertFalse(caps["can_resume"])

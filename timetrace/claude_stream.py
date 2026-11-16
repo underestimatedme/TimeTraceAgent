@@ -40,6 +40,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
@@ -51,9 +52,12 @@ NO_HOST_DENY = "This run cannot ask anyone for permission; use a different appro
 DEFAULT_IDLE_GRACE = 5.0
 
 
-def user_message(text: str) -> Dict[str, Any]:
-    return {"type": "user", "session_id": "", "parent_tool_use_id": None,
+def user_message(text: str, message_uuid: Optional[str] = None) -> Dict[str, Any]:
+    message = {"type": "user", "session_id": "", "parent_tool_use_id": None,
             "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    if message_uuid:
+        message["uuid"] = message_uuid
+    return message
 
 
 def permission_response(request_id: str, tool_use_id: Optional[str], decision: Dict[str, Any],
@@ -83,10 +87,13 @@ class StreamSession:
     def __init__(self, cmd: Sequence[str], cwd: str, log_file: str, prompt: str, host: Any = None,
                  timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
                  drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = None,
-                 idle_grace: float = DEFAULT_IDLE_GRACE):
+                 idle_grace: float = DEFAULT_IDLE_GRACE, confirm_session: str = ""):
         self.cmd, self.cwd, self.log_file, self.prompt = list(cmd), cwd, log_file, prompt
         self.host, self.timeout, self.cancel_event = host, timeout, cancel_event
         self.drop_env, self.env, self.idle_grace = drop_env, env, idle_grace
+        self.confirm_session = confirm_session
+        self._user_acks = {}
+        self._session_confirmed = False
         self.lines: List[str] = []
         self._lock = threading.Lock()          # stdin writes, counters, close decision
         self._log_lock = threading.Lock()
@@ -126,6 +133,47 @@ class StreamSession:
             self._last_was_result = False
             return True
 
+    def _send_confirmed_locked(self, input_id, text, finish):
+        """Caller holds self._lock. The CLI replays this UUID on acceptance."""
+        message_uuid = str(uuid.uuid5(uuid.UUID(self.confirm_session), input_id))
+        self._user_acks[message_uuid] = finish
+        if self._write(user_message(text, message_uuid)):
+            self._sent += 1
+            self._last_was_result = False
+
+    def send_confirmed(self, input_id, text, finish):
+        with self._lock:
+            if self._stdin_open and not self._last_was_result:
+                self._send_confirmed_locked(input_id, text, finish)
+                return
+        finish("rejected")
+
+    def _initial_echo(self, status):
+        self.host.initial_delivery(status)
+        if status == "applied":
+            self.host.attach_interactive(self.send_confirmed)
+
+    def _interactive_message(self, msg):
+        if msg.get("session_id") != self.confirm_session:
+            return
+        kind = msg.get("type")
+        if kind == "system" and msg.get("subtype") == "init" and not self._session_confirmed:
+            self._session_confirmed = True
+            self.host.provider_session(self.confirm_session)
+        if kind == "user" and msg.get("isReplay") is True:
+            with self._lock:
+                finish = self._user_acks.pop(msg.get("uuid"), None)
+            if finish is not None:
+                finish("applied")
+        if kind == "assistant" and not msg.get("parent_tool_use_id"):
+            message = msg.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            text = [block["text"] for block in content or []
+                    if isinstance(block, dict) and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)]
+            if text:
+                self.host.assistant_message(mask_structure("\n".join(text)))
+
     def _close_stdin_locked(self) -> None:
         if not self._stdin_open:
             return
@@ -163,6 +211,8 @@ class StreamSession:
             shown = json.dumps(mask_structure(msg), ensure_ascii=False) if isinstance(msg, dict) else mask_timetrace_tokens(raw)
             self._log(log, shown + "\n")
             kind = msg.get("type") if isinstance(msg, dict) else None
+            if self.confirm_session and isinstance(msg, dict):
+                self._interactive_message(msg)
             if kind == "control_request":
                 self._on_control_request(msg)
                 continue
@@ -184,7 +234,7 @@ class StreamSession:
                     if self._results >= self._sent:
                         # Every message was answered: nothing more to do.
                         self._close_stdin_locked()
-                elif kind is not None:
+                elif kind is not None and (not self.confirm_session or kind in ("assistant", "stream_event")):
                     self._last_was_result = False
 
     def _read_stderr(self, stream, log) -> None:
@@ -216,7 +266,16 @@ class StreamSession:
                 decision = {"behavior": "deny", "message": NO_HOST_DENY}
             else:
                 try:
-                    decision = self.host.permission(mask_structure(request), cancelled) or {}   # (shown masked; answered with the original)
+                    if self.confirm_session:
+                        def respond(answer):
+                            with self._lock:
+                                if cancelled.is_set() or (self.cancel_event is not None and self.cancel_event.is_set()):
+                                    return False
+                                return self._write(permission_response(request_id, request.get("tool_use_id"),
+                                                                       answer, request.get("input")))
+                        self.host.permission(request, cancelled, respond=respond)
+                        return
+                    decision = self.host.permission(mask_structure(request), cancelled) or {}
                 except Exception:
                     decision = {"behavior": "deny", "message": NO_HOST_DENY}
         finally:
@@ -225,7 +284,7 @@ class StreamSession:
                 if self._waiting == 0 and self._paused_since is not None:
                     self._paused_total += time.monotonic() - self._paused_since
                     self._paused_since = None
-        self._pending.pop(request_id, None)
+            self._pending.pop(request_id, None)
         if cancelled.is_set():
             return  # withdrawn (or the run ended): nobody is listening
         with self._lock:
@@ -253,11 +312,13 @@ class StreamSession:
                 self._stdin_open = True
                 self._write({"type": "control_request", "request_id": INIT_REQUEST_ID,
                              "request": {"subtype": "initialize"}})
-                if self._write(user_message(self.prompt)):
+                if self.confirm_session:
+                    self._send_confirmed_locked(self.host.message_id, self.prompt, self._initial_echo)
+                elif self._write(user_message(self.prompt)):
                     self._sent += 1
             out.start()
             err.start()
-            if self.host is not None:
+            if self.host is not None and not self.confirm_session:
                 try:
                     self.host.attach(self.send_user)
                 except Exception:
@@ -291,6 +352,9 @@ class StreamSession:
                 err.join(timeout=2)
                 for worker in list(self._workers):
                     worker.join(timeout=2)
+                for finish in list(self._user_acks.values()):
+                    finish("uncertain")
+                self._user_acks.clear()
                 proc.stdout.close()
                 proc.stderr.close()
                 log.write("--- exit %s ---\n" % proc.returncode)
@@ -312,6 +376,6 @@ class StreamSession:
 def run_stream(cmd: Sequence[str], cwd: str, log_file: str, prompt: str, host: Any = None,
                timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
                drop_env: Optional[Sequence[str]] = None, idle_grace: float = DEFAULT_IDLE_GRACE,
-               env: Optional[dict] = None) -> Tuple[int, List[str]]:
+               env: Optional[dict] = None, confirm_session: str = "") -> Tuple[int, List[str]]:
     return StreamSession(cmd, cwd, log_file, prompt, host=host, timeout=timeout, cancel_event=cancel_event,
-                         drop_env=drop_env, idle_grace=idle_grace, env=env).run()
+                         drop_env=drop_env, idle_grace=idle_grace, env=env, confirm_session=confirm_session).run()

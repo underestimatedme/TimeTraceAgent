@@ -22,6 +22,12 @@ SAFETY_RULES = (
     " that directory is never committed.\n"
 )
 
+WORK_SESSION_RULES = SAFETY_RULES + (
+    "In your final reply, summarize the changes and mention the checks you actually ran and their outcomes. "
+    "If you could not run a check, say so.\n"
+)
+
+
 # Appended to every run in a folder (non-git) workspace. The working directory
 # is the task's own output directory; the source material around it must stay
 # untouched (the runner compares a before/after snapshot and fails the job).

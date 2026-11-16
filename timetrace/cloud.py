@@ -214,6 +214,9 @@ class CloudClient:
             body["max_parallel_per_tool"] = {str(k): int(v) for k, v in max_parallel_per_tool.items()}
         return self.request("PUT", "/runner/inventory", body, token)
 
+    def work_session_retention(self, token, session_id):
+        return self.request("GET", "/runner/work-sessions/%s" % _segment(session_id), token=token, timeout=2)
+
     def runner_config(self, token):
         return self.request("GET", "/runner/config", token=token)
 
