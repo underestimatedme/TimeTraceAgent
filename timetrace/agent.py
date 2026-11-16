@@ -19,7 +19,7 @@ from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
 from timetrace import (approvals, audit, checks, dev_status, folder, local_sessions, pause, quota, results,
-                       runner_state, sync, worktree)
+                       runner_state, sync, usage, worktree)
 from timetrace.remote_control import RunControl
 from timetrace import approval_delivery
 from timetrace.approval_delivery import ApprovalPump
@@ -1149,10 +1149,12 @@ class Agent:
                 control.apply_lease(lease)
         return renewed, ""
 
-    def _blocked(self, claim, plan_key, reason, checkpoint=None, seq=1, observed_at=None, note="", event_type="waiting_input"):
+    def _blocked(self, claim, plan_key, reason, checkpoint=None, seq=1, observed_at=None, note="", event_type="waiting_input",
+                 result=None):
         """`note`: a folder run changed files outside its output directory
         before it was stopped; named in the event and never resumable.
-        `event_type`: "failed" for a block only a person's retry resolves."""
+        `event_type`: "failed" for a block only a person's retry resolves.
+        `result`: the run's, when one ended; a failed event carries its usage."""
         cancelled = reason == "cancelled"
         if (cancelled and not claim["job"].get("work_session_id")) or note:
             self.db.delete_checkpoint(plan_key)
@@ -1163,8 +1165,8 @@ class Agent:
             self.db.save_checkpoint(checkpoint)
         event_type = "cancelled" if cancelled else event_type
         message = "dispatch blocked: %s" % reason + ("; " + note if note else "")
-        self._report(claim, [{"seq": seq, "type": event_type, "message": message,
-                              "observed_at": observed_at or self._observed_now()}])
+        self._report(claim, [usage.attach({"seq": seq, "type": event_type, "message": message,
+                                           "observed_at": observed_at or self._observed_now()}, result)])
         self.db.update_remote_claim(claim["job"]["id"], "reported")
         if cancelled:
             return "job %s → cancelled" % claim["job"]["id"]
@@ -1352,8 +1354,8 @@ class Agent:
                 # A folder run that wrote outside its output directory is a
                 # failure whatever stopped it, and never resumable.
                 self.db.delete_checkpoint(plan_key)
-                self._report(claim, [{"seq": terminal_seq, "type": "failed", "message": note,
-                                      "observed_at": observed_end or self._observed_now()}])
+                self._report(claim, [usage.attach({"seq": terminal_seq, "type": "failed", "message": note,
+                                                   "observed_at": observed_end or self._observed_now()}, result)])
                 self.db.update_remote_claim(job_id, "reported")
                 return "job %s → failed" % job_id
             sid = (control.provider_session_id if work_session else getattr(result, "session_id", None)) or ""
@@ -1389,7 +1391,7 @@ class Agent:
                 event["branch"] = prepared_branch
             if sid:
                 event["provider_session_id"] = sid
-            self._report(claim, [event])
+            self._report(claim, [usage.attach(event, result)])
             self.db.update_remote_claim(job_id, "reported")
             if getattr(result, "samples", None):
                 self._post_samples(job["provider"], adapter, result.samples)
@@ -1559,6 +1561,7 @@ class Agent:
                         following = followup_run(text, execution_path, session, log_file, cancel_event)
                         self._note_run_session(cancel_event, following)
                         following.samples = list(getattr(result, "samples", None) or []) + list(following.samples or [])
+                        following.usage = usage.merge(getattr(result, "usage", None), getattr(following, "usage", None))
                         result = following
                     return result
                 def invoke():
@@ -1657,7 +1660,7 @@ class Agent:
                     return self._fenced(job_id, plan_key, reason, abort_note())
                 if checkpoint_error:
                     return self._blocked(claim, plan_key, checkpoint_error, checkpoint, seq=2,
-                                         observed_at=observed_end, event_type="failed")
+                                         observed_at=observed_end, event_type="failed", result=result)
         except Exception as exc:
             terminal_seq = 2 if running_announced else 1
             if user_interrupted():
@@ -1708,16 +1711,17 @@ class Agent:
                 # Whatever the tool reported, a run that wrote outside its
                 # output directory is a failure and never resumable.
                 self.db.delete_checkpoint(plan_key)
-                self._report(claim, [{"seq": 2, "type": "failed", "message": problem,
-                                      "output_tail": tail_text(log_file), "observed_at": observed_end}])
+                self._report(claim, [usage.attach({"seq": 2, "type": "failed", "message": problem,
+                                                   "output_tail": tail_text(log_file), "observed_at": observed_end},
+                                                  result)])
                 self.db.update_remote_claim(job_id, "reported")
                 self.maintain(force=True)
                 return "job %s → failed" % job_id
         if result.ok and read_only:
-            self._report(claim, [{"seq": 2, "type": "completed", "message": "completed",
-                                  "provider_session_id": result.session_id,
-                                  "reply": control.terminal_reply(result.output),
-                                  "observed_at": observed_end}])
+            self._report(claim, [usage.attach({"seq": 2, "type": "completed", "message": "completed",
+                                               "provider_session_id": result.session_id,
+                                               "reply": control.terminal_reply(result.output),
+                                               "observed_at": observed_end}, result)])
             self.db.update_remote_claim(job_id, "reported")
             self.maintain(force=True)
             return "job %s → replied" % job_id
@@ -1728,8 +1732,9 @@ class Agent:
                 if work_session and left_out:
                     raise ValueError("任务副本还有未提交的文件，请在副本中提交后重试；文件已保留")
             except Exception as exc:
-                self._report(claim, [{"seq": 2, "type": "failed", "message": redact(str(exc))[:1000],
-                                      "output_tail": tail_text(log_file), "observed_at": observed_end}])
+                self._report(claim, [usage.attach({"seq": 2, "type": "failed", "message": redact(str(exc))[:1000],
+                                                   "output_tail": tail_text(log_file), "observed_at": observed_end},
+                                                  result)])
                 self.db.update_remote_claim(job_id, "reported")
                 return "job %s → failed" % job_id
         if result.ok:
@@ -1845,7 +1850,7 @@ class Agent:
                     others = [a for a in event.get("artifacts", []) if a.get("ref") != artifact["ref"]]
                     event["artifacts"] = [artifact] + others[:17]
         event["observed_at"] = observed_end
-        self._report(claim, [event])
+        self._report(claim, [usage.attach(event, result)])
         self.db.update_remote_claim(job_id, "reported")
         # A finished run changed the quota picture: refresh it right away.
         self.maintain(force=True)
@@ -2035,7 +2040,7 @@ class Agent:
             self._post_samples(job["provider"], adapter, result.samples)
         outcome, event = finish(result)
         event["observed_at"] = observed_end
-        self._report(claim, [event])
+        self._report(claim, [usage.attach(event, result)])
         self.db.update_remote_claim(job_id, "reported")
         self.maintain(force=True)
         return "job %s → %s" % (job_id, outcome)
@@ -2631,6 +2636,14 @@ class Agent:
             event["import_result"] = results.redact_deep(event["import_result"])
         if "dev_status" in event:
             event["dev_status"] = results.redact_deep(event["dev_status"])
+        if "usage" in event:
+            # Numbers and a model name: nothing to mask, but always in the contract's shape and bounds (Valley
+            # refuses the whole event otherwise).
+            bounded = usage.clean(event["usage"])
+            if bounded is None:
+                event.pop("usage")
+            else:
+                event["usage"] = bounded
         if isinstance(event.get("check_result"), dict):
             check = results.redact_all(event["check_result"])
             check["output_tail"] = (checks.bounded_tail(check.get("output_tail") or "")

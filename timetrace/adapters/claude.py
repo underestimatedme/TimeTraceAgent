@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace.billing import billing_env_keys, claude_verifier
-from timetrace import tiers
+from timetrace import tiers, usage
 from timetrace.adapters import claude_usage
 from timetrace.config import claude_quota_probe_enabled
 from timetrace.claude_stream import run_stream
@@ -210,6 +210,7 @@ def safe_positional(prompt: str) -> str:
 def parse_stream(lines: List[str]) -> RunResult:
     """Turn stream-json lines into a RunResult (exit_code left for the caller)."""
     res = RunResult()
+    tokens = _Tokens()
     for raw in lines:
         raw = raw.strip()
         if not raw.startswith("{"):
@@ -218,14 +219,67 @@ def parse_stream(lines: List[str]) -> RunResult:
             msg = json.loads(raw)
         except ValueError:
             continue
+        if not isinstance(msg, dict):
+            continue
         mtype = msg.get("type")
         if mtype == "rate_limit_event":
             _apply_rate_limit(msg.get("rate_limit_info") or {}, res)
         elif mtype == "result":
             _apply_result(msg, res)
+        tokens.add(msg)
         if not res.session_id and msg.get("session_id"):
             res.session_id = msg["session_id"]
+    res.usage = tokens.total()
     return res
+
+
+# The four counts of a `result` message's `usage`, in the contract's order (input excludes cache reads already).
+RESULT_USAGE = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+MODEL_USAGE = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+
+
+class _Tokens:
+    """What one Claude process used. A `result` message's `usage` is per turn in a stream-json input session (one
+    result per message sent; Claude Code 2.1.325 documents it as the main loop's, per turn), so the results are added up.
+    The model is the one with the most tokens in the latest non-empty `modelUsage` (a running total), else the last
+    assistant message's, else the one the session started with."""
+
+    def __init__(self):
+        self.counts = [0, 0, 0, 0]
+        self.model_usage: Dict[str, Any] = {}
+        self.assistant_model = ""
+        self.init_model = ""
+
+    def add(self, msg: Dict[str, Any]) -> None:
+        mtype = msg.get("type")
+        if mtype == "result":
+            reported = msg.get("usage")
+            if isinstance(reported, dict):
+                for i, key in enumerate(RESULT_USAGE):
+                    self.counts[i] += usage.count(reported.get(key))
+            if isinstance(msg.get("modelUsage"), dict) and msg["modelUsage"]:
+                self.model_usage = msg["modelUsage"]
+        elif mtype == "assistant":
+            message = msg.get("message")
+            name = message.get("model") if isinstance(message, dict) else None
+            if isinstance(name, str) and name.strip() and name.strip() != "<synthetic>":
+                self.assistant_model = name.strip()
+        elif mtype == "system" and msg.get("subtype") == "init":
+            if isinstance(msg.get("model"), str) and msg["model"].strip():
+                self.init_model = msg["model"].strip()
+
+    def model(self) -> str:
+        best, most = "", 0
+        for name, entry in self.model_usage.items():
+            if not (isinstance(name, str) and name.strip() and isinstance(entry, dict)):
+                continue
+            total = sum(usage.count(entry.get(key)) for key in MODEL_USAGE)
+            if total > most:
+                best, most = name.strip(), total
+        return best or self.assistant_model or self.init_model
+
+    def total(self) -> Optional[Dict[str, Any]]:
+        return usage.make(self.model(), *self.counts)
 
 
 def _apply_rate_limit(info: Dict[str, Any], res: RunResult) -> None:

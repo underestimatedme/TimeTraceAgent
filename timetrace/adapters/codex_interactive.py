@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict
 
-from timetrace import approvals
+from timetrace import approvals, usage
 from timetrace.billing import billing_env_keys
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.models import CODEX, RunResult
@@ -55,6 +55,12 @@ class CodexTurn:
         self.initial_sent = False
         self.initial_confirmed = False
         self.ended = False
+        # Token usage: the thread's running totals before this turn (the rollout's, snake case, set by the adapter for a
+        # resumed thread: None when unknown) or as the App Server replayed them, and the last ones of this turn.
+        self.saved_totals = {}
+        self.replayed_totals = None
+        self.end_totals = None
+        self.model = ""
 
     def _write_locked(self, msg):
         try:
@@ -133,6 +139,9 @@ class CodexTurn:
     def _notification(self, method, params):
         if params.get("threadId") != self.thread_id:
             return
+        if method == "thread/tokenUsage/updated":
+            self._token_usage(params)
+            return
         if method in ("turn/started", "turn/completed"):
             turn = params.get("turn")
             if method == "turn/started" and not self.turn_id and self.initial_sent and isinstance(turn, dict):
@@ -154,6 +163,29 @@ class CodexTurn:
             self.file_changes[item.get("id")] = paths
         if method == "item/completed":
             self._reply(item)
+
+    def _token_usage(self, params):
+        """Each update carries the thread's running totals. One for an earlier turn is the App Server replaying what a
+        resumed thread had saved (the starting point); the last one for this turn is where it ended."""
+        token_usage = params.get("tokenUsage")
+        totals = token_usage.get("total") if isinstance(token_usage, dict) else None
+        if not isinstance(totals, dict):
+            return
+        if self.turn_id and params.get("turnId") == self.turn_id:
+            self.end_totals = totals
+        elif self.end_totals is None:
+            self.replayed_totals = totals
+
+    def turn_usage(self):
+        """What this turn used, or None when it reported nothing or a resumed thread's starting totals are unknown."""
+        if self.end_totals is None:
+            return None
+        start = self.replayed_totals
+        if start is None and isinstance(self.saved_totals, dict):
+            start = {camel: self.saved_totals.get(snake) for snake, camel in zip(usage.CODEX_SNAKE, usage.CODEX_CAMEL)}
+        if start is None:
+            return None
+        return usage.codex_delta(self.end_totals, start, self.model, usage.CODEX_CAMEL)
 
     def _reply(self, item):
         if (not isinstance(item, dict) or item.get("type") != "agentMessage"
@@ -254,8 +286,10 @@ class CodexTurn:
             return
         self._write({"method": "initialized"})
         method = "thread/resume" if session_id else "thread/start"
-        thread = self._request(method, dict(params, threadId=session_id, excludeTurns=True) if session_id else params)
-        thread = (thread or {}).get("thread")
+        response = self._request(method, dict(params, threadId=session_id, excludeTurns=True) if session_id else params)
+        thread = (response or {}).get("thread")
+        model = (response or {}).get("model")
+        self.model = model if isinstance(model, str) and model.strip() else str(params.get("model") or "")
         actual = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(actual, str) or not actual or (session_id and actual != session_id):
             self.result.error = "Codex session unavailable" if session_id else "Codex could not start a session"
@@ -315,6 +349,10 @@ class CodexTurn:
                     pass
             if not self.result.ok and not self.result.error:
                 self.result.error = "Codex App Server disconnected"
+            try:
+                self.result.usage = self.turn_usage()
+            except Exception:
+                self.result.usage = None
         finally:
             self.ended = True
             self.host.detach()
