@@ -4,6 +4,10 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.10 工作项 Agent 会话
+
+在 TimeTrace 用户控制台的工作项中发起 Codex 或 Claude Code 会话。你可以换到手机浏览器继续发送指令、处理单次审批，并在原工作项验收。执行使用同一隔离 Git 工作树，空闲时可沿用厂商会话只读追问。使用此功能需要配套的 TimeTrace 用户控制台和 Valley。详见 [0.6.10 发布说明](docs/releases/0.6.10.md)。
+
 ## 0.6.9：委派前可核对实际 Git 分支
 
 执行端会上报已登记 Git 仓库的分支和提交，以及项目父目录中受支持的独立 Git 子仓库的检出信息。配套 TimeTrace 控制台显示上报时间。升级沿用现有配对和工作区。详见 [0.6.9 发布说明](docs/releases/0.6.9.md)。
@@ -126,7 +130,7 @@ timetrace agent install                  # 安装并启动登录用户的 Launch
 
 Runner refresh token 存在 macOS 登录 Keychain（service `com.atlaspaces.timetrace.runner`）；access token 15 分钟轮换。每个远程任务仍进入独立 worktree，且 push 被禁用。电脑关机、休眠或未登录时，Valley 只保留排队任务，不会在云端接管本地代码或账号。
 
-## 远程控制、审批与电脑状态（协议 2，0.4.0 起）
+## 常规远程任务的控制、审批与电脑状态（协议 2，0.4.0 起）
 
 - **中断**：手机上点「中断」后，电脑结束该任务的进程组，保留 worktree 和分支并写 checkpoint；手机点「继续」（可带补充指令）时在同一会话里接着做。
 - **追加指令**：Claude 任务运行中直接写入会话（stream-json 输入）；Codex 在本轮结束后以 `codex exec resume` 在同一个作业里执行，沙箱参数不变，零付费核验照常。
