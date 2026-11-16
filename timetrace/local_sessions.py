@@ -563,10 +563,20 @@ class Importer:
             yield CODEX, path, info
 
     def run(self, db: Any, upload: Callable[[List[Dict[str, Any]]], Any], enabled: Callable[[], bool] = lambda: True,
-            busy_since: Callable[[], Optional[float]] = lambda: None) -> Dict[str, Any]:
+            busy_since: Callable[[], Optional[float]] = lambda: None,
+            pending_own: Callable[[], set] = set) -> Dict[str, Any]:
         """Scan changed files (newest first, at most max_files) and upload what changed, in batches of at most
         batch_size. A file's state is written only once its record was accepted (or it has nothing to send), so an
-        upload that fails is simply tried again next round. Returns counts only."""
+        upload that fails is simply tried again next round. Returns counts only.
+
+        `pending_own`: TimeTrace run session ids the Runner holds but has not written to the database yet."""
+
+        def own_ids() -> set:
+            # In memory FIRST, the database SECOND: an id leaves the pending set only after it was written, so one
+            # that moves in between is seen by the second read.
+            pending = set(pending_own())
+            return pending | db.own_provider_session_ids()
+
         stats = {"read": 0, "uploaded": 0, "unchanged": 0, "not_sent": 0, "deferred": 0, "too_large": 0,
                  "rejected": 0, "off": False, "failed": ""}
         if not enabled():
@@ -626,7 +636,7 @@ class Importer:
             if busy is not None and info.st_mtime >= busy - 1:
                 stats["deferred"] += 1
                 continue
-            own = db.own_provider_session_ids()
+            own = own_ids()
             payload = self._payload(summary, workspaces, own, home)
             if payload is None:
                 stats["not_sent"] += 1
@@ -645,7 +655,7 @@ class Importer:
         pending = self._one_per_session(pending, db)
 
         def check(batch):
-            return self._still_sendable(batch, db, stats, enabled, busy_since)
+            return self._still_sendable(batch, db, stats, enabled, busy_since, own_ids)
 
         for start in range(0, len(pending), self.batch_size):
             try:
@@ -693,7 +703,7 @@ class Importer:
         return list(chosen.values())
 
     @staticmethod
-    def _still_sendable(batch, db, stats, enabled, busy_since) -> list:
+    def _still_sendable(batch, db, stats, enabled, busy_since, own_ids) -> list:
         """Checked right before EVERY request (each batch and each half of a split one): the switch is still on (else
         ImportOff ends the round at once), and no record has meanwhile turned out to be a TimeTrace run (its provider
         session id was recorded: settled unsent) or been written while a run is going (left for a later round)."""
@@ -702,7 +712,7 @@ class Importer:
         # The run state FIRST, the recorded ids SECOND (see run()): a run that ends between the two reads recorded its
         # id before it stopped running, so it is either still running in the first read or recorded in the second.
         busy = busy_since()
-        own = db.own_provider_session_ids()
+        own = own_ids()
         sendable, settled = [], []
         for item in batch:
             row, _, session_id, mtime = item

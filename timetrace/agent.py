@@ -358,6 +358,7 @@ class Agent:
         self._running = {}  # id(cancel event) → cancel event
         self._running_since = {}  # id(cancel event) → when the job started (time.time())
         self._run_sessions = {}  # id(cancel event) → provider session ids its tool runs produced (see _note_run_session)
+        self._unrecorded_sessions = set()  # ids of finished runs whose database write has not succeeded yet
 
     @property
     def stopping(self) -> bool:
@@ -399,17 +400,31 @@ class Agent:
             with self._jobs_lock:
                 self._run_sessions.setdefault(id(cancel_event), set()).update(ids)
 
-    def _record_run_sessions(self, cancel_event: threading.Event) -> None:
+    def _record_run_sessions(self, cancel_event: threading.Event = None) -> None:
         """Every provider session id the job's runs produced, recorded as a TimeTrace run BEFORE the job stops counting
         as running. The local session import reads the running state first and the recorded ids second, so a run that
-        ends while it reads is caught by one or the other and is never imported as one the person ran by hand."""
+        ends while it reads is caught by one or the other and is never imported as one the person ran by hand.
+
+        An id is moved to the in-memory pending set first and leaves it only once the database holds it: a write that
+        fails keeps it there (the import excludes pending ids too) and it is written again at the next _untrack or
+        upkeep. Without a job (cancel_event None) only the pending ids are retried."""
         with self._jobs_lock:
-            ids = self._run_sessions.pop(id(cancel_event), set())
-        for sid in sorted(ids):
+            if cancel_event is not None:
+                self._unrecorded_sessions |= self._run_sessions.pop(id(cancel_event), set())
+            pending = sorted(self._unrecorded_sessions)
+        for sid in pending:
             try:
                 self.db.record_provider_session(sid)
             except Exception as exc:
-                self.log("run session id not recorded: %s" % exc.__class__.__name__)
+                self.log("run session id not recorded yet (kept, retried later): %s" % exc.__class__.__name__)
+                continue
+            with self._jobs_lock:
+                self._unrecorded_sessions.discard(sid)
+
+    def _pending_run_sessions(self) -> set:
+        """Run session ids not yet in the database (see _record_run_sessions)."""
+        with self._jobs_lock:
+            return set(self._unrecorded_sessions)
 
     def _untrack(self, cancel_event: threading.Event) -> None:
         self._record_run_sessions(cancel_event)
@@ -483,6 +498,8 @@ class Agent:
         self.log("sync: %s" % ("pushed" if pushed else "push failed"))
 
     def _upkeep(self, now: float, force: bool) -> None:
+        if self._unrecorded_sessions:
+            self._record_run_sessions()
         self._refresh_work_session_retention(now)
         self._refresh_health(now)
         self._refresh_reset_credits(now)
@@ -624,7 +641,8 @@ class Agent:
             if threading.get_ident() != self._db_owner and getattr(self._db, "path", None) is not None:
                 db = Database(self._db.path)
             stats = self._local_sessions.run(db or self.db, self._upload_local_sessions,
-                                             enabled=lambda: self._local_session_import, busy_since=self._busy_since)
+                                             enabled=lambda: self._local_session_import, busy_since=self._busy_since,
+                                             pending_own=self._pending_run_sessions)
         except Exception as exc:
             stats = {"failed": exc.__class__.__name__}
         finally:

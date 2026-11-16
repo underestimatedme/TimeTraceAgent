@@ -3,6 +3,7 @@
 Every fixture here is synthetic (written by the tests); nothing is read from a real ~/.claude or ~/.codex."""
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -708,32 +709,9 @@ class SecondReviewRegressionTest(Fixture):
         self.assertEqual((uploads, stats.get("uploaded")), ([], 0))
 
 
-class ThirdReviewRegressionTest(Fixture):
-    """Blockers found in the third review (each test fails on 83fcb2e)."""
+class Lifecycle(Fixture):
+    """Drives the real Agent.run_once lifecycle with a tool that leaves a session file in the run's directory."""
 
-    SOURCE = ("/Users/alice/Acme Corp/customer secret.csv", "alice@acme.example", "ghp_" + "A1b2C3d4E5" * 4,
-              "secret.txt中的内容", ".env", "Payroll 2026", "Renamed by hand ~/private/notes.md")
-
-    def test_no_conversation_text_leaves_not_even_a_title(self):
-        cwd = self.cwd
-        write_lines(self.claude / "projects" / "-p" / "talky.jsonl", [
-            claude_user("talky", cwd, "edit %s and mail %s, token %s" % self.SOURCE[:3], "2026-11-16T10:00:00Z"),
-            claude_assistant("talky", cwd, "m1", "2026-11-16T10:00:01Z"),
-            claude_user("talky", cwd, "%s / %s / %s" % self.SOURCE[3:6], "2026-11-16T10:00:02Z"),
-            {"type": "custom-title", "sessionId": "talky", "customTitle": self.SOURCE[6]},
-        ])
-        write_lines(self.codex / "sessions" / "2026" / "11" / "16" / "rollout-2026-11-16T09-00-00-cxt.jsonl",
-                    [codex_meta("cxt", cwd), user_item(" ".join(self.SOURCE)), token_count(10, 4, 3)])
-        _, sent = self.run_once()
-        records = [record for batch in sent for record in batch]
-        self.assertEqual(len(records), 2)
-        self.assertEqual([record["title"] for record in records], ["", ""])
-        self.assertEqual(sorted(record["turns"] for record in records), [1, 2])
-        raw = json.dumps(sent, ensure_ascii=False)
-        for text in self.SOURCE + ("Acme", "alice", "customer", "secret", "Payroll", "private", "edit", "Renamed"):
-            self.assertNotIn(text, raw)
-
-    # 2. every run's provider session is a TimeTrace run, whatever the outcome
     def lifecycle_agent(self, job, adapter):
         import subprocess
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.cwd, check=True)
@@ -802,6 +780,34 @@ class ThirdReviewRegressionTest(Fixture):
         rows = list(self.db.local_session_files().values())
         self.assertEqual([(row["session_key"], row["fingerprint"]) for row in rows], [("", "")])  # settled, not sent
 
+
+class ThirdReviewRegressionTest(Lifecycle):
+    """Blockers found in the third review (each test fails on 83fcb2e)."""
+
+    SOURCE = ("/Users/alice/Acme Corp/customer secret.csv", "alice@acme.example", "ghp_" + "A1b2C3d4E5" * 4,
+              "secret.txt中的内容", ".env", "Payroll 2026", "Renamed by hand ~/private/notes.md")
+
+    # 1. no conversation text, not even a title
+    def test_no_conversation_text_leaves_not_even_a_title(self):
+        cwd = self.cwd
+        write_lines(self.claude / "projects" / "-p" / "talky.jsonl", [
+            claude_user("talky", cwd, "edit %s and mail %s, token %s" % self.SOURCE[:3], "2026-11-16T10:00:00Z"),
+            claude_assistant("talky", cwd, "m1", "2026-11-16T10:00:01Z"),
+            claude_user("talky", cwd, "%s / %s / %s" % self.SOURCE[3:6], "2026-11-16T10:00:02Z"),
+            {"type": "custom-title", "sessionId": "talky", "customTitle": self.SOURCE[6]},
+        ])
+        write_lines(self.codex / "sessions" / "2026" / "11" / "16" / "rollout-2026-11-16T09-00-00-cxt.jsonl",
+                    [codex_meta("cxt", cwd), user_item(" ".join(self.SOURCE)), token_count(10, 4, 3)])
+        _, sent = self.run_once()
+        records = [record for batch in sent for record in batch]
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record["title"] for record in records], ["", ""])
+        self.assertEqual(sorted(record["turns"] for record in records), [1, 2])
+        raw = json.dumps(sent, ensure_ascii=False)
+        for text in self.SOURCE + ("Acme", "alice", "customer", "secret", "Payroll", "private", "edit", "Renamed"):
+            self.assertNotIn(text, raw)
+
+    # 2. every run's provider session is a TimeTrace run, whatever the outcome
     def test_a_failed_chat_turn_is_not_imported(self):
         job = {"id": "c1", "kind": "chat_turn", "workspace_id": "ws1", "tool_profile_id": "claude-default",
                "provider": "claude", "prompt": "explain"}
@@ -842,6 +848,107 @@ class ThirdReviewRegressionTest(Fixture):
         self.assertTrue(seen["running_at_record"])
         self.assertIsNone(agent._busy_since())
         self.assertTrue({"s-1", "s-2"} <= self.db.own_provider_session_ids())
+
+
+class FourthReviewRegressionTest(Lifecycle):
+    """The run's session id must survive the cut of a long tool output (fails on fc07d30)."""
+
+    FILLER = 10_050  # more than process.MAX_CAPTURED_LINES lines between thread.started and the end
+
+    def fake_codex(self, mode, thread_id):
+        """A stand-in `codex` binary: thread.started, then FILLER events, then how the turn ended."""
+        script = Path(self.tmp.name) / ("codex-%s" % mode)
+        script.write_text("\n".join([
+            "#!" + sys.executable,
+            "import json, sys",
+            "if 'app-server' in sys.argv: sys.exit(1)",
+            "print(json.dumps({'type': 'thread.started', 'thread_id': %r}))" % thread_id,
+            "for i in range(%d):" % self.FILLER,
+            "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'reasoning', 'text': 'step %d' % i}}))",
+            {"success": "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'ok'}}))\n"
+                        "print(json.dumps({'type': 'turn.completed'}))\nsys.exit(0)",
+             "failed": "print(json.dumps({'type': 'turn.failed', 'error': {'message': 'boom'}}))\nsys.exit(1)",
+             "quota": "print(json.dumps({'type': 'error', 'message': \"You've hit your usage limit\"}))\nsys.exit(1)",
+             }[mode],
+        ]) + "\n")
+        script.chmod(0o755)
+        return str(script)
+
+    def codex_adapter(self, binary):
+        from timetrace.adapters import codex
+
+        class Codex(codex.CodexAdapter):
+            def capabilities(self):
+                return {"can_record": True, "can_read_quota": False, "can_dispatch": True, "can_resume": True,
+                        "can_enforce_zero_spend": True}
+
+            def read_limits(self):
+                return []
+
+        return Codex({"bin": binary}, billing=object())
+
+    def check_long_new_chat(self, mode, outcome):
+        thread_id = "thread-long-" + mode
+        write_lines(self.codex / "sessions" / "2026" / "11" / "16" / ("rollout-2026-11-16T09-00-00-%s.jsonl" % thread_id),
+                    [codex_meta(thread_id, self.cwd), user_item("explain"), token_count(10, 4, 3)])
+        job = {"id": "c1", "kind": "chat_turn", "workspace_id": "ws1", "tool_profile_id": "codex-default",
+               "provider": "codex", "prompt": "explain"}
+        agent, cloud = self.lifecycle_agent(job, self.codex_adapter(self.fake_codex(mode, thread_id)))
+        self.assertEqual(agent.run_once(), "job c1 → " + outcome)
+        self.assert_run_not_imported(agent, cloud, thread_id)
+
+    def test_a_long_successful_new_chat_is_not_imported(self):
+        self.check_long_new_chat("success", "replied")
+
+    def test_a_long_failed_new_chat_is_not_imported(self):
+        self.check_long_new_chat("failed", "failed")
+
+    def test_a_long_quota_blocked_new_chat_is_not_imported(self):
+        self.check_long_new_chat("quota", "waiting_quota")
+
+    def test_the_watch_sees_lines_the_returned_buffer_dropped(self):
+        from timetrace.adapters import codex
+        from timetrace.process import MAX_CAPTURED_LINES, run_streaming
+        watch = codex.ThreadWatch()
+        log = str(Path(self.tmp.name) / "run.log")
+        code, lines = run_streaming([self.fake_codex("success", "t-first")], self.tmp.name, log, on_line=watch)
+        self.assertEqual((code, len(lines)), (0, MAX_CAPTURED_LINES))
+        self.assertIsNone(codex.parse_exec(lines).session_id)  # the cut dropped thread.started...
+        self.assertEqual(watch.thread_id, "t-first")            # ...the watch kept it
+
+    def test_claude_runs_know_their_session_whatever_the_output_keeps(self):
+        from timetrace.adapters import claude
+        seen = {}
+
+        def long_output(cmd, cwd, log_file, **kwargs):
+            seen["sid"] = cmd[cmd.index("--session-id") + 1]
+            return 1, ['{"type": "assistant", "message": {}}'] * 10_000  # no line carries the session id
+
+        adapter = claude.ClaudeAdapter({"bin": "claude"}, billing=object(), credentials=lambda: {})
+        with patch.object(claude, "run_streaming", long_output):
+            for run in (lambda: adapter.chat("q", self.cwd, "", "/dev/null"),
+                        lambda: adapter.review("q", self.cwd, "/dev/null"),
+                        lambda: adapter.plan("q", self.cwd, "/dev/null"),
+                        lambda: adapter.parse_import("q", self.cwd, "/dev/null")):
+                self.assertEqual(run().session_id, seen["sid"])
+
+    def test_an_id_whose_write_failed_stays_excluded_and_is_written_later(self):
+        self.claude_session("write-failed")
+        agent = Agent(self.db, type("Cloud", (), {})(), {}, self.home, lambda: "token", local_sessions=self.importer())
+        agent.cloud.post_local_sessions = lambda token, sessions: self.fail("a run was uploaded")
+        agent._local_session_import = agent._local_session_known = True
+        cancel = threading.Event()
+        agent._track(cancel)
+        agent._note_run_session(cancel, "write-failed")
+        with patch.object(self.db, "record_provider_session", side_effect=OSError("disk busy")):
+            agent._untrack(cancel)
+        self.assertEqual(agent._pending_run_sessions(), {"write-failed"})
+        self.assertNotIn("write-failed", self.db.own_provider_session_ids())
+        stats = agent.import_local_sessions()          # still excluded while only held in memory
+        self.assertEqual((stats["uploaded"], stats["not_sent"]), (0, 1))
+        agent.maintain(now=1000)                       # the next upkeep writes it
+        self.assertEqual(agent._pending_run_sessions(), set())
+        self.assertIn("write-failed", self.db.own_provider_session_ids())
 
 
 class CloudLocalSessionsTest(unittest.TestCase):

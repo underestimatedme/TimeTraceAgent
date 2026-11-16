@@ -6,7 +6,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import IO, List, Mapping, Optional, Sequence, Tuple
+from typing import IO, Callable, List, Mapping, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.redact import mask_timetrace_tokens, redact
@@ -86,10 +86,13 @@ def child_env(drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = No
 def run_streaming(
     cmd: Sequence[str], cwd: str, log_file: str, env: Optional[dict] = None,
     timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
-    drop_env: Optional[Sequence[str]] = None,
+    drop_env: Optional[Sequence[str]] = None, on_line: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, List[str]]:
     """`drop_env` names variables the child must not inherit (billing keys and
-    endpoints that could switch a subscription tool to metered API usage)."""
+    endpoints that could switch a subscription tool to metered API usage).
+    The returned stdout lines are only the last MAX_CAPTURED_LINES; `on_line`
+    sees every stdout line as it is read (masked, without the newline), for
+    what must not be lost to that cut (Codex's session id comes first)."""
     lines: List[str] = []
     run_env = child_env(drop_env, env)
     with open(log_file, "a", encoding="utf-8") as log, open(os.devnull, "rb") as devnull:
@@ -105,7 +108,7 @@ def run_streaming(
         )
         assert proc.stdout is not None and proc.stderr is not None
         lock = threading.Lock()
-        stdout_thread = threading.Thread(target=_tee, args=(proc.stdout, log, lines, lock, ""), daemon=True)
+        stdout_thread = threading.Thread(target=_tee, args=(proc.stdout, log, lines, lock, "", on_line), daemon=True)
         stderr_thread = threading.Thread(target=_tee, args=(proc.stderr, log, None, lock, "[stderr] "), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
@@ -233,9 +236,15 @@ def _group_emptied(proc: subprocess.Popen) -> bool:
     return True
 
 
-def _tee(stream: IO[str], log: IO[str], lines: Optional[List[str]], lock: threading.Lock, prefix: str) -> None:
+def _tee(stream: IO[str], log: IO[str], lines: Optional[List[str]], lock: threading.Lock, prefix: str,
+         on_line: Optional[Callable[[str], None]] = None) -> None:
     for line in iter(stream.readline, ""):
         line = mask_timetrace_tokens(line)
+        if on_line is not None:
+            try:
+                on_line(line.rstrip("\n"))
+            except Exception:
+                pass  # a watcher never stops the output from being read
         if lines is not None:
             lines.append(line.rstrip("\n"))
             if len(lines) > MAX_CAPTURED_LINES:

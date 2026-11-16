@@ -95,7 +95,7 @@ class DispatchedEnvironmentTest(unittest.TestCase):
     def test_codex_start_and_resume_strip_billing_variables(self):
         seen = []
 
-        def fake_run(cmd, cwd, log_file, env=None, timeout=None, cancel_event=None, drop_env=None):
+        def fake_run(cmd, cwd, log_file, env=None, timeout=None, cancel_event=None, drop_env=None, **kwargs):
             seen.append(tuple(drop_env or ()))
             return 0, []
         adapter = CodexAdapter({}, billing=StaticBilling(True))
