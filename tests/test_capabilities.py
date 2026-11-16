@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest import mock
 
 from timetrace.adapters.cursor import CursorAdapter, safe_capabilities
 from timetrace.adapters.gemini import GeminiAdapter
+from timetrace import billing
 from timetrace.billing import StaticBilling, billing_env_keys
 
 
@@ -33,11 +35,12 @@ class CapabilitiesTest(unittest.TestCase):
     def test_a_run_whose_binary_is_missing_fails_without_raising(self):
         # Start / resume are implemented (through ACP) for both; the gate, not a NotImplementedError, keeps an
         # unverified tool from running. A binary that does not exist is an ordinary failed run.
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {
-                "HOME": d, "GEMINI_CLI_HOME": d, "GEMINI_CLI_SYSTEM_SETTINGS_PATH": str(Path(d) / "none.json")}):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HOME": d}), \
+                mock.patch.dict(billing.GEMINI_SYSTEM_SETTINGS, {sys.platform: str(Path(d) / "none.json")}):
             (Path(d) / ".gemini").mkdir()
-            (Path(d) / ".gemini" / "settings.json").write_text('{"security": {"auth": {"selectedType": "oauth-personal"}}}')
-            for name in billing_env_keys("gemini"):
+            (Path(d) / ".gemini" / "settings.json").write_text(
+                '{"security": {"auth": {"selectedType": "oauth-personal"}}, "billing": {"overageStrategy": "never"}}')
+            for name in billing_env_keys("gemini") + billing.GEMINI_SETTINGS_PATH_VARS:
                 os.environ.pop(name, None)   # restored by patch.dict
             missing = str(Path(d) / "missing-agent")
             for adapter in (CursorAdapter({"bin": missing}), GeminiAdapter({"bin": missing}, billing=StaticBilling(True))):

@@ -401,7 +401,7 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | --- | --- | --- |
 | Claude Code | `claude auth status` 报告 `loggedIn=true`、`authMethod=claude.ai`、`apiProvider=firstParty` 且有 `subscriptionType` | `timetrace/billing.py: verify_claude` |
 | Codex | `codex login status` 报告 `Logged in using ChatGPT`，且 `~/.codex/auth.json` 的 `auth_mode=chatgpt`、无 `OPENAI_API_KEY` | `timetrace/billing.py: verify_codex` |
-| Gemini CLI（ACP） | `~/.gemini/settings.json` 选用 `oauth-personal`，环境变量和 `.env` 文件里没有 API key、Vertex 或 Cloud 项目 | `timetrace/billing.py: verify_gemini` |
+| Gemini CLI（ACP） | `~/.gemini/settings.json` 选用 `oauth-personal` 且 `billing.overageStrategy` 明确为 `never`，环境变量和 `.env` 文件里没有 API key、Vertex 或 Cloud 项目，没有设置路径覆盖变量 | `timetrace/billing.py: verify_gemini` |
 | Cursor（ACP） | 永不通过（`cursor_billing_unverifiable`） | `timetrace/adapters/cursor.py` |
 
 另外两条对两个工具都生效：
@@ -480,8 +480,12 @@ Runner 还可以用 Agent Client Protocol（ACP：JSON-RPC 2.0，经标准输入
 
 在 `~/.timetrace/config.json` 写入配置段才会登记这两个工具，例如 `"gemini": {"bin": "gemini"}`、`"cursor": {"bin": "cursor-agent"}`；可选 `extra_args`（追加在启动命令后）和 `timeout_seconds`（缺省 3600）。改完后运行 `timetrace agent install` 重启 Runner，再用 `timetrace agent doctor` 查看路径、启动命令和核验结论。
 
-- **Gemini 的零付费规则**：只有个人 Google 账号登录（Login with Google，`settings.json` 的 `security.auth.selectedType`，旧版为顶层 `selectedAuthType`，等于 `oauth-personal`）才通过；`enforcedType`、外部认证或系统级设置文件改掉它也不通过。`billing.overageStrategy`（额度用完后是否动用付费 AI 点数）只能不设或设为 `never`，`always`、`ask` 或不认识的值都不通过；按 Gemini CLI 合并的各层设置（系统默认、用户、工作区、系统覆盖）取最终生效值。设了 `GEMINI_CLI_HOME` 时，核验读的是它指向的目录，子进程的 `GEMINI_CLI_HOME` 也固定为这个已核验的目录（相对路径不通过）。环境变量 `GEMINI_API_KEY`、`GOOGLE_API_KEY`、`GOOGLE_GENAI_USE_VERTEXAI`、`GOOGLE_GENAI_USE_GCA`、`GOOGLE_APPLICATION_CREDENTIALS`、`GOOGLE_CLOUD_PROJECT` 等任一存在，或出现在 `~/.gemini/.env`（没有时为 `~/.env`）里，都不通过；无论结论如何，这些变量都不会传给 Gemini 子进程，也不会进入检查命令的环境。
-- **每次启动前整套重查，并加上运行目录**：Gemini CLI 会从工作目录逐级向上加载第一个 `.gemini/.env` 或 `.env`，项目的 `.env` 常有给应用本身用的 `GEMINI_API_KEY`；工作区的 `.gemini/settings.json` 也是仓库内容。发现这类计费路径时本次不启动，报 `billing_unverified`。客户端从不调用 ACP 的 `authenticate`，不替你选认证方式。
+- **Gemini 的零付费规则**：原则是「无法确切判断就拒绝」，不去复刻 Gemini CLI 的每条配置解析规则。只有同时满足下列条件才通过：
+  - 个人 Google 账号登录（Login with Google）：按 Gemini CLI 合并的各层设置（系统默认、`~/.gemini/settings.json`、工作区、系统覆盖）取最终值，`security.auth.selectedType`（旧版为顶层 `selectedAuthType`）为 `oauth-personal`，且没有其他 `enforcedType` 或外部认证；
+  - `billing.overageStrategy`（额度用完后是否动用付费 AI 点数）最终值明确为 `never`。不设时 CLI 默认 `ask`；无法从源码证明 ACP 运行里的 `ask` 不会花钱，所以不设、`ask`、`always` 或不认识的值都不通过，需要手动在 `~/.gemini/settings.json` 写入 `"billing": {"overageStrategy": "never"}`；
+  - 环境变量里没有 `GEMINI_API_KEY`、`GOOGLE_API_KEY`、`GOOGLE_GENAI_USE_VERTEXAI`、`GOOGLE_GENAI_USE_GCA`、`GOOGLE_APPLICATION_CREDENTIALS`、`GOOGLE_CLOUD_PROJECT` 等；从运行目录逐级向上直到根目录的每个 `.env` 和 `.gemini/.env`，以及家目录的两个，都不能含这些变量（项目的 `.env` 常有给应用本身用的 `GEMINI_API_KEY`）；
+  - 没有设置 `GEMINI_CLI_HOME`、`GEMINI_CLI_SYSTEM_SETTINGS_PATH`、`GEMINI_CLI_SYSTEM_DEFAULTS_PATH`（无论绝对还是相对路径），设置里没有 `advanced.ignoreLocalEnv`，`extra_args` 里没有 `--ignore-env`：这些会改变 CLI 读设置或 `.env` 的位置，一律不通过；`HOME` 必须是绝对路径。
+- **每次启动前整套重查**：每次运行只取一次环境快照，`HOME` 和所有被检查的路径都从这份快照得出；核验用它，启动子进程也原样用它（去掉计费变量），之间不再读取当前进程的环境。发现问题时本次不启动，报 `billing_unverified`。客户端从不调用 ACP 的 `authenticate`，不替你选认证方式。
 - **Cursor 的规则**：Cursor 套餐可能按用量计费，CLI 又没有可在派发前核验的信号，所以核验结论固定为 `cursor_billing_unverifiable`，门禁始终返回 `billing_unverified`。没有任何配置项能绕过；运行路径已实现，留待以后有可核验的信号再开放。
 - **权限**：客户端声明不提供文件系统和终端能力，智能体调用 `fs/*`、`terminal/*` 或其他未知方法一律回 `-32601`。权限请求先过本机规则，再按需问手机，只回答一次性选项（`allow_once` / `reject_once`），从不选「始终允许 / 始终拒绝」；没有手机审批通道（如本地队列）时一律拒绝，切换模式的请求直接拒绝。
 - **MCP 与日志**：智能体声明支持 http MCP 时，本次运行的 TimeTrace MCP 以 http 服务器 `timetrace` 随 `session/new` 交给它，令牌只在请求头里，不进命令行参数、环境变量和日志；不支持时不接入，并在日志注明。日志是可读的对话记录（请求、工具调用、计划、权限决定、智能体文本），令牌一律脱敏。续接优先 `session/resume`，其次 `session/load`（回放的历史不计入本轮）；都不支持时续接直接失败，不会悄悄开新会话。

@@ -33,7 +33,6 @@ import itertools
 import json
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
@@ -44,7 +43,7 @@ from timetrace import __version__, process
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.mcp_access import McpAccess, skip_note
 from timetrace.process import MAX_LOG_BYTES, StopRequest, ToolExitUnconfirmed, _shell_quote, child_env
-from timetrace.redact import mask_structure, mask_timetrace_tokens, redact
+from timetrace.redact import _TIMETRACE_TOKEN, mask_structure, mask_timetrace_tokens, redact
 
 PROTOCOL_VERSION = 1
 METHOD_NOT_FOUND = -32601
@@ -61,7 +60,12 @@ EXIT_GRACE_SECONDS = 2.0
 MAX_TEXT_CHARS = 256 * 1024     # agent text kept for the result (the most recent part)
 MAX_PLAN_ENTRIES = 50
 SHOWN_CHARS = 300               # one transcript detail (a title, a garbage line, an error message)
-_FLUSH_CHARS = 16 * 1024        # streamed text with no newline is written once this long (at a space)
+_FLUSH_CHARS = 16 * 1024        # streamed text with no newline is written once this long
+# How much streamed text a forced flush always keeps back: more than the longest TimeTrace token
+# (mcp_access.MAX_TOKEN_CHARS), so one still arriving is masked once it is complete, never written in two pieces.
+_HOLD_CHARS = 1024
+# The stop reasons ACP v1 defines; any other value an agent sends is reported as "other", never verbatim.
+STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
 
 
 class AcpError(RuntimeError):
@@ -213,14 +217,21 @@ def safe_text(value: Any, limit: int = SHOWN_CHARS) -> str:
 _short = safe_text
 
 
-def _tail(text: str, limit: int) -> str:
-    """The last `limit` characters of streamed text, starting after a whitespace so a secret (which has none) is
-    never cut in two and left unrecognisable; text without any whitespace there is simply cut."""
-    if len(text) <= limit:
-        return text
-    start = len(text) - limit
-    space = re.search(r"\s", text[start:])
-    return text[start + space.end():] if space else text[start:]
+def _safe_cut(text: str, cut: int) -> int:
+    """`cut`, moved back to the start of a TimeTrace token it would split. Text kept or written in pieces is cut only
+    there, so every token stays whole in one piece and is masked when that piece is (a token is at most
+    _HOLD_CHARS long, so the move is bounded)."""
+    for match in _TIMETRACE_TOKEN.finditer(text, max(0, cut - _HOLD_CHARS), min(len(text), cut + _HOLD_CHARS)):
+        if match.start() < cut < match.end():
+            return match.start()
+    return cut
+
+
+def stop_reason(value: Any) -> str:
+    """An agent's stopReason as it may be stored and shown: one of ACP's own, "other", or "" when there is none."""
+    if not isinstance(value, str) or not value:
+        return ""
+    return value if value in STOP_REASONS else "other"
 
 
 class AcpSession:
@@ -235,11 +246,12 @@ class AcpSession:
     def __init__(self, cmd: Sequence[str], cwd: str, log_file: str, prompt: str, *, session_id: Optional[str] = None,
                  host: Any = None, mcp: Optional[McpAccess] = None, timeout: Optional[float] = None,
                  cancel_event: Optional[threading.Event] = None, drop_env: Optional[Sequence[str]] = None,
-                 env: Optional[dict] = None, request_timeout: float = REQUEST_TIMEOUT_SECONDS,
+                 env: Optional[dict] = None, base_env: Optional[Dict[str, str]] = None,
+                 request_timeout: float = REQUEST_TIMEOUT_SECONDS,
                  load_timeout: float = LOAD_TIMEOUT_SECONDS, client_name: str = "timetrace"):
         self.cmd, self.cwd, self.log_file, self.prompt = list(cmd), os.path.abspath(cwd), log_file, prompt
         self.session_id, self.host, self.mcp, self.timeout = session_id, host, mcp, timeout
-        self.cancel_event, self.drop_env, self.env = cancel_event, drop_env, env
+        self.cancel_event, self.drop_env, self.env, self.base_env = cancel_event, drop_env, env, base_env
         self.request_timeout, self.load_timeout, self.client_name = request_timeout, load_timeout, client_name
         self.garbage_lines = 0
         self._proc: Optional[subprocess.Popen] = None
@@ -316,11 +328,14 @@ class AcpSession:
                 line, self._stream_buf = self._stream_buf.split("\n", 1)
                 self._write_locked(self._prefix(kind) + mask_timetrace_tokens(line) + "\n")
             if len(self._stream_buf) > _FLUSH_CHARS:
-                cut = self._stream_buf.rfind(" ")
-                if cut > 0 or len(self._stream_buf) > 4 * _FLUSH_CHARS:
-                    cut = cut if cut > 0 else len(self._stream_buf)
+                # A line this long is written in pieces, always keeping _HOLD_CHARS back and never cutting a token:
+                # one that is still arriving is masked once it is complete. Whitespace is preferred (no token has any).
+                cut = len(self._stream_buf) - _HOLD_CHARS
+                space = self._stream_buf.rfind(" ", 0, cut)
+                cut = space + 1 if space >= 0 else _safe_cut(self._stream_buf, cut)
+                if cut > 0:
                     self._write_locked(self._prefix(kind) + mask_timetrace_tokens(self._stream_buf[:cut]) + "\n")
-                    self._stream_buf = self._stream_buf[cut:].lstrip(" ")
+                    self._stream_buf = self._stream_buf[cut:]
 
     # ---- the wire ------------------------------------------------------------------------------------------------
     def _send(self, message: Dict[str, Any]) -> bool:
@@ -530,11 +545,14 @@ class AcpSession:
         self._text_len += len(text)
         self._last.append(text)
         self._last_len += len(text)
+        # Kept raw (a token may still be arriving), so the front is cut only where no token is split.
         if self._text_len > 2 * MAX_TEXT_CHARS:
-            self._text = [_tail("".join(self._text), MAX_TEXT_CHARS)]
+            joined = "".join(self._text)
+            self._text = [joined[_safe_cut(joined, len(joined) - MAX_TEXT_CHARS):]]
             self._text_len = len(self._text[0])
         if self._last_len > 2 * MAX_TEXT_CHARS:
-            self._last = [_tail("".join(self._last), MAX_TEXT_CHARS)]
+            joined = "".join(self._last)
+            self._last = [joined[_safe_cut(joined, len(joined) - MAX_TEXT_CHARS):]]
             self._last_len = len(self._last[0])
 
     # ---- requests --------------------------------------------------------------------------------------------------
@@ -573,10 +591,12 @@ class AcpSession:
             pending.done.wait(.05)
         if pending.error is not None:
             code = pending.error.get("code")
+            code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            # A non-integer code is agent-supplied text like the message: masked whole, then cut.
+            shown = code if code is not None else safe_text(pending.error.get("code"), 40)
             message = _short(pending.error.get("message") or "")
-            self._line("<- %s error %s: %s" % (pending.method, code, message))
-            raise AcpError("%s failed (%s): %s" % (pending.method, code, message),
-                           code=code if isinstance(code, int) else None, method=pending.method)
+            self._line("<- %s error %s: %s" % (pending.method, shown, message))
+            raise AcpError("%s failed (%s): %s" % (pending.method, shown, message), code=code, method=pending.method)
         return pending.result
 
     # ---- the conversation ----------------------------------------------------------------------------------------
@@ -628,9 +648,8 @@ class AcpSession:
             "sessionId": self._session, "prompt": [{"type": "text", "text": self.prompt}],
         }, " (%d characters)" % len(self.prompt))
         answer = self._await(self._prompt_pending, None)
-        stop = answer.get("stopReason")
-        result.stop_reason = stop if isinstance(stop, str) else ""
-        self._line("<- session/prompt: stopReason %s" % (_short(result.stop_reason) or "missing"))
+        result.stop_reason = stop_reason(answer.get("stopReason"))
+        self._line("<- session/prompt: stopReason %s" % (result.stop_reason or "missing"))
 
     def _mcp_servers(self, http_mcp: bool, result: AcpResult) -> List[Dict[str, Any]]:
         """TimeTrace's MCP server for this run, when there is an access and the agent takes http servers. The header
@@ -668,9 +687,9 @@ class AcpSession:
             deadline = time.monotonic() + CANCEL_GRACE_SECONDS
             while not pending.done.is_set() and not self._eof.is_set() and time.monotonic() < deadline:
                 pending.done.wait(.05)
-            if pending.done.is_set() and pending.error is None and isinstance(pending.result.get("stopReason"), str):
-                result.stop_reason = pending.result["stopReason"]
-                self._line("<- session/prompt: stopReason %s" % _short(result.stop_reason))
+            if pending.done.is_set() and pending.error is None and stop_reason(pending.result.get("stopReason")):
+                result.stop_reason = stop_reason(pending.result.get("stopReason"))
+                self._line("<- session/prompt: stopReason %s" % result.stop_reason)
         result.cancelled = True
         result.error = "cancelled" if reason == "stop" else "timed out after %gs" % (self.timeout or 0)
         if proc is None or proc.poll() is not None:
@@ -691,7 +710,8 @@ class AcpSession:
     # ---- lifecycle -------------------------------------------------------------------------------------------------
     def run(self) -> AcpResult:
         result = AcpResult()
-        run_env = child_env(self.drop_env, self.env)
+        # With `base_env` the child gets that snapshot (the one a billing check read), not a fresh os.environ.
+        run_env = child_env(self.drop_env, self.env, base=self.base_env)
         stopping = isinstance(self.cancel_event, StopRequest)
         with open(self.log_file, "a", encoding="utf-8") as log:
             self._log = log
@@ -741,8 +761,9 @@ class AcpSession:
             self._line("--- exit %s ---" % proc.returncode)
             self._log = None
         result.exit_code = proc.returncode
-        result.text = mask_timetrace_tokens(_tail("".join(self._text), MAX_TEXT_CHARS))
-        result.last_message = mask_timetrace_tokens(_tail("".join(self._last), MAX_TEXT_CHARS))
+        # The whole text is masked first, then cut (a cut inside a mask marker is harmless).
+        result.text = mask_timetrace_tokens("".join(self._text))[-MAX_TEXT_CHARS:]
+        result.last_message = mask_timetrace_tokens("".join(self._last))[-MAX_TEXT_CHARS:]
         result.tool_calls, result.plan, result.usage = len(self._tool_ids), self._plan, self._usage
         return result
 

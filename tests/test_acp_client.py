@@ -477,5 +477,51 @@ class RedactionTest(AcpCase):
         self.assertEqual(self.leaks(self.log_text()), [])
 
 
+
+# ---- second review (d8f1d62): each of these fails on that commit ----------------------------------------------------
+
+LONG_TOKEN = "ttm_" + "Ab1-Cd2_" * 8   # 68 characters: long enough that either half of a split is a 20-character run
+
+
+def token_runs(text):
+    """Every 20-character run of LONG_TOKEN found in `text` (a fragment long enough to matter)."""
+    return [LONG_TOKEN[i:i + 20] for i in range(len(LONG_TOKEN) - 19) if LONG_TOKEN[i:i + 20] in text]
+
+
+class TokenFragmentTest(AcpCase):
+    def assertNowhere(self, result):
+        from timetrace.adapters.acp import run_result
+        for where, text in (("log", self.log_text()), ("text", result.text), ("last_message", result.last_message),
+                            ("RunResult.output", run_result(result, None).output)):
+            self.assertEqual(token_runs(text), [], where)
+
+    def test_a_token_at_the_trim_point_of_the_kept_text_never_leaves_a_fragment(self):
+        from timetrace.acp_client import MAX_TEXT_CHARS
+        total = 2 * MAX_TEXT_CHARS + 100            # one chunk long enough to be trimmed...
+        start = MAX_TEXT_CHARS + 90                 # ...with the trim point 10 characters into the token
+        chunk = "a" * start + LONG_TOKEN + "b" * (total - start - len(LONG_TOKEN))
+        result = self.run_session({"turn": [{"chunk": chunk}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertNowhere(result)
+
+    def test_a_token_across_a_forced_log_flush_never_leaves_a_fragment(self):
+        result = self.run_session({"turn": [{"chunk": "a" * 70000 + LONG_TOKEN[:34]},
+                                            {"chunk": LONG_TOKEN[34:] + " done\n"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertNowhere(result)
+
+    def test_a_string_error_code_is_masked_too(self):
+        result = self.run_session({"turn": [{"error": {"code": "E-" + LONG_TOKEN, "message": "bad"}}]})
+        self.assertEqual(token_runs(result.error), [])
+        self.assertEqual(token_runs(self.log_text()), [])
+
+    def test_an_unknown_stop_reason_is_reported_as_other(self):
+        result = self.run_session({"turn": [{"stop": "custom " + LONG_TOKEN}]})
+        self.assertEqual(result.stop_reason, "other")
+        self.assertEqual(token_runs(self.log_text()), [])
+        known = self.run_session({"turn": [{"stop": "max_turn_requests"}]})
+        self.assertEqual(known.stop_reason, "max_turn_requests")
+
+
 if __name__ == "__main__":
     unittest.main()
