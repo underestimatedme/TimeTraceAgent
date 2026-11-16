@@ -100,11 +100,11 @@ class AcpAdapter(ToolAdapter):
         caps["can_enforce_zero_spend"] = self.billing.verdict().verified
         return merge_capabilities(caps)
 
-    def prepare(self, cwd: str) -> Tuple[str, Optional[Dict[str, str]]]:
-        """(why this run must not start from `cwd`, "" to go ahead; the run's one environment snapshot). The snapshot
-        is what a subclass checks and exactly what the child is started with (minus the billing keys and secret-named
-        variables): os.environ is not read again between the check and the spawn."""
-        return "", dict(os.environ)
+    def prepare(self, cwd: str) -> Tuple[str, Optional[Dict[str, str]], List[str]]:
+        """(why this run must not start from `cwd`, "" to go ahead; the run's one environment snapshot; the command).
+        The snapshot is what a subclass checks and exactly what the child is started with (minus the billing keys and
+        secret-named variables): os.environ is not read again between the check and the spawn."""
+        return "", dict(os.environ), self.command()
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               control=None, mcp: Optional[McpAccess] = None) -> RunResult:
@@ -119,13 +119,13 @@ class AcpAdapter(ToolAdapter):
         return self._run(prompt, cwd, session_id, log_file, cancel_event, control, mcp)
 
     def _run(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp) -> RunResult:
-        problem, snapshot = self.prepare(cwd)
+        problem, snapshot, cmd = self.prepare(cwd)
         if problem:
             with open(log_file, "a", encoding="utf-8") as log:
                 log.write("--- not started: billing_unverified (%s) ---\n" % problem)
             return RunResult(exit_code=1, session_id=session_id, error="billing_unverified: " + problem)
         # The rules go first in the one prompt ACP has (it has no system-prompt channel), as for Codex.
-        session = AcpSession(self.command(), cwd, log_file, SAFETY_RULES + "\n" + prompt, session_id=session_id,
+        session = AcpSession(cmd, cwd, log_file, SAFETY_RULES + "\n" + prompt, session_id=session_id,
                              host=control, mcp=mcp, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                              cancel_event=cancel_event, drop_env=billing_env_keys(self.name), base_env=snapshot)
         with masking([mcp.token] if mcp is not None else []):

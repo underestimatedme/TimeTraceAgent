@@ -15,16 +15,19 @@ starts a model run, so verifying costs nothing. Anything unknown stays
 unverified with a machine-readable reason. Verdicts are cached briefly and
 re-checked right before a spawn.
 
-The ACP agents follow the same rule. Gemini CLI is gated hermetically: an
-allowlisted child environment, no .env or system settings file anywhere the
-CLI could read one, exact user settings (personal Google login, AI credits
-"never"), no billing keys in workspace settings, and the audited CLI version.
+The ACP agents follow the same rule. Gemini CLI is gated hermetically and
+allow-only, without running anything: an allowlisted child environment, the
+audited CLI version read from its package.json, exact user settings (personal
+Google login, AI credits "never", no other key), a personal cached login, and
+no .env, workspace Gemini or agent configuration, user extension / command /
+skill / policy / agent directory or system configuration anywhere.
 Cursor has no signal we can check, so it stays unverified and is never
 dispatched.
 """
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -197,20 +200,28 @@ def verify_codex(cfg: Mapping[str, object], run: Callable[[Sequence[str], float]
 
 
 # ---- Gemini CLI ---------------------------------------------------------------------------------------------------
-# Gemini CLI has no read-only "auth status" command, and modelling how it resolves its configuration proved fragile
-# (settings layers, .env discovery, path overrides, endpoint variables). The gate is therefore hermetic and allow-only:
-# the child gets an allowlisted environment, and a run is verified only when the few files that decide its billing
-# exist exactly as required and nothing else that could change them exists at all. Anything else is refused with a
-# precise reason. Paths and keys follow Gemini CLI v0.60.0; no real Gemini CLI was run on this machine.
-GEMINI_PERSONAL_LOGIN = "oauth-personal"
-GEMINI_OVERAGE_OFF = "never"
-GEMINI_AUDITED_MINOR = (0, 60)       # the CLI version these rules were written against: 0.60.x only
-GEMINI_VERSION_TIMEOUT_SECONDS = 15.0
-# The system settings file of each platform; its system-defaults.json sits next to it. Existence alone refuses.
-GEMINI_SYSTEM_SETTINGS = {"darwin": "/Library/Application Support/GeminiCli/settings.json",
-                          "linux": "/etc/gemini-cli/settings.json"}
+# Gemini CLI has no read-only "auth status" command, and modelling how it resolves its configuration proved fragile.
+# The gate is hermetic and allow-only: the child gets an allowlisted environment, nothing is executed to verify (no
+# `--version`: it loads settings and runs migrations and cleanup before parsing its arguments), and a run is
+# verified only when the few files that decide its billing exist exactly as required and no other Gemini or agent
+# configuration exists anywhere the CLI could load it. Anything else is refused with a precise reason. Paths are
+# those of Gemini CLI v0.60.0 (packages/core/src/config/storage.ts); no real Gemini CLI was run on this machine.
+GEMINI_PACKAGE = "@google/gemini-cli"
+GEMINI_AUDITED_VERSION = re.compile(r"0\.60\.\d+")   # audited on 0.60.0; its patch releases are accepted
+# Storage.getSystemConfigDir(): system settings, system defaults and system policies live here. Existence refuses.
+GEMINI_SYSTEM_DIRS = ("/Library/Application Support/GeminiCli", "/etc/gemini-cli")
+# ~/.gemini/settings.json must be exactly this document: personal Google login, paid AI credits off. No other key
+# (mcpServers, tools, hooks, extensions, context, advanced, model, ui, ...) is allowed, not even cosmetic ones.
+GEMINI_USER_SETTINGS = {"security": {"auth": {"selectedType": "oauth-personal"}}, "billing": {"overageStrategy": "never"}}
+# What v0.60.0 loads from ~/.gemini besides settings: user commands, skills, policies and agents (Storage), and
+# extensions. Existence refuses (extensions: a non-empty directory).
+GEMINI_USER_DIRS = ("commands", "skills", "policies", "agents")
+# Cached Google login (Storage.getOAuthCredsPath()). code_assist/oauth2.ts isAdcCredentials(): an object without a
+# string `type`, or with type "authorized_user", is set on a plain OAuth2 client (the personal login); any other type
+# goes through GoogleAuth.fromJSON() (service account, external account, ...).
+GEMINI_PERSONAL_CREDENTIAL_TYPES = (None, "authorized_user")
 # The only variables the Gemini child receives, from the run's one environment snapshot:
-#   PATH          finding `node` (an npm-installed CLI is a node script) and the commands the model runs (git, ...)
+#   PATH          finding `node` (the CLI is a node script) and the commands the model runs (git, ...)
 #   HOME          where the CLI keeps its login and user settings - exactly the ones verified here
 #   USER, LOGNAME the account name tools such as git fall back to
 #   SHELL         the shell the CLI's command tool starts
@@ -219,13 +230,10 @@ GEMINI_SYSTEM_SETTINGS = {"darwin": "/Library/Application Support/GeminiCli/sett
 #   TMPDIR        the per-user temporary directory macOS assigns (node's os.tmpdir())
 #   TZ            timestamps
 # Everything else stays out by construction: API keys, Vertex / Cloud project settings, endpoint overrides such as
-# CODE_ASSIST_ENDPOINT, GEMINI_CLI_HOME and the system-settings path variables, proxies and extra CA certificates (a
-# network that needs them fails closed: the run cannot connect, so it cannot spend).
+# CODE_ASSIST_ENDPOINT, GEMINI_CLI_HOME and the system-settings path variables, GOOGLE_APPLICATION_CREDENTIALS,
+# proxies and extra CA certificates (a network that needs them fails closed: the run cannot connect, cannot spend).
 GEMINI_ENV_ALLOWLIST = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ")
 GEMINI_ENV_ALLOWED_PREFIXES = ("LC_",)
-# The top-level keys a workspace's .gemini/settings.json must not set (auth, billing, environment handling).
-GEMINI_WORKSPACE_FORBIDDEN_KEYS = ("security", "billing", "advanced")
-_GEMINI_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 
 
 def gemini_child_env(snapshot: Mapping[str, str]) -> Dict[str, str]:
@@ -244,157 +252,190 @@ def gemini_home(env: Mapping[str, str]) -> Tuple[Optional[Path], str]:
     return Path(home), ""
 
 
+def _reject_constant(name: str) -> object:
+    raise ValueError("not strict JSON: " + name)
+
+
+def _strict_json(path: Path) -> object:
+    """The file as strict JSON (no NaN / Infinity); raises OSError / ValueError otherwise."""
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+
+
 def _shown(path: Path, home: Path) -> str:
     """A path for a reason string, with the home shown as ~ (reasons reach doctor output and run errors)."""
-    text = str(path)
-    return "~" + text[len(str(home)):] if text == str(home) or text.startswith(str(home) + os.sep) else text
+    text, prefix = str(path), str(home)
+    return "~" + text[len(prefix):] if text == prefix or text.startswith(prefix + os.sep) else text
 
 
-def _dotenv_candidates(start: Optional[str], home: Path) -> List[Path]:
-    """Every .env file Gemini CLI could load: each `.gemini/.env` and `.env` from the run directory up to the
-    filesystem root, and the home's two. Their content is never read: existence alone refuses."""
-    files: List[Path] = []
-    if start is not None:
-        current = Path(os.path.abspath(start))
+def gemini_resolve(binary: str, env: Mapping[str, str]) -> Tuple[Optional[str], str]:
+    """(the binary the child will be started with, "") or (None, why its version is not the audited one). Read
+    statically, nothing is run: the binary found on the snapshot's PATH (or the absolute `bin`), its real path, and
+    the nearest package.json above it, which must be @google/gemini-cli at version 0.60.x."""
+    found = binary if os.path.isabs(binary) else shutil.which(binary, path=env.get("PATH", ""))
+    if not found or not os.path.isfile(found) or not os.access(found, os.X_OK):
+        return None, "gemini_version_unknown:not_found"
+    current = Path(os.path.realpath(found)).parent
+    while True:
+        manifest = current / "package.json"
+        if manifest.is_file():
+            try:
+                package = _strict_json(manifest)
+            except (OSError, ValueError):
+                return None, "gemini_version_unknown:unreadable_package_json"
+            if not isinstance(package, dict) or package.get("name") != GEMINI_PACKAGE:
+                return None, "gemini_version_unknown:not_gemini_cli"
+            version = package.get("version")
+            if not isinstance(version, str) or not GEMINI_AUDITED_VERSION.fullmatch(version):
+                return None, "gemini_version_unaudited:%s" % (version if isinstance(version, str) and
+                                                               re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", version) else "?")
+            return found, ""
+        if current.parent == current:
+            return None, "gemini_version_unknown:no_package_json"
+        current = current.parent
+
+
+def _ancestors(start: str) -> List[Path]:
+    """`start` and every directory above it, for the path as given and for its real path (so /tmp and /private/tmp
+    are both covered)."""
+    chains: List[Path] = []
+    for begin in (Path(os.path.abspath(start)), Path(os.path.realpath(start))):
+        current = begin
         while True:
-            files += [current / ".gemini" / ".env", current / ".env"]
+            chains.append(current)
             if current.parent == current:
                 break
             current = current.parent
-    files += [home / ".gemini" / ".env", home / ".env"]
-    return list(dict.fromkeys(files))
+    return list(dict.fromkeys(chains))
 
 
-def _system_files(system_settings_path: Optional[str], system_defaults_path: Optional[str]) -> List[Path]:
-    settings = [Path(p) for p in GEMINI_SYSTEM_SETTINGS.values()]
-    if system_settings_path:
-        settings.append(Path(system_settings_path))
-    files = settings + [p.parent / "system-defaults.json" for p in settings]
-    if system_defaults_path:
-        files.append(Path(system_defaults_path))
-    return list(dict.fromkeys(files))
+def _tree_problem(start: str, home: Path) -> str:
+    """No .env file, no Gemini configuration other than the user's own ~/.gemini, and no agent configuration
+    (.agents: skills v0.60.0 loads) in `start` or any directory above it. Existence alone refuses."""
+    own = os.path.realpath(home / ".gemini")
+    for directory in _ancestors(start):
+        for name in (".env", ".agents"):
+            if (directory / name).exists():
+                return "gemini_dotenv_present:%s" % _shown(directory / name, home) if name == ".env" else \
+                    "gemini_agents_config_present:%s" % _shown(directory / name, home)
+        gemini = directory / ".gemini"
+        if gemini.exists() and os.path.realpath(gemini) != own:
+            return "gemini_workspace_config_present:%s" % _shown(gemini, home)
+    return ""
 
 
-def _read_json_object(path: Path) -> Optional[Dict[str, object]]:
-    """The file as one strict JSON object, or None (unreadable, not JSON, not an object)."""
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+def _user_problem(home: Path) -> str:
+    """What ~ itself must look like: ~/.gemini/settings.json exactly GEMINI_USER_SETTINGS, a personal cached login,
+    no .env, extension, command, skill, policy or agent configuration, no ~/.env or ~/.agents."""
+    gemini = home / ".gemini"
+    for path in (home / ".env", home / ".agents", gemini / ".env"):
+        if path.exists():
+            kind = "gemini_agents_config_present" if path.name == ".agents" else "gemini_dotenv_present"
+            return "%s:%s" % (kind, _shown(path, home))
+    for name in GEMINI_USER_DIRS:
+        if (gemini / name).exists():
+            return "gemini_user_config_present:%s" % _shown(gemini / name, home)
+    extensions = gemini / "extensions"
+    if extensions.exists() and (not extensions.is_dir() or any(extensions.iterdir())):
+        return "gemini_user_config_present:%s" % _shown(extensions, home)
+    reason = _settings_problem(gemini / "settings.json")
+    if reason:
+        return reason
+    return _credentials_problem(gemini / "oauth_creds.json")
 
 
-def _user_settings_problem(home: Path) -> str:
-    """~/.gemini/settings.json must exist, be strict JSON and say exactly: security.auth.selectedType ==
-    "oauth-personal" (the layout v0.60.0 reads; the old top-level selectedAuthType does not count) with no other
-    auth setting, and billing.overageStrategy == "never"."""
-    path = home / ".gemini" / "settings.json"
+def _settings_problem(path: Path) -> str:
     if not path.exists():
         return "settings_missing"
-    settings = _read_json_object(path)
-    if settings is None:
-        return "settings_unreadable"
-    security = settings.get("security") if isinstance(settings.get("security"), dict) else {}
-    auth = security.get("auth") if isinstance(security.get("auth"), dict) else {}
-    selected = auth.get("selectedType")
-    if selected is None:
-        return "auth_type_unset"
-    if selected != GEMINI_PERSONAL_LOGIN:
-        return "auth_method_not_subscription:%s" % selected
-    extra = sorted(key for key in auth if key != "selectedType")
-    if extra:
-        return "auth_override_present:security.auth.%s" % extra[0]
-    billing = settings.get("billing") if isinstance(settings.get("billing"), dict) else {}
-    if "overageStrategy" not in billing:
-        return "billing_overage_unset"
-    if billing["overageStrategy"] != GEMINI_OVERAGE_OFF:
-        return "billing_overage_enabled:%s" % billing["overageStrategy"]
-    return ""
-
-
-def _workspace_settings_problem(cwd: str, home: Path) -> str:
-    """Each .gemini/settings.json from the run directory up to its repository root (the first directory holding
-    .git), never above the home (whose file is the user's): none may set security, billing or advanced."""
-    current = Path(os.path.abspath(cwd))
-    while current != home:
-        path = current / ".gemini" / "settings.json"
-        if path.exists():
-            settings = _read_json_object(path)
-            if settings is None:
-                return "workspace_settings_unreadable"
-            for key in GEMINI_WORKSPACE_FORBIDDEN_KEYS:
-                if key in settings:
-                    return "workspace_settings_override:%s" % key
-        if (current / ".git").exists() or current.parent == current:
-            break
-        current = current.parent
-    return ""
-
-
-def _version_problem(binary: str, env: Mapping[str, str], cwd: str, run: Callable = subprocess.run) -> str:
-    """`<bin> --version` (it prints the version and exits: no model call), with the child's hermetic environment;
-    only a plain 0.60.x is accepted."""
     try:
-        proc = run([binary, "--version"], capture_output=True, text=True, timeout=GEMINI_VERSION_TIMEOUT_SECONDS,
-                   stdin=subprocess.DEVNULL, env=gemini_child_env(env), cwd=cwd)
-    except Exception as exc:   # missing binary, timeout, permission: all mean "not the audited CLI"
-        return "gemini_version_unaudited:" + type(exc).__name__
-    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
-    match = _GEMINI_VERSION.fullmatch(lines[-1]) if proc.returncode == 0 and lines else None
-    if match is None:
-        return "gemini_version_unaudited:unparsable"
-    if (int(match.group(1)), int(match.group(2))) != GEMINI_AUDITED_MINOR:
-        return "gemini_version_unaudited:%s.%s.%s" % match.groups()
+        settings = _strict_json(path)
+    except (OSError, ValueError):
+        return "settings_unreadable"
+    if not isinstance(settings, dict):
+        return "settings_unreadable"
+    for key in settings:
+        if key not in GEMINI_USER_SETTINGS:
+            return "settings_key_not_allowed:%s" % _key(key)
+    security = settings.get("security")
+    auth = security.get("auth") if isinstance(security, dict) else None
+    if not isinstance(auth, dict) or "selectedType" not in auth:
+        return "auth_type_unset"
+    if auth["selectedType"] != "oauth-personal":
+        return "auth_method_not_subscription:%s" % _key(auth["selectedType"])
+    if security != GEMINI_USER_SETTINGS["security"]:
+        extra = sorted(set(security) - {"auth"}) or sorted(set(auth) - {"selectedType"})
+        prefix = "security." if set(security) - {"auth"} else "security.auth."
+        return "settings_key_not_allowed:%s%s" % (prefix, _key(extra[0]))
+    billing = settings.get("billing")
+    if not isinstance(billing, dict) or "overageStrategy" not in billing:
+        return "billing_overage_unset"
+    if billing["overageStrategy"] != "never":
+        return "billing_overage_enabled:%s" % _key(billing["overageStrategy"])
+    if billing != GEMINI_USER_SETTINGS["billing"]:
+        return "settings_key_not_allowed:billing.%s" % _key(sorted(set(billing) - {"overageStrategy"})[0])
     return ""
+
+
+def _credentials_problem(path: Path) -> str:
+    """The cached login must be a personal one. Only its `type` is read; no token value is ever kept or shown."""
+    if not path.exists():
+        return "gemini_credentials_missing"
+    try:
+        credentials = _strict_json(path)
+    except (OSError, ValueError):
+        return "gemini_credentials_not_personal:unreadable"
+    if not isinstance(credentials, dict):
+        return "gemini_credentials_not_personal:unreadable"
+    kind = credentials.get("type")
+    if kind not in GEMINI_PERSONAL_CREDENTIAL_TYPES:
+        return "gemini_credentials_not_personal:%s" % _key(kind)
+    return ""
+
+
+def _key(value: object) -> str:
+    """A settings key or value as it may appear in a reason: short, plain, never file content beyond that."""
+    text = value if isinstance(value, str) else json.dumps(value)
+    return text if re.fullmatch(r"[0-9A-Za-z_.$-]{1,40}", text) else "?"
 
 
 def gemini_billing_problem(env: Mapping[str, str], cwd: Optional[str] = None, binary: str = "gemini",
-                           system_settings_path: Optional[str] = None, system_defaults_path: Optional[str] = None,
-                           run: Callable = subprocess.run) -> str:
-    """Why a Gemini run is not verified zero-spend, "" when every allow condition holds. `env` is the run's one
-    environment snapshot (the child gets its allowlisted part); without `cwd` it judges what every run shares (the
-    verifier), with it also the run's own directory (right before the spawn)."""
+                           extra_args: Sequence[object] = ()) -> Tuple[str, Optional[str]]:
+    """(why a Gemini run is not verified zero-spend, "" when every allow condition holds; the binary to start).
+    `env` is the run's one environment snapshot (the child gets its allowlisted part). Without `cwd` the home and
+    every directory above it are checked (the verifier); with it, the run's directory and every one above it."""
     home, reason = gemini_home(env)
     if home is None:
-        return reason
-    for path in _system_files(system_settings_path, system_defaults_path):
-        if path.exists():
-            return "gemini_system_settings_present:%s" % path
-    for path in _dotenv_candidates(cwd, home):
-        if path.exists():
-            return "gemini_dotenv_present:%s" % _shown(path, home)
-    reason = _user_settings_problem(home)
-    if reason:
-        return reason
-    if cwd is not None:
-        reason = _workspace_settings_problem(cwd, home)
+        return reason, None
+    if extra_args:
+        return "gemini_extra_args_unsupported", None
+    try:
+        for directory in GEMINI_SYSTEM_DIRS:
+            if os.path.exists(directory):
+                return "gemini_system_config_present:%s" % directory, None
+        reason = _tree_problem(cwd if cwd is not None else str(home), home) or _user_problem(home)
         if reason:
-            return reason
-    return _version_problem(binary, env, cwd if cwd is not None else str(home), run)
+            return reason, None
+        resolved, reason = gemini_resolve(binary, env)
+    except OSError as exc:   # a directory that cannot be listed or read: nothing can be shown to be absent
+        return "gemini_config_unreadable:%s" % type(exc).__name__, None
+    return reason, resolved
 
 
 def verify_gemini(cfg: Mapping[str, object], env: Optional[Mapping[str, str]] = None,
-                  system_settings_path: Optional[str] = None, system_defaults_path: Optional[str] = None,
-                  now: Optional[float] = None, run: Callable = subprocess.run) -> BillingVerdict:
+                  now: Optional[float] = None) -> BillingVerdict:
     now = time.time() if now is None else now
     env = dict(os.environ) if env is None else env
-    reason = gemini_billing_problem(env, None, str(cfg.get("bin") or "gemini"), system_settings_path,
-                                    system_defaults_path, run)
+    reason, _ = gemini_billing_problem(env, None, str(cfg.get("bin") or "gemini"), cfg.get("extra_args") or ())
     if reason:
         return _unverified("gemini", reason, "", now)
-    return BillingVerdict(provider="gemini", verified=True, reason="", auth_method=GEMINI_PERSONAL_LOGIN,
-                          verified_at=now)
+    return BillingVerdict(provider="gemini", verified=True, reason="", auth_method="oauth-personal", verified_at=now)
 
 
 def gemini_workspace_problem(cwd: str, env: Mapping[str, str], binary: str = "gemini",
-                             system_settings_path: Optional[str] = None,
-                             system_defaults_path: Optional[str] = None, run: Callable = subprocess.run) -> str:
-    """The whole check again for one run, right before it is spawned, against the snapshot whose allowlisted part
-    the child gets, now with the run's directory: every .env on the way up from there and its workspace settings.
-    "" to go ahead."""
+                             extra_args: Sequence[object] = ()) -> str:
+    """The whole check again for one run, right before it is spawned, from the run's directory. "" to go ahead."""
     if not isinstance(env, Mapping):
         raise TypeError("env must be the run's environment snapshot")
-    return gemini_billing_problem(env, cwd, binary, system_settings_path, system_defaults_path, run)
+    return gemini_billing_problem(env, cwd, binary, extra_args)[0]
 
 
 class BillingVerifier:

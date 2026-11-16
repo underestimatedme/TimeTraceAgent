@@ -401,7 +401,7 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | --- | --- | --- |
 | Claude Code | `claude auth status` 报告 `loggedIn=true`、`authMethod=claude.ai`、`apiProvider=firstParty` 且有 `subscriptionType` | `timetrace/billing.py: verify_claude` |
 | Codex | `codex login status` 报告 `Logged in using ChatGPT`，且 `~/.codex/auth.json` 的 `auth_mode=chatgpt`、无 `OPENAI_API_KEY` | `timetrace/billing.py: verify_codex` |
-| Gemini CLI（ACP） | 版本 0.60.x；`~/.gemini/settings.json` 只选 `oauth-personal` 且 `billing.overageStrategy` 为 `never`；没有任何 `.env` 和系统级设置文件；子进程只拿白名单环境变量 | `timetrace/billing.py: verify_gemini` |
+| Gemini CLI（ACP） | package.json 版本 0.60.x；`~/.gemini/settings.json` 只能是个人登录加 `overageStrategy: never`；个人登录凭据；没有 `.env`、工作区 Gemini 配置和系统级配置；子进程只拿白名单环境变量 | `timetrace/billing.py: verify_gemini` |
 | Cursor（ACP） | 永不通过（`cursor_billing_unverifiable`） | `timetrace/adapters/cursor.py` |
 
 另外两条对两个工具都生效：
@@ -480,13 +480,15 @@ Runner 还可以用 Agent Client Protocol（ACP：JSON-RPC 2.0，经标准输入
 
 在 `~/.timetrace/config.json` 写入配置段才会登记这两个工具，例如 `"gemini": {"bin": "gemini"}`、`"cursor": {"bin": "cursor-agent"}`；可选 `extra_args`（追加在启动命令后）和 `timeout_seconds`（缺省 3600）。改完后运行 `timetrace agent install` 重启 Runner，再用 `timetrace agent doctor` 查看路径、启动命令和核验结论。
 
-- **Gemini 的零付费规则（封闭式白名单）**：不去复刻 Gemini CLI 的配置解析，只在下列条件全部满足时才派发，否则报 `billing_unverified` 并给出具体原因：
-  - `gemini --version`（不调用模型，用下面的白名单环境运行）输出的版本是 `0.60.x`；规则只针对这个审核过的版本，其他版本或无法识别都不通过（`gemini_version_unaudited`）；
-  - `~/.gemini/settings.json`（`HOME` 取自本次运行的环境快照，必须是绝对路径）存在且是严格 JSON，`security.auth` 里只有 `"selectedType": "oauth-personal"`（旧版顶层 `selectedAuthType` 不算），并且 `"billing": {"overageStrategy": "never"}`；不设时 CLI 默认 `ask`，无法从源码证明 ACP 运行里的 `ask` 不会花钱，所以必须明确写 `never`；
-  - 从运行目录逐级向上直到根目录，以及家目录，都不存在任何 `.env` 或 `.gemini/.env` 文件：只看是否存在，不解析内容。**带 `.env` 的项目不能派发给 Gemini**；
-  - 不存在系统级设置文件（macOS `/Library/Application Support/GeminiCli/settings.json` 或 `system-defaults.json`，Linux `/etc/gemini-cli/` 下同名文件），不管内容和权限；
-  - 从运行目录到仓库根目录的工作区 `.gemini/settings.json` 不含 `security`、`billing`、`advanced` 键（其他键可以有）。
-- **白名单环境**：每次运行只取一次环境快照，核验用它；Gemini 子进程只拿到其中的 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`，其他变量（API key、Vertex/Cloud 项目、`CODE_ASSIST_ENDPOINT`、`GEMINI_CLI_HOME`、代理和额外 CA 证书等）一律进不去；需要代理才能联网的环境会连不上，不会产生费用。每次启动前整套重查（含版本），客户端从不调用 ACP 的 `authenticate`。
+- **Gemini 的零付费规则（封闭式白名单，核验不运行任何程序）**：不去复刻 Gemini CLI 的配置解析，只在下列条件全部满足时才派发，否则报 `billing_unverified` 并给出具体原因：
+  - 版本：在本次运行环境快照的 `PATH` 里找到的 `gemini`（或配置的绝对路径），取真实路径后向上最近的 `package.json` 必须是 `@google/gemini-cli`，版本为 `0.60.x`。规则按 0.60.0 审核，同一小版本的补丁版本据此接受；其他版本或找不到都不通过（`gemini_version_unaudited` / `gemini_version_unknown`）。不运行 `gemini --version`：它在解析参数前就会加载设置、迁移并保存旧设置、清理目录；
+  - `~/.gemini/settings.json`（`HOME` 取自环境快照，必须是绝对路径）是严格 JSON（不接受注释、NaN、Infinity），且**只能**是 `{"security": {"auth": {"selectedType": "oauth-personal"}}, "billing": {"overageStrategy": "never"}}`，不能有任何其他键（`mcpServers`、`tools`、`hooks`、`model`、`ui` 等都不行）。不设 `overageStrategy` 时 CLI 默认 `ask`，无法从源码证明 ACP 运行里的 `ask` 不会花钱，所以必须明确写 `never`；
+  - `~/.gemini/oauth_creds.json` 存在、是严格 JSON，`type` 不存在或为 `authorized_user`（依据 v0.60.0 `packages/core/src/code_assist/oauth2.ts` 的 `isAdcCredentials`：没有字符串 `type` 或为 `authorized_user` 时按个人 OAuth 登录处理，其他类型走服务账号等 ADC 路径）。只读 `type` 字段，从不读取或记录令牌；
+  - `~/.gemini` 下没有 `commands`、`skills`、`policies`、`agents` 目录，`extensions` 不存在或为空；没有 `~/.env`、`~/.gemini/.env`、`~/.agents`；
+  - 从运行目录（同时按原路径和真实路径）逐级向上直到根目录，不存在任何 `.env`、`.agents` 或除 `~/.gemini` 以外的 `.gemini` 目录（工作区的 Gemini 配置会在启动时运行 MCP 服务器，不会先请求权限）；没有运行目录时（工具清单核验）从家目录向上检查。只看是否存在，不解析内容。**带 `.env` 或 `.gemini` 的项目不能派发给 Gemini**；
+  - 不存在系统级配置目录（macOS `/Library/Application Support/GeminiCli`，Linux `/etc/gemini-cli`）；
+  - 配置里不设 `extra_args`。
+- **白名单环境与启动**：每次运行只取一次环境快照，核验用它；Gemini 子进程只拿到其中的 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`，其他变量（API key、Vertex/Cloud 项目、`CODE_ASSIST_ENDPOINT`、`GEMINI_CLI_HOME`、`GOOGLE_APPLICATION_CREDENTIALS`、代理和额外 CA 证书等）一律进不去；需要代理才能联网的环境会连不上，不会产生费用。每次启动前整套重查，并直接启动刚核验过的那个程序路径。客户端从不调用 ACP 的 `authenticate`。
 - **Cursor 的规则**：Cursor 套餐可能按用量计费，CLI 又没有可在派发前核验的信号，所以核验结论固定为 `cursor_billing_unverifiable`，门禁始终返回 `billing_unverified`。没有任何配置项能绕过；运行路径已实现，留待以后有可核验的信号再开放。
 - **权限**：客户端声明不提供文件系统和终端能力，智能体调用 `fs/*`、`terminal/*` 或其他未知方法一律回 `-32601`。权限请求先过本机规则，再按需问手机，只回答一次性选项（`allow_once` / `reject_once`），从不选「始终允许 / 始终拒绝」；没有手机审批通道（如本地队列）时一律拒绝，切换模式的请求直接拒绝。
 - **MCP 与日志**：智能体声明支持 http MCP 时，本次运行的 TimeTrace MCP 以 http 服务器 `timetrace` 随 `session/new` 交给它，令牌只在请求头里，不进命令行参数、环境变量和日志；不支持时不接入，并在日志注明。日志是可读的对话记录（请求、工具调用、计划、权限决定、智能体文本），令牌一律脱敏。续接优先 `session/resume`，其次 `session/load`（回放的历史不计入本轮）；都不支持时续接直接失败，不会悄悄开新会话。

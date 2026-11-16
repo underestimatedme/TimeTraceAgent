@@ -1,8 +1,8 @@
 """Gemini CLI and Cursor through the generic ACP client: capabilities, the zero-spend gate, the hermetic Gemini
-billing check and what a run sends. The agent is always tests/fake_acp_agent.py behind a wrapper script; no real
-Gemini CLI or Cursor is started and no model is called.
+billing check and what a run sends. The agent is always tests/fake_acp_agent.py behind a wrapper script installed
+as a fake @google/gemini-cli package; no real Gemini CLI or Cursor is started and no model is called.
 
-Only names that also exist at commit ec54723 are imported here, so the review regression tests below can be run
+Only names that also exist at commit 5de3679 are imported here, so the review regression tests below can be run
 against that commit to show they fail there."""
 import json
 import os
@@ -27,27 +27,50 @@ from timetrace.mcp_access import McpAccess
 
 FAKE = str(Path(__file__).with_name("fake_acp_agent.py"))
 TOKEN = "ttm_" + "Qa1Ws2Ed3Rf4Tg5Yh6Uj7Ik8"
-# The only user settings the gate accepts: personal Google login (current layout), paid AI credits explicitly off.
+# The only user settings the gate accepts: personal Google login, paid AI credits explicitly off, nothing else.
 PERSONAL = {"security": {"auth": {"selectedType": "oauth-personal"}}, "billing": {"overageStrategy": "never"}}
 API_KEY_LOGIN = {"security": {"auth": {"selectedType": "gemini-api-key"}}, "billing": {"overageStrategy": "never"}}
+# A cached personal login as Gemini CLI writes it (no `type` field); the values are dummies, never real tokens.
+PERSONAL_CREDS = {"access_token": "dummy-access", "refresh_token": "dummy-refresh", "token_type": "Bearer",
+                  "expiry_date": 1}
 ALLOWED = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ")
 
 
-def wrapper(directory: Path) -> str:
-    """An executable standing in for `gemini` / `cursor-agent`: it runs the fake agent with whatever arguments the
-    adapter passes. The fake's scenario and transcript paths are part of the script, because the Gemini child gets no
-    variable of the test's environment."""
-    path = directory / "agent-bin"
+def wrapper(path: Path, directory: Path) -> str:
+    """An executable standing in for the CLI: it runs the fake agent with whatever arguments the adapter passes. The
+    fake's scenario and transcript paths are part of the script, because the Gemini child gets no variable of the
+    test's environment."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('#!/bin/sh\nexec /usr/bin/env TT_ACP_SCENARIO="%s" TT_ACP_TRANSCRIPT="%s" "%s" "%s" "$@"\n'
                     % (directory / "scenario.json", directory / "transcript.jsonl", sys.executable, FAKE))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return str(path)
 
 
-def gemini_home(directory: Path, settings) -> Path:
-    """A home directory with Gemini user settings (a dict, or raw text)."""
+def gemini_package(root: Path, directory: Path, version="0.60.0", name="@google/gemini-cli") -> str:
+    """An npm-style install: root/lib/node_modules/@google/gemini-cli/{package.json,dist/index.js} and the
+    root/bin/gemini symlink to it. Returns the symlink."""
+    package = root / "lib" / "node_modules" / "@google" / "gemini-cli"
+    script = wrapper(package / "dist" / "index.js", directory)
+    (package / "package.json").write_text(json.dumps({"name": name, "version": version, "bin": {"gemini": "dist/index.js"}}))
+    link = root / "bin" / "gemini"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(script)
+    return str(link)
+
+
+def gemini_home(directory: Path, settings, creds=PERSONAL_CREDS) -> Path:
+    """A home directory with Gemini user settings (a dict, or raw text) and a cached login (None: none)."""
     (directory / ".gemini").mkdir(parents=True, exist_ok=True)
     (directory / ".gemini" / "settings.json").write_text(settings if isinstance(settings, str) else json.dumps(settings))
+    creds_file = directory / ".gemini" / "oauth_creds.json"
+    if creds is None:
+        if creds_file.exists():
+            creds_file.unlink()
+    else:
+        creds_file.write_text(creds if isinstance(creds, str) else json.dumps(creds))
     return directory
 
 
@@ -58,15 +81,17 @@ class AdapterCase(unittest.TestCase):
         self.d = Path(self.tmp.name).resolve()
         self.work = self.d / "worktree"
         (self.work / ".git").mkdir(parents=True)   # a worktree root, as the runner's are
-        self.bin = wrapper(self.d)
+        self.bin = gemini_package(self.d / "npm", self.d)
         self.transcript = self.d / "transcript.jsonl"
         self.log = str(self.d / "run.log")
-        self.no_system = str(self.d / "no-system" / "settings.json")
-        # The machine's own Gemini system files and variables never reach a test.
-        patcher = mock.patch.dict(billing.GEMINI_SYSTEM_SETTINGS, {
-            "darwin": str(self.d / "sys-darwin" / "settings.json"), "linux": str(self.d / "sys-linux" / "settings.json")})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The machine's own Gemini system configuration and variables never reach a test (create=True: these names
+        # differ between the commits the regression tests are run against).
+        for name, value in (("GEMINI_SYSTEM_DIRS", (str(self.d / "sys-darwin"), str(self.d / "sys-linux"))),
+                            ("GEMINI_SYSTEM_SETTINGS", {"darwin": str(self.d / "sys-darwin" / "settings.json"),
+                                                        "linux": str(self.d / "sys-linux" / "settings.json")})):
+            patcher = mock.patch.object(billing, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         env = mock.patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
@@ -96,16 +121,16 @@ class AdapterCase(unittest.TestCase):
     def snapshot(self, **extra):
         return dict({"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}, **extra)
 
-    def verdict(self, env=None, cfg=None, system=None, version=None):
-        if version is not None:
-            self.scenario({"version": version})
-        return verify_gemini(cfg or {"bin": self.bin}, env=self.snapshot() if env is None else env,
-                             system_settings_path=system or self.no_system, now=1.0)
+    def verdict(self, env=None, cfg=None):
+        return verify_gemini(cfg or {"bin": self.bin}, env=self.snapshot() if env is None else env, now=1.0)
 
     def assertReason(self, reason, **kwargs):
         verdict = self.verdict(**kwargs)
         self.assertFalse(verdict.verified, "verified, expected %s" % reason)
         self.assertEqual(verdict.reason, reason)
+
+    def problem(self, cwd=None):
+        return gemini_workspace_problem(str(cwd or self.work), env=self.snapshot(), binary=self.bin)
 
     def start(self, scenario, cfg=None, **kwargs):
         adapter = GeminiAdapter(dict({"bin": self.bin}, **(cfg or {})), billing=StaticBilling(True))
@@ -165,7 +190,22 @@ class GeminiRunTest(AdapterCase):
         text = self.received("session/prompt")[0]["params"]["prompt"][0]["text"]
         self.assertEqual(text, SAFETY_RULES + "\nfix it")
         self.assertNotIn("timetrace-drawn-id", self.transcript.read_text(), "the agent names its own sessions")
-        self.assertEqual(len(self.version_calls()), 1, "the version is checked right before the spawn")
+
+    def test_the_child_is_the_binary_found_on_the_snapshot_path(self):
+        seen = {}
+
+        class Recording:
+            def __init__(self, cmd, *args, **kwargs):
+                seen["cmd"], seen["base_env"] = cmd, kwargs["base_env"]
+
+            def run(self):
+                return AcpResult(stop_reason="end_turn", session_id="s")
+        os.environ["PATH"] = str(self.d / "npm" / "bin") + os.pathsep + os.environ.get("PATH", "")
+        adapter = GeminiAdapter({}, billing=StaticBilling(True))
+        with mock.patch("timetrace.adapters.acp.AcpSession", Recording):
+            self.assertTrue(adapter.start("p", str(self.work), "s", self.log).ok)
+        self.assertEqual(seen["cmd"], [self.bin, "--acp", "--skip-trust"])
+        self.assertEqual(seen["base_env"]["HOME"], str(self.home))
 
     def test_resume_sends_the_agents_session_back(self):
         adapter = GeminiAdapter({"bin": self.bin}, billing=StaticBilling(True))
@@ -198,6 +238,11 @@ class GeminiRunTest(AdapterCase):
         self.assertEqual(res.error, "billing_unverified: gemini_dotenv_present:%s" % (self.work / ".env"))
         self.assertEqual(self.records(), [], "nothing was spawned")
         self.assertIn("not started: billing_unverified", Path(self.log).read_text())
+
+    def test_extra_args_are_not_supported(self):
+        res = self.start({"turn": []}, cfg={"extra_args": ["--model", "x"]})
+        self.assertEqual(res.error, "billing_unverified: gemini_extra_args_unsupported")
+        self.assertReason("gemini_extra_args_unsupported", cfg={"bin": self.bin, "extra_args": ["-m", "x"]})
 
     def test_run_result_only_counts_an_end_turn_as_success(self):
         self.assertTrue(run_result(AcpResult(stop_reason="end_turn", exit_code=-15), None).ok)
@@ -258,30 +303,25 @@ class RunResultRedactionTest(unittest.TestCase):
                 self.assertNotIn(piece, error)
 
 
+
+
 class GeminiVerifierTest(AdapterCase):
     def test_the_exact_allow_conditions_verify(self):
         verdict = self.verdict()
         self.assertTrue(verdict.verified, verdict.reason)
         self.assertEqual((verdict.provider, verdict.auth_method), ("gemini", "oauth-personal"))
-        calls = self.version_calls()
-        self.assertEqual(len(calls), 1)
-        # Besides the allowlist: the wrapper's own two variables, what /bin/sh and the OS add, and LC_* (allowed;
-        # Python sets LC_CTYPE itself under a C locale).
-        extra = {name for name in calls[0]["env"] if not name.startswith("LC_")} - set(ALLOWED) - {
-            "TT_ACP_SCENARIO", "TT_ACP_TRANSCRIPT", "PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"}
-        self.assertEqual(extra, set(), "the version check runs with the hermetic environment")
 
-    def test_user_settings_must_say_exactly_personal_login_and_credits_never(self):
+    def test_user_settings_must_be_exactly_the_allowed_document(self):
         cases = (
             ({"billing": {"overageStrategy": "never"}}, "auth_type_unset"),
             (API_KEY_LOGIN, "auth_method_not_subscription:gemini-api-key"),
             (dict(PERSONAL, security={"auth": {"selectedType": "oauth-personal", "enforcedType": "oauth-personal"}}),
-             "auth_override_present:security.auth.enforcedType"),
-            (dict(PERSONAL, security={"auth": {"selectedType": "oauth-personal", "useExternal": False}}),
-             "auth_override_present:security.auth.useExternal"),
+             "settings_key_not_allowed:security.auth.enforcedType"),
+            (dict(PERSONAL, security={"auth": {"selectedType": "oauth-personal"}, "folderTrust": {}}),
+             "settings_key_not_allowed:security.folderTrust"),
             (dict(PERSONAL, billing={}), "billing_overage_unset"),
             (dict(PERSONAL, billing={"overageStrategy": "ask"}), "billing_overage_enabled:ask"),
-            (dict(PERSONAL, billing={"overageStrategy": "always"}), "billing_overage_enabled:always"),
+            (dict(PERSONAL, billing={"overageStrategy": "never", "x": 1}), "settings_key_not_allowed:billing.x"),
             ('{"security": {"auth": {"selectedType": "oauth-personal"}}, // a comment\n "billing": {}}',
              "settings_unreadable"),
             (["not", "an", "object"], "settings_unreadable"),
@@ -301,39 +341,12 @@ class GeminiVerifierTest(AdapterCase):
         verifier = GeminiAdapter({"bin": self.bin}).billing
         self.assertIsInstance(verifier, billing.BillingVerifier)
         self.assertTrue(verifier.verdict().verified, verifier.verdict().reason)
-        verifier.verdict()
-        self.assertEqual(len(self.version_calls()), 1, "cached between calls; the gate forces a fresh one")
-        verifier.verdict(force=True)
-        self.assertEqual(len(self.version_calls()), 2)
+        gemini_home(self.home, API_KEY_LOGIN)
+        self.assertTrue(verifier.verdict().verified, "cached between calls")
+        self.assertFalse(verifier.verdict(force=True).verified, "the gate forces a fresh one")
 
 
-class WorkspaceSettingsTest(AdapterCase):
-    def problem(self, **extra):
-        return gemini_workspace_problem(str(self.work), env=self.snapshot(**extra), binary=self.bin,
-                                        system_settings_path=self.no_system)
-
-    def test_workspace_settings_may_not_touch_security_billing_or_advanced(self):
-        self.assertEqual(self.problem(), "")
-        (self.work / ".gemini").mkdir()
-        settings = self.work / ".gemini" / "settings.json"
-        settings.write_text(json.dumps({"ui": {"theme": "dark"}}))
-        self.assertEqual(self.problem(), "")
-        for key in ("security", "billing", "advanced"):
-            with self.subTest(key=key):
-                settings.write_text(json.dumps({key: {}}))
-                self.assertEqual(self.problem(), "workspace_settings_override:" + key)
-        settings.write_text("{broken")
-        self.assertEqual(self.problem(), "workspace_settings_unreadable")
-
-    def test_a_subdirectory_run_checks_up_to_the_repository_root(self):
-        sub = self.work / "pkg" / "app"
-        sub.mkdir(parents=True)
-        (self.work / ".gemini").mkdir()
-        (self.work / ".gemini" / "settings.json").write_text(json.dumps({"billing": {"overageStrategy": "always"}}))
-        problem = gemini_workspace_problem(str(sub), env=self.snapshot(), binary=self.bin,
-                                           system_settings_path=self.no_system)
-        self.assertEqual(problem, "workspace_settings_override:billing")
-
+class SnapshotAndListsTest(AdapterCase):
     def test_gemini_billing_keys_are_listed_for_check_commands(self):
         keys = billing.billing_env_keys("gemini")
         for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
@@ -365,7 +378,7 @@ class SnapshotTest(AdapterCase):
         self.assertEqual(self.child_env()["HOME"], str(self.home), "the child runs with the HOME that was verified")
 
 
-# ---- third review (ec54723): each class reproduces one finding and fails on that commit -----------------------------
+# ---- third review (ec54723) findings, still refused ----------------------------------------------------------------
 
 class EnvironmentAllowlistTest(AdapterCase):
     """Finding 1: CODE_ASSIST_ENDPOINT (or any other variable) in the runner's environment reached the child."""
@@ -386,25 +399,18 @@ class EnvironmentAllowlistTest(AdapterCase):
         self.assertReason("gemini_dotenv_present:~/.env")
 
 
-class SystemSettingsTest(AdapterCase):
-    """Finding 2: a system settings file the CLI may skip (unsafe owner / permissions) could hide the user's own
-    "always"; any system settings or defaults file now refuses, whatever it says."""
-
-    def test_any_system_file_refuses(self):
-        gemini_home(self.home, dict(PERSONAL, billing={"overageStrategy": "always"}))
-        system = self.d / "admin" / "settings.json"
-        system.parent.mkdir()
-        system.write_text(json.dumps({"billing": {"overageStrategy": "never"}}))
-        self.assertReason("gemini_system_settings_present:%s" % system, system=str(system))
-        gemini_home(self.home, PERSONAL)
-        for name in ("settings.json", "system-defaults.json"):
-            with self.subTest(name=name):
-                for existing in (self.d / "sys-darwin").glob("*"):
-                    existing.unlink()
-                path = self.d / "sys-darwin" / name
-                path.parent.mkdir(exist_ok=True)
-                path.write_text("{}")
-                self.assertReason("gemini_system_settings_present:%s" % path)
+class SystemConfigTest(AdapterCase):
+    def test_any_system_configuration_refuses(self):
+        for platform_dir in ("sys-darwin", "sys-linux"):
+            for name in ("settings.json", "system-defaults.json", "policies"):
+                with self.subTest(platform=platform_dir, name=name):
+                    directory = self.d / platform_dir
+                    directory.mkdir(exist_ok=True)
+                    (directory / name).mkdir() if name == "policies" else (directory / name).write_text("{}")
+                    self.assertReason("gemini_system_config_present:%s" % directory)
+                    for child in directory.iterdir():
+                        child.rmdir() if child.is_dir() else child.unlink()
+                    directory.rmdir()
 
 
 class DotenvOverrideTest(AdapterCase):
@@ -422,29 +428,124 @@ class DotenvOverrideTest(AdapterCase):
 
 
 class DotenvParsingTest(AdapterCase):
-    """Finding 4: a multiline-quoted key the old parser read as empty, and the old top-level login key."""
-
     def test_any_dotenv_refuses_without_being_parsed(self):
         (self.home / ".env").write_text('GEMINI_API_KEY="\nAIzaSyNotARealKey000000000000000000000"\n')
         self.assertReason("gemini_dotenv_present:~/.env")
 
     def test_the_old_top_level_login_key_does_not_count(self):
         gemini_home(self.home, {"selectedAuthType": "oauth-personal", "billing": {"overageStrategy": "never"}})
-        self.assertReason("auth_type_unset")
+        self.assertReason("settings_key_not_allowed:selectedAuthType")
 
 
-class VersionPinTest(AdapterCase):
-    """Only the audited Gemini CLI 0.60.x is accepted."""
+# ---- fourth review (5de3679): each class reproduces one finding and fails on that commit ----------------------------
 
-    def test_only_a_plain_060_version_verifies(self):
-        for printed, reason in (("0.61.0", "gemini_version_unaudited:0.61.0"),
-                                ("0.59.9", "gemini_version_unaudited:0.59.9"),
-                                ("0.60.0-preview.1", "gemini_version_unaudited:unparsable"),
-                                ("Gemini CLI", "gemini_version_unaudited:unparsable")):
-            with self.subTest(printed=printed):
-                self.assertReason(reason, version=printed)
-        self.assertTrue(self.verdict(version="0.60.7").verified)
-        self.assertReason("gemini_version_unaudited:FileNotFoundError", cfg={"bin": str(self.d / "no-gemini")})
+class WorkspaceGeminiConfigTest(AdapterCase):
+    """Finding 1: a workspace .gemini (MCP servers start at launch, without a permission request) was allowed."""
+
+    def test_workspace_mcp_servers_never_start_the_agent(self):
+        (self.work / ".gemini").mkdir()
+        (self.work / ".gemini" / "settings.json").write_text(json.dumps(
+            {"mcpServers": {"x": {"command": "/bin/sh", "args": ["-c", "touch %s" % (self.d / "ran")]}}}))
+        res = self.start({"turn": []})
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "billing_unverified: gemini_workspace_config_present:%s" % (self.work / ".gemini"))
+        self.assertEqual(self.records(), [], "nothing was spawned")
+
+    def test_any_workspace_or_agent_configuration_on_the_way_up_refuses(self):
+        (self.work / ".gemini" / "commands").mkdir(parents=True)
+        self.assertEqual(self.problem(), "gemini_workspace_config_present:%s" % (self.work / ".gemini"))
+        (self.work / ".gemini" / "commands").rmdir()
+        (self.work / ".gemini").rmdir()
+        (self.d / ".agents" / "skills").mkdir(parents=True)
+        self.assertEqual(self.problem(), "gemini_agents_config_present:%s" % (self.d / ".agents"))
+
+
+class UserGeminiConfigTest(AdapterCase):
+    """Finding 1 (user side): only the allowed settings keys, no extensions / commands / skills / policies /
+    agents, no ~/.agents."""
+
+    def test_any_other_settings_key_refuses(self):
+        for key, value in (("mcpServers", {"x": {"command": "true"}}), ("tools", {}), ("hooks", {}),
+                           ("extensions", {}), ("context", {}), ("advanced", {}), ("model", {}), ("ui", {})):
+            with self.subTest(key=key):
+                gemini_home(self.home, dict(PERSONAL, **{key: value}))
+                self.assertReason("settings_key_not_allowed:" + key)
+
+    def test_user_extension_command_skill_policy_and_agent_directories_refuse(self):
+        (self.home / ".gemini" / "extensions").mkdir()
+        self.assertTrue(self.verdict().verified, "an empty extensions directory is fine")
+        (self.home / ".gemini" / "extensions" / "some-extension").mkdir()
+        self.assertReason("gemini_user_config_present:~/.gemini/extensions")
+        (self.home / ".gemini" / "extensions" / "some-extension").rmdir()
+        for name in ("commands", "skills", "policies", "agents"):
+            with self.subTest(name=name):
+                (self.home / ".gemini" / name).mkdir()
+                self.assertReason("gemini_user_config_present:~/.gemini/" + name)
+                (self.home / ".gemini" / name).rmdir()
+        (self.home / ".agents" / "skills").mkdir(parents=True)
+        self.assertReason("gemini_agents_config_present:~/.agents")
+
+
+class CredentialTypeTest(AdapterCase):
+    """Finding 2: only a personal cached login (no `type`, or "authorized_user") is accepted."""
+
+    def test_only_a_personal_cached_login_verifies(self):
+        for creds in (PERSONAL_CREDS, dict(PERSONAL_CREDS, type="authorized_user")):
+            with self.subTest(creds=creds.get("type")):
+                gemini_home(self.home, PERSONAL, creds)
+                self.assertTrue(self.verdict().verified, self.verdict().reason)
+        secret = "dummy-private-key-value"
+        for kind in ("service_account", "external_account", "impersonated_service_account"):
+            with self.subTest(kind=kind):
+                gemini_home(self.home, PERSONAL, {"type": kind, "private_key": secret})
+                verdict = self.verdict()
+                self.assertEqual(verdict.reason, "gemini_credentials_not_personal:" + kind)
+                self.assertNotIn(secret, json.dumps(verdict.__dict__))
+        gemini_home(self.home, PERSONAL, '{"refresh_token": "x", "expiry_date": NaN}')
+        self.assertReason("gemini_credentials_not_personal:unreadable")
+        gemini_home(self.home, PERSONAL, None)
+        self.assertReason("gemini_credentials_missing")
+
+
+class StaticVersionTest(AdapterCase):
+    """Finding 3: verification ran `gemini --version` (which loads settings, migrates and cleans up). The version is
+    now read from the package's package.json and nothing is run."""
+
+    def test_verification_runs_nothing(self):
+        self.assertTrue(self.verdict().verified)
+        self.assertTrue(self.problem() == "")
+        self.assertEqual(self.version_calls(), [], "no `--version` was run")
+
+    def test_the_version_comes_from_the_package_json(self):
+        self.scenario({"version": "0.60.0"})   # what `--version` would print: not consulted
+        for version, reason in (("0.61.0", "gemini_version_unaudited:0.61.0"),
+                                ("0.60.0-preview.1", "gemini_version_unaudited:0.60.0-preview.1"),
+                                ("0.59.9", "gemini_version_unaudited:0.59.9")):
+            with self.subTest(version=version):
+                self.assertReason(reason, cfg={"bin": gemini_package(self.d / "npm", self.d, version)})
+        self.assertReason("gemini_version_unknown:not_gemini_cli",
+                          cfg={"bin": gemini_package(self.d / "npm", self.d, name="@someone/else")})
+        self.assertTrue(self.verdict(cfg={"bin": gemini_package(self.d / "npm", self.d, "0.60.4")}).verified)
+        loose = wrapper(self.d / "loose" / "gemini", self.d)
+        self.assertReason("gemini_version_unknown:no_package_json", cfg={"bin": loose})
+        self.assertReason("gemini_version_unknown:not_found", cfg={"bin": "gemini"}, env=self.snapshot(PATH=str(self.d)))
+
+
+class WalkTest(AdapterCase):
+    """Non-blocking review items: real paths, strict JSON, and the home's ancestors without a run directory."""
+
+    def test_the_real_path_of_the_run_directory_is_walked_too(self):
+        real = self.d / "elsewhere" / "run"
+        (real / ".git").mkdir(parents=True)
+        (self.d / "elsewhere" / ".env").write_text("X=1\n")
+        link = self.d / "link-run"
+        link.symlink_to(real)
+        problem = gemini_workspace_problem(str(link), env=self.snapshot(), binary=self.bin)
+        self.assertEqual(problem, "gemini_dotenv_present:%s" % (self.d / "elsewhere" / ".env"))
+
+    def test_without_a_run_directory_the_homes_ancestors_are_checked(self):
+        (self.d / ".env").write_text("X=1\n")   # the home's parent
+        self.assertReason("gemini_dotenv_present:%s" % (self.d / ".env"))
 
 
 
