@@ -208,9 +208,10 @@ def safe_positional(prompt: str) -> str:
 
 
 def parse_stream(lines: List[str]) -> RunResult:
-    """Turn stream-json lines into a RunResult (exit_code left for the caller)."""
+    """Turn stream-json lines into a RunResult (exit_code left for the caller). Its usage covers these lines only: a
+    run's comes from every line it printed (ClaudeAdapter._result)."""
     res = RunResult()
-    tokens = _Tokens()
+    tokens = usage.ClaudeTokens()
     for raw in lines:
         raw = raw.strip()
         if not raw.startswith("{"):
@@ -231,55 +232,6 @@ def parse_stream(lines: List[str]) -> RunResult:
             res.session_id = msg["session_id"]
     res.usage = tokens.total()
     return res
-
-
-# The four counts of a `result` message's `usage`, in the contract's order (input excludes cache reads already).
-RESULT_USAGE = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-MODEL_USAGE = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
-
-
-class _Tokens:
-    """What one Claude process used. A `result` message's `usage` is per turn in a stream-json input session (one
-    result per message sent; Claude Code 2.1.325 documents it as the main loop's, per turn), so the results are added up.
-    The model is the one with the most tokens in the latest non-empty `modelUsage` (a running total), else the last
-    assistant message's, else the one the session started with."""
-
-    def __init__(self):
-        self.counts = [0, 0, 0, 0]
-        self.model_usage: Dict[str, Any] = {}
-        self.assistant_model = ""
-        self.init_model = ""
-
-    def add(self, msg: Dict[str, Any]) -> None:
-        mtype = msg.get("type")
-        if mtype == "result":
-            reported = msg.get("usage")
-            if isinstance(reported, dict):
-                for i, key in enumerate(RESULT_USAGE):
-                    self.counts[i] += usage.count(reported.get(key))
-            if isinstance(msg.get("modelUsage"), dict) and msg["modelUsage"]:
-                self.model_usage = msg["modelUsage"]
-        elif mtype == "assistant":
-            message = msg.get("message")
-            name = message.get("model") if isinstance(message, dict) else None
-            if isinstance(name, str) and name.strip() and name.strip() != "<synthetic>":
-                self.assistant_model = name.strip()
-        elif mtype == "system" and msg.get("subtype") == "init":
-            if isinstance(msg.get("model"), str) and msg["model"].strip():
-                self.init_model = msg["model"].strip()
-
-    def model(self) -> str:
-        best, most = "", 0
-        for name, entry in self.model_usage.items():
-            if not (isinstance(name, str) and name.strip() and isinstance(entry, dict)):
-                continue
-            total = sum(usage.count(entry.get(key)) for key in MODEL_USAGE)
-            if total > most:
-                best, most = name.strip(), total
-        return best or self.assistant_model or self.init_model
-
-    def total(self) -> Optional[Dict[str, Any]]:
-        return usage.make(self.model(), *self.counts)
 
 
 def _apply_rate_limit(info: Dict[str, Any], res: RunResult) -> None:
@@ -456,11 +408,13 @@ class ClaudeAdapter(ToolAdapter):
                 if mcp is not None:
                     config = write_mcp_config(os.path.dirname(os.path.abspath(log_file)), mcp)
                     cmd += ["--mcp-config", config, "--allowedTools", MCP_ALLOWED_TOOLS]
+                tokens = usage.ClaudeTokens()
                 code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                          timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                          cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE),
-                                         env=mcp.env() if mcp is not None else None, confirm_session=session_id)
-                result = self._result(code, lines, "")
+                                         env=mcp.env() if mcp is not None else None, confirm_session=session_id,
+                                         on_message=tokens.add)
+                result = self._result(code, lines, "", tokens)
                 if result.session_id != session_id:
                     result.ok = False
                     result.session_id = None
@@ -554,20 +508,26 @@ class ClaudeAdapter(ToolAdapter):
                     cancel_event, control, env: Optional[Dict[str, str]] = None) -> RunResult:
         # Time spent waiting for a permission decision does not count
         # toward timeout_seconds (the session pauses its clock).
+        tokens = usage.ClaudeTokens()
         code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                  timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                 cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env)
-        return self._result(code, lines, session_id)
+                                 cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env,
+                                 on_message=tokens.add)
+        return self._result(code, lines, session_id, tokens)
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None,
              env: Optional[Dict[str, str]] = None) -> RunResult:
+        tokens = usage.ClaudeTokens()
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                                    cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env)
-        return self._result(code, lines, session_id)
+                                    cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env,
+                                    on_line=tokens.feed)
+        return self._result(code, lines, session_id, tokens)
 
     @staticmethod
-    def _result(code: int, lines: List[str], session_id: str) -> RunResult:
+    def _result(code: int, lines: List[str], session_id: str, tokens: usage.ClaudeTokens) -> RunResult:
+        """`lines` are only the last ones the run printed; what it used comes from `tokens`, which saw them all."""
         res = parse_stream(lines)
+        res.usage = tokens.total()
         res.exit_code = code
         res.session_id = res.session_id or session_id
         if code != 0 and not res.blocked and res.ok:

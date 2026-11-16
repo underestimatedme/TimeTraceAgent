@@ -310,11 +310,12 @@ def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] 
     """`codex exec --json` lines → RunResult. `turn.completed.usage` is the thread's running total (Codex sets it from
     the last token-usage update, whose `total` includes what a resumed thread had saved), so the run used the last one
     minus `start`: the thread's totals before the run (ZERO for a new thread, None when they are not known for certain,
-    which reports no usage). The model is one an event names, else `model` (the configured one)."""
+    which reports no usage). The model is one an event names, else `model` (the configured one). Its usage covers
+    these lines only: a run's comes from every line it printed (CodexAdapter._run)."""
     res = RunResult()
     saw_turn_completed = False
     saw_failure = False
-    reported = []
+    tokens = usage.CodexTokens(start, model)
     for raw in lines:
         raw = raw.strip()
         if not raw.startswith("{"):
@@ -326,14 +327,11 @@ def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] 
         if not isinstance(msg, dict):
             continue
         t = msg.get("type", "")
-        if isinstance(msg.get("model"), str) and msg["model"].strip():
-            model = msg["model"]
+        tokens.add(msg)
         if t == "thread.started":
             res.session_id = msg.get("thread_id") or res.session_id
         elif t == "turn.completed":
             saw_turn_completed = True
-            # Every turn.completed counts, one without a whole total too: the last one is where the run ended.
-            reported.append(usage.codex_totals(msg.get("usage")))
         elif t in ("error", "turn.failed"):
             saw_failure = True
             err = msg.get("error") if isinstance(msg.get("error"), dict) else msg
@@ -348,8 +346,7 @@ def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] 
     res.ok = saw_turn_completed and not saw_failure and not res.blocked
     if res.blocked:
         res.ok = False
-    # Every total must be certain and none may be below the one before it, the starting totals included.
-    res.usage = usage.codex_run_used(start, reported, model)
+    res.usage = tokens.total()
     return res
 
 
@@ -673,10 +670,13 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             start = None  # never a reason for a run to fail: it only reports no usage
         watch = ThreadWatch()
+        # The lines handed back are only the last ones: what the run used is kept from every line as it is read.
+        tokens = usage.CodexTokens(start, str(self.cfg.get("model") or ""))
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                     cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env,
-                                    on_line=watch)
+                                    on_line=usage.watchers(watch, tokens.feed))
         res = parse_exec(lines, model=str(self.cfg.get("model") or ""), start=start)
+        res.usage = tokens.total()
         # Every Codex exec run (task, resume, folder, chat, review, plan, import) passes here.
         res.session_id = watch.thread_id or res.session_id
         res.exit_code = code

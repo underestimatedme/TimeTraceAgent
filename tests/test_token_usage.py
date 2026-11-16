@@ -17,6 +17,7 @@ from timetrace.adapters import claude, codex
 from timetrace.adapters.codex_interactive import CodexTurn
 from timetrace.billing import StaticBilling
 from timetrace.models import RunResult
+from timetrace.process import MAX_CAPTURED_LINES
 import tests.test_chat_turn as chat_turn
 from tests.test_chat_turn import ChatAdapter, ChatCloud
 from tests.test_codex_interactive import Host
@@ -29,6 +30,22 @@ ZERO = (0, 0, 0, 0)  # a new thread's running totals (timetrace.usage.ZERO)
 
 def lines(name):
     return (FIXTURES / name).read_text(encoding="utf-8").splitlines()
+
+
+def printed(output, on_line=None, on_message=None):
+    """What run_streaming / run_stream do with a run's output lines: every one goes to the watchers as it is read
+    (`on_line` raw, `on_message` decoded), then the lines are handed back."""
+    for line in output:
+        if on_line is not None:
+            on_line(line)
+        if on_message is not None:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict):
+                on_message(msg)
+    return 0, list(output)
 
 
 def tokens(model, i, o, r, w):
@@ -122,9 +139,9 @@ class ClaudeUsageTest(unittest.TestCase):
         """Each Claude run path (print mode, stream-json input, work session) through its real result handling."""
         seen = {}
 
-        def fake(cmd, *args, **kwargs):
+        def fake(cmd, *args, on_line=None, on_message=None, **kwargs):
             seen["cmd"] = cmd
-            return 0, result_lines(cmd)
+            return printed(result_lines(cmd), on_line, on_message)
         with patch.object(claude, "run_streaming", fake), patch.object(claude, "run_stream", fake):
             adapter = claude.ClaudeAdapter({"bin": "claude"}, billing=object(), credentials=lambda: {})
             return call(adapter), seen["cmd"]
@@ -371,9 +388,9 @@ class CodexThreadTotalsTest(unittest.TestCase):
             write_rollout(home, THREAD, [TURN, token_count(16000, 12000, 1000)])
             seen = []
 
-            def fake(cmd, cwd, log, **kwargs):
+            def fake(cmd, cwd, log, on_line=None, **kwargs):
                 seen.append(cmd)
-                return 0, lines("codex_exec_cached.jsonl")
+                return printed(lines("codex_exec_cached.jsonl"), on_line)
             adapter = codex.CodexAdapter({"bin": "codex", "model": "gpt-6.1-sol"}, billing=StaticBilling(True))
             log = str(Path(home) / "run.log")
             with patch.dict(os.environ, {"CODEX_HOME": home}), patch.object(codex, "run_streaming", fake), \
@@ -404,11 +421,98 @@ class CodexThreadTotalsTest(unittest.TestCase):
                                                                     "output_tokens": 30}})
             adapter = codex.CodexAdapter({"bin": "codex"}, billing=StaticBilling(True))
             with patch.dict(os.environ, {"CODEX_HOME": home}), \
-                    patch.object(codex, "run_streaming", lambda *a, **k: (0, [ended])), \
+                    patch.object(codex, "run_streaming", lambda *a, on_line=None, **k: printed([ended], on_line)), \
                     patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
                 res = adapter.resume("go", home, THREAD, str(Path(home) / "run.log"))
             self.assertTrue(res.ok)
             self.assertIsNone(res.usage)
+
+
+LONG = 10_000 + 50  # more output lines than a run hands back (timetrace.process.MAX_CAPTURED_LINES)
+
+
+def tool(path, output):
+    """An executable stand-in for a tool binary that prints `output` (objects, one JSON line each) and exits 0."""
+    data = path.with_name(path.name + ".out")
+    data.write_text("".join(json.dumps(o) + "\n" for o in output))
+    path.write_text("#!%s\nimport sys\nsys.stdout.write(open(%r).read())\n" % (sys.executable, str(data)))
+    path.chmod(0o700)
+    return str(path)
+
+
+def codex_turn(inputs, cached, output):
+    return {"type": "turn.completed", "usage": {"input_tokens": inputs, "cached_input_tokens": cached,
+                                                "output_tokens": output}}
+
+
+ORDINARY = [{"type": "item.completed", "item": {"id": "i%d" % i, "type": "reasoning", "text": "x"}} for i in range(LONG)]
+
+
+class LongOutputUsageTest(unittest.TestCase):
+    """What a run used never depends on the last lines it hands back: kept while every line is read, through the real
+    run_streaming (_tee) and the real stream-json reader."""
+
+    def test_codex_baseline_check_sees_a_total_more_than_the_kept_lines_ago(self):
+        self.assertGreater(LONG, MAX_CAPTURED_LINES)
+        with tempfile.TemporaryDirectory() as home:
+            write_rollout(home, THREAD, [TURN, token_count(2000, 1000, 90)])
+            started = {"type": "thread.started", "thread_id": THREAD}
+            adapter = codex.CodexAdapter({"bin": "", "timeout_seconds": 60}, billing=StaticBilling(True))
+            log = str(Path(home) / "run.log")
+            with patch.dict(os.environ, {"CODEX_HOME": home}), \
+                    patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
+                # Baseline (2000, 1000, 0, 90), then 1000/400/50 below it, LONG lines, then 2500/1400/100.
+                adapter.cfg["bin"] = tool(Path(home) / "codex", [started, codex_turn(1000, 400, 50)] + ORDINARY
+                                          + [codex_turn(2500, 1400, 100)])
+                below = adapter.resume("go", home, THREAD, log)
+                self.assertTrue(below.ok, below.error)
+                self.assertIsNone(below.usage)  # not 100 / 10 / 400 from the kept tail alone
+                # The same with a first total that fits: the last total minus the baseline.
+                adapter.cfg["bin"] = tool(Path(home) / "codex2", [started, codex_turn(2200, 1100, 95)] + ORDINARY
+                                          + [codex_turn(2500, 1400, 100)])
+                self.assertEqual(adapter.resume("go", home, THREAD, log).usage, tokens("", 100, 10, 400, 0))
+
+    def test_codex_total_going_down_more_than_the_kept_lines_apart(self):
+        with tempfile.TemporaryDirectory() as home:
+            adapter = codex.CodexAdapter({"bin": tool(Path(home) / "codex", [codex_turn(900, 300, 45)] + ORDINARY
+                                                      + [codex_turn(800, 300, 45)]), "timeout_seconds": 60},
+                                         billing=StaticBilling(True))
+            with patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
+                res = adapter.start("go", home, "s", str(Path(home) / "run.log"))
+            self.assertTrue(res.ok, res.error)
+            self.assertIsNone(res.usage)
+
+    def test_claude_print_mode_adds_a_result_more_than_the_kept_lines_ago(self):
+        def result(text, inputs, output):
+            return {"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": "s",
+                    "usage": {"input_tokens": inputs, "output_tokens": output}}
+        events = [{"type": "stream_event", "event": {"i": i}} for i in range(LONG)]
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_bin = tool(Path(tmp) / "claude", [result("one", 100, 10)] + events + [result("two", 20, 5)])
+            adapter = claude.ClaudeAdapter({"bin": claude_bin, "timeout_seconds": 60}, billing=object(),
+                                           credentials=lambda: {})
+            res = adapter.start("go", tmp, str(uuid.uuid4()), str(Path(tmp) / "run.log"))
+            self.assertTrue(res.ok, res.error)
+            self.assertEqual(res.output, "two")
+            self.assertEqual(res.usage, tokens("", 120, 15, 0, 0))  # not 20 / 5
+
+    def test_claude_stream_reader_adds_a_result_more_than_the_kept_lines_ago(self):
+        from tests.test_claude_stream import FAKE, Recorder
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario = Path(tmp) / "scenario.json"
+            scenario.write_text(json.dumps({"turns": [[
+                {"result": "one", "usage": {"input_tokens": 100, "output_tokens": 10}},
+                {"lines": LONG},
+                {"result": "two", "usage": {"input_tokens": 20, "output_tokens": 5}}]]}))
+            fake = Path(tmp) / "claude"
+            fake.write_text("#!" + sys.executable + "\n" + Path(FAKE).read_text())
+            fake.chmod(0o700)
+            adapter = claude.ClaudeAdapter({"bin": str(fake), "timeout_seconds": 60}, billing=object(),
+                                           credentials=lambda: {})
+            with patch.dict(os.environ, {"TT_FAKE_SCENARIO": str(scenario)}):
+                res = adapter.start("go", tmp, str(uuid.uuid4()), str(Path(tmp) / "run.log"), control=Recorder())
+            self.assertEqual(res.output, "two")
+            self.assertEqual(res.usage, tokens("", 120, 15, 0, 0))  # not 20 / 5
 
 
 class CodexAppServerUsageTest(unittest.TestCase):

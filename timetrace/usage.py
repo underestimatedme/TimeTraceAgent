@@ -5,6 +5,7 @@ reads not included), output, cache read, cache write - and the model name. Valle
 a count above 1e12 or a model name over 64 characters, so every value made here is bounded; a run that reported nothing
 (or only zeros) has no usage at all rather than an empty one. Numbers and a model name are not secret: no redaction.
 """
+import json
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -114,6 +115,141 @@ def codex_run_used(start: Optional[Totals], reported: List[Optional[Totals]], mo
     if not all(grows(a, b) for a, b in zip(chain, chain[1:])):
         return None
     return codex_used(reported[-1], start, model)
+
+
+# ---- kept while the output is read --------------------------------------------------------------------------------
+# A run hands back only the last lines of its output (timetrace.process.MAX_CAPTURED_LINES), so what it used is kept
+# from every line as it is read, never parsed from what is left. A watcher that fails on a line has missed it: it then
+# reports no usage at all.
+
+def _json_line(line: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(line, str):
+        return None
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+# The four counts of a Claude `result` message's `usage`, in the contract's order (input excludes cache reads already),
+# and of one model in its `modelUsage`.
+CLAUDE_RESULT = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+CLAUDE_MODEL_USAGE = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+
+
+class ClaudeTokens:
+    """What one Claude process used. A `result` message's `usage` is per turn in a stream-json input session (one
+    result per message sent; Claude Code 2.1.325 documents it as the main loop's, per turn), so every result is added
+    up. The model is the one with the most tokens in the latest non-empty `modelUsage` (a running total), else the last
+    assistant message's, else the one the session started with."""
+
+    def __init__(self):
+        self.counts = [0, 0, 0, 0]
+        self.model_usage: Dict[str, Any] = {}
+        self.assistant_model = ""
+        self.init_model = ""
+        self.broken = False
+
+    def feed(self, line: str) -> None:
+        """One raw stdout line (run_streaming's `on_line`)."""
+        try:
+            msg = _json_line(line) if isinstance(line, str) and ('"result"' in line or '"assistant"' in line or '"init"' in line) else None
+        except Exception:
+            self.broken = True
+            return
+        if msg is not None:
+            self.add(msg)
+
+    def add(self, msg: Any) -> None:
+        """One decoded stdout message (the stream-json reader's)."""
+        try:
+            self._add(msg)
+        except Exception:
+            self.broken = True
+
+    def _add(self, msg: Any) -> None:
+        if not isinstance(msg, dict):
+            return
+        kind = msg.get("type")
+        if kind == "result":
+            reported = msg.get("usage")
+            if isinstance(reported, dict):
+                for i, key in enumerate(CLAUDE_RESULT):
+                    self.counts[i] += count(reported.get(key))
+            if isinstance(msg.get("modelUsage"), dict) and msg["modelUsage"]:
+                self.model_usage = msg["modelUsage"]
+        elif kind == "assistant":
+            message = msg.get("message")
+            name = message.get("model") if isinstance(message, dict) else None
+            if isinstance(name, str) and name.strip() and name.strip() != "<synthetic>":
+                self.assistant_model = name.strip()
+        elif kind == "system" and msg.get("subtype") == "init":
+            if isinstance(msg.get("model"), str) and msg["model"].strip():
+                self.init_model = msg["model"].strip()
+
+    def model(self) -> str:
+        best, most = "", 0
+        for name, entry in self.model_usage.items():
+            if not (isinstance(name, str) and name.strip() and isinstance(entry, dict)):
+                continue
+            tokens = sum(count(entry.get(key)) for key in CLAUDE_MODEL_USAGE)
+            if tokens > most:
+                best, most = name.strip(), tokens
+        return best or self.assistant_model or self.init_model
+
+    def total(self) -> Optional[Dict[str, Any]]:
+        return None if self.broken else make(self.model(), *self.counts)
+
+
+class CodexTokens:
+    """What one `codex exec --json` run used: the last `turn.completed` total minus `start` (the thread's totals before
+    the run: ZERO for a new thread, None when not known for certain), every total in between checked as one chain
+    (timetrace.usage.codex_run_used). The model is the last one an event names, else `model` (the configured one)."""
+
+    def __init__(self, start: Optional[Totals] = ZERO, model: str = ""):
+        self.start, self.model = start, model
+        self.reported: List[Optional[Totals]] = []
+        self.broken = False
+
+    def feed(self, line: str) -> None:
+        """One raw stdout line (run_streaming's `on_line`)."""
+        try:
+            msg = _json_line(line) if isinstance(line, str) and ('"turn.completed"' in line or '"model"' in line) else None
+        except Exception:
+            self.broken = True
+            return
+        if msg is not None:
+            self.add(msg)
+
+    def add(self, msg: Any) -> None:
+        try:
+            if not isinstance(msg, dict):
+                return
+            if isinstance(msg.get("model"), str) and msg["model"].strip():
+                self.model = msg["model"]
+            if msg.get("type") == "turn.completed":
+                # Every turn.completed counts, one without a whole total too: the last one is where the run ended.
+                self.reported.append(codex_totals(msg.get("usage")))
+        except Exception:
+            self.broken = True
+
+    def total(self) -> Optional[Dict[str, Any]]:
+        return None if self.broken else codex_run_used(self.start, self.reported, self.model)
+
+
+def watchers(*callbacks):
+    """One `on_line` for several watchers: each sees every line, whatever another one does with it."""
+    def on_line(line):
+        for callback in callbacks:
+            try:
+                callback(line)
+            except Exception:
+                pass
+    return on_line
 
 
 def attach(event: Dict[str, Any], result: Any) -> Dict[str, Any]:

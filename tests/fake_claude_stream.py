@@ -23,7 +23,8 @@ Each user message runs the next turn (the last one repeats). Steps:
   {"cancel_permission": {"tool": …, "input": …}}     ask, then cancel the request
   {"sleep": seconds}
   {"rate_limit": {...rate_limit_info...}}
-  {"result": "text", "is_error": false, "subtype": "success"}
+  {"result": "text", "is_error": false, "subtype": "success", "usage": {...}}   ("usage" optional)
+  {"lines": n}                                       n ordinary output lines (stream events)
 Everything received, the argv and each permission answer are appended to
 $TT_FAKE_TRANSCRIPT as JSON lines. EOF on stdin ends the process once the
 queued turns are done.
@@ -142,14 +143,21 @@ def main():
                 record({"decision": {"tool": ask["tool"], "reply": reply}})
                 emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
                     {"type": "text", "text": "permission %s" % reply.get("response", {}).get("behavior")}]}})
+            elif "lines" in step:
+                for i in range(int(step["lines"])):
+                    sys.stdout.write(json.dumps({"type": "stream_event", "session_id": session, "event": {"i": i}}) + "\n")
+                sys.stdout.flush()
             elif "rate_limit" in step:
                 emit({"type": "rate_limit_event", "session_id": session, "rate_limit_info": step["rate_limit"]})
             elif "result" in step:
                 emit({"type": "assistant", "session_id": session, "message": {"role": "assistant", "content": [
                     {"type": "text", "text": step["result"]}]}})
-                emit({"type": "result", "subtype": step.get("subtype", "success"),
-                      "is_error": bool(step.get("is_error", False)), "result": step["result"],
-                      "session_id": session, "api_error_status": step.get("api_error_status")})
+                result = {"type": "result", "subtype": step.get("subtype", "success"),
+                          "is_error": bool(step.get("is_error", False)), "result": step["result"],
+                          "session_id": session, "api_error_status": step.get("api_error_status")}
+                if "usage" in step:
+                    result["usage"] = step["usage"]
+                emit(result)
     sys.exit(int(scenario.get("exit_code", 0)))
 
 
