@@ -169,15 +169,14 @@ class CodexTurn:
     def _token_usage(self, params):
         """Each update carries the thread's running totals. One for an earlier turn, before this turn reported any, is
         the App Server replaying what a resumed thread had saved (the starting point); this turn's last is where it
-        ended. A total that is not whole, an earlier turn's after this one's, or one that goes down is a conflict."""
+        ended. A total that is not whole or an earlier turn's after this one's is a conflict (one that goes down is
+        caught by turn_usage, against the starting totals too)."""
         token_usage = params.get("tokenUsage")
         totals = usage.codex_totals(token_usage.get("total") if isinstance(token_usage, dict) else None,
                                     usage.CODEX_CAMEL)
         if totals is None:
             self.usage_conflict = True
         elif self.turn_id and params.get("turnId") == self.turn_id:
-            if self.turn_totals and not usage.grows(self.turn_totals[-1], totals):
-                self.usage_conflict = True
             self.turn_totals.append(totals)
         elif self.turn_totals:
             self.usage_conflict = True
@@ -186,7 +185,8 @@ class CodexTurn:
 
     def turn_usage(self):
         """What this turn used; None when it reported nothing, when where it began is not certain (no saved or replayed
-        totals for a resumed thread, two different replays, a replay that disagrees with the rollout) or on a conflict."""
+        totals for a resumed thread, two different replays, a replay that disagrees with the rollout), on a conflict,
+        or when any of its totals is below the one before it, the starting totals included."""
         if self.usage_conflict or not self.turn_totals or len(self.replayed) > 1:
             return None
         start = self.saved_totals
@@ -194,7 +194,7 @@ class CodexTurn:
             if start is not None and start != self.replayed[0]:
                 return None
             start = self.replayed[0]
-        return usage.codex_used(self.turn_totals[-1], start, self.model)
+        return usage.codex_run_used(start, self.turn_totals, self.model)
 
     def _reply(self, item):
         if (not isinstance(item, dict) or item.get("type") != "agentMessage"

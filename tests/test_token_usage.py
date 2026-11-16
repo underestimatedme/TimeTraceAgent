@@ -206,6 +206,30 @@ class CodexUsageTest(unittest.TestCase):
         self.assertIsNone(run(first, {"input_tokens": 2600, "cached_input_tokens": 1.5, "output_tokens": 95}).usage)
         self.assertIsNone(run({"input_tokens": 2000, "output_tokens": 90}).usage)
 
+    def test_a_total_below_the_starting_totals_at_any_point_is_no_usage(self):
+        """Baseline (2000 incl. cached, 1000 cached, 0, 90), then 1000/400/50 and 2500/1400/100: the first update is
+        below where the run began, so no share of it can be told (not input 100, output 10, cache read 400)."""
+        events = [{"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}},
+                  {"type": "turn.completed", "usage": {"input_tokens": 2500, "cached_input_tokens": 1400, "output_tokens": 100}}]
+        res = codex.parse_exec([json.dumps(e) for e in events], start=(2000, 1000, 0, 90))
+        self.assertTrue(res.ok)
+        self.assertIsNone(res.usage)
+        # Below in one field only (output) is enough.
+        res = codex.parse_exec([json.dumps(events[1])], start=(2000, 1000, 0, 101))
+        self.assertIsNone(res.usage)
+        self.assertEqual(codex.parse_exec([json.dumps(events[1])], start=(2000, 1000, 0, 90)).usage,
+                         tokens("", 100, 10, 400, 0))
+
+    def test_the_last_turn_completed_without_a_whole_total_is_no_usage(self):
+        """900/300/45, then a turn.completed with no usage: the run's end total is unknown (not 945)."""
+        first = {"type": "turn.completed", "usage": {"input_tokens": 900, "cached_input_tokens": 300, "output_tokens": 45}}
+        for last in ({"type": "turn.completed"}, {"type": "turn.completed", "usage": None},
+                     {"type": "turn.completed", "usage": {"input_tokens": 950}}):
+            res = codex.parse_exec([json.dumps(first), json.dumps(last)])
+            self.assertTrue(res.ok, last)
+            self.assertIsNone(res.usage, last)
+        self.assertEqual(codex.parse_exec([json.dumps(first)]).usage, tokens("", 600, 45, 300, 0))
+
     def test_missing_or_garbage_usage_is_none_and_never_fails_the_run(self):
         for reported in ("lots", None, {"input_tokens": "1200", "output_tokens": -5}, {}):
             event = {"type": "turn.completed"}
@@ -458,6 +482,11 @@ class CodexAppServerUsageTest(unittest.TestCase):
         check("an earlier turn's totals after this turn's", None, ("tu", 900, 300, 40), ("earlier", 500, 200, 30))
         check("this turn's totals going down", ZERO, ("tu", 900, 300, 40), ("tu", 800, 300, 40))
         check("ending below the replay", None, ("earlier", 1000, 200, 30), ("tu", 900, 300, 40))
+        # Baseline (2000, 1000, 0, 90), updates 1000/400/50 then 2500/1400/100: the first is below the baseline.
+        check("an update below the rollout's totals", (2000, 1000, 0, 90), ("tu", 1000, 400, 50), ("tu", 2500, 1400, 100))
+        check("an update below the replayed totals", None, ("earlier", 2000, 1000, 90), ("tu", 1000, 400, 50),
+              ("tu", 2500, 1400, 100))
+        check("one field below the baseline", (2000, 1000, 0, 101), ("tu", 2500, 1400, 100))
         for garbage in ("x", {"total": [1]}, {"total": {"inputTokens": "9", "cachedInputTokens": 0, "outputTokens": 1}}):
             turn = self.turn()
             self.update(turn, "tu", 900, 300, 40)

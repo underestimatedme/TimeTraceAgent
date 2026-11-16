@@ -6,7 +6,7 @@ a count above 1e12 or a model name over 64 characters, so every value made here 
 (or only zeros) has no usage at all rather than an empty one. Numbers and a model name are not secret: no redaction.
 """
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 MODEL_CHARS = 64
 MAX_COUNT = 10 ** 12
@@ -102,6 +102,18 @@ def codex_used(end: Optional[Totals], start: Optional[Totals], model: Any) -> Op
 def grows(earlier: Totals, later: Totals) -> bool:
     """Running totals never go down."""
     return all(b >= a for a, b in zip(earlier, later))
+
+
+def codex_run_used(start: Optional[Totals], reported: List[Optional[Totals]], model: Any) -> Optional[Dict[str, Any]]:
+    """What one Codex run used from `start` (the thread's totals before it) and every running total it reported, in
+    order: the last one minus `start`. None when `start` is unknown, when the last report (or any) has no whole total,
+    or when any total is below the one before it - `start` included - in any field."""
+    if start is None or not reported or None in reported:
+        return None
+    chain = [start] + list(reported)
+    if not all(grows(a, b) for a, b in zip(chain, chain[1:])):
+        return None
+    return codex_used(reported[-1], start, model)
 
 
 def attach(event: Dict[str, Any], result: Any) -> Dict[str, Any]:

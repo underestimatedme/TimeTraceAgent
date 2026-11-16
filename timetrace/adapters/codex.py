@@ -332,8 +332,8 @@ def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] 
             res.session_id = msg.get("thread_id") or res.session_id
         elif t == "turn.completed":
             saw_turn_completed = True
-            if "usage" in msg:
-                reported.append(usage.codex_totals(msg["usage"]))
+            # Every turn.completed counts, one without a whole total too: the last one is where the run ended.
+            reported.append(usage.codex_totals(msg.get("usage")))
         elif t in ("error", "turn.failed"):
             saw_failure = True
             err = msg.get("error") if isinstance(msg.get("error"), dict) else msg
@@ -348,9 +348,8 @@ def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] 
     res.ok = saw_turn_completed and not saw_failure and not res.blocked
     if res.blocked:
         res.ok = False
-    # Every total must be certain and none may go down; otherwise this run's share cannot be told.
-    if reported and None not in reported and all(usage.grows(a, b) for a, b in zip(reported, reported[1:])):
-        res.usage = usage.codex_used(reported[-1], start, model)
+    # Every total must be certain and none may be below the one before it, the starting totals included.
+    res.usage = usage.codex_run_used(start, reported, model)
     return res
 
 
