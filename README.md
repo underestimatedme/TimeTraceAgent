@@ -401,6 +401,8 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | --- | --- | --- |
 | Claude Code | `claude auth status` 报告 `loggedIn=true`、`authMethod=claude.ai`、`apiProvider=firstParty` 且有 `subscriptionType` | `timetrace/billing.py: verify_claude` |
 | Codex | `codex login status` 报告 `Logged in using ChatGPT`，且 `~/.codex/auth.json` 的 `auth_mode=chatgpt`、无 `OPENAI_API_KEY` | `timetrace/billing.py: verify_codex` |
+| Gemini CLI（ACP） | 永不通过（`gemini_billing_unverifiable`），待真实安装审计 | `timetrace/adapters/gemini.py` |
+| Cursor（ACP） | 永不通过（`cursor_billing_unverifiable`） | `timetrace/adapters/cursor.py` |
 
 另外两条对两个工具都生效：
 
@@ -466,6 +468,26 @@ timetrace statusline --uninstall   # 移除；原来有自己的状态栏时原�
 | 执行 | `claude -p --output-format stream-json --session-id <uuid>` | `codex exec --json -s workspace-write -C <worktree>` |
 | 续接 | `claude -p --resume <session_id>` | `codex exec resume <thread_id>` |
 | 撞限流 | `rate_limit_info.status == rejected` 或 HTTP 429 | JSONL `error` 事件含 "usage limit"，退出码 1；重置时间取自 app-server |
+
+## Gemini CLI 与 Cursor：通过 ACP 运行，但永不派发
+
+Runner 可以用 Agent Client Protocol（ACP：JSON-RPC 2.0，经标准输入输出逐行传递）驱动 Gemini CLI 和 Cursor。两者共用一个只依赖 Python 标准库的客户端（`timetrace/acp_client.py`），启动命令沿用 Codeg 项目的固定写法：Gemini CLI（≥0.60）为 `gemini --acp --skip-trust`，Cursor 为 `cursor-agent acp`。
+
+在 `~/.timetrace/config.json` 写入配置段即可登记，例如 `"gemini": {"bin": "gemini"}`、`"cursor": {"bin": "cursor-agent"}`（可选 `extra_args`、`timeout_seconds`，缺省 3600 秒）；`timetrace agent doctor` 会显示找到的路径、启动命令和核验结论。两者的 ACP 运行在技术上可用，但 **TimeTrace 从不给 Gemini 或 Cursor 派发任务**：两个适配器的核验结论固定为未通过（`gemini_billing_unverifiable`、`cursor_billing_unverifiable`），门禁在任何配置下都返回 `billing_unverified`，启动和续接一样。没有配置项或构造参数能改变这一点。原因是无法核验零付费和凭据隔离：
+
+- **Cursor**：套餐可能按用量计费，CLI 没有可在派发前核验的信号。
+- **Gemini**：经过四轮审查，每一轮都发现 CLI 会自行加载并执行、或可能改变计费的东西。以后若要开放，需要在真实安装上审计并覆盖这些点：
+  - 会执行的配置：工作区和上级目录的 `.gemini`（设置里的 MCP 服务器在启动时就运行，不先请求权限）、`.agents`、`.env`；用户的 `~/.gemini/settings.json` 中除登录和计费外的所有键（`mcpServers`、`tools`、`hooks`、`extensions` 等），以及 `~/.gemini` 下的 `extensions`、`commands`、`skills`、`policies`、`agents`；系统级 `/Library/Application Support/GeminiCli`（含 system-defaults 与 policies）；
+  - 计费：`security.auth.selectedType` 必须是个人登录，`billing.overageStrategy` 默认 `ask`，未能从源码证明 ACP 下不会动用付费 AI 点数；
+  - 凭据类型：`~/.gemini/oauth_creds.json` 中非 `authorized_user` 的类型走服务账号等 ADC 路径；
+  - MCP OAuth 令牌缓存：`~/.gemini/mcp-oauth-tokens.json` 按 MCP 服务器名（包括 `timetrace`）读取缓存令牌，并可能向缓存里的第三方 tokenUrl 刷新；
+  - PATH 与 `node` 解析、版本：`#!/usr/bin/env node` 脚本会按 PATH 找 `node`，版本要固定到审计过的那一版，且不能靠运行 `gemini --version` 获取（它会先加载设置、迁移并清理目录）。
+
+保留下来的通用加固对两者都生效：每次运行只取一次环境快照，子进程只拿到其中的 `PATH`（只保留绝对路径项）、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`；程序按这份 PATH 解析一次，并以其绝对真实路径启动；令牌只放在发给智能体的 `session/new`、`session/resume`、`session/load` 请求中 MCP 服务器条目的请求头里，不进命令行参数、环境变量和日志；智能体返回的会话 ID 必须是保守的格式且不含令牌，否则不保留。客户端从不调用 ACP 的 `authenticate`。
+
+- **权限**：客户端声明不提供文件系统和终端能力，智能体调用 `fs/*`、`terminal/*` 或其他未知方法一律回 `-32601`。权限请求先过本机规则，再按需问手机，只回答一次性选项（`allow_once` / `reject_once`），从不选「始终允许 / 始终拒绝」；没有手机审批通道（如本地队列）时一律拒绝，切换模式的请求直接拒绝。
+- **日志**：可读的对话记录（请求、工具调用、计划、权限决定、智能体文本），每路输出各自缓冲、整段脱敏后才写入；向智能体写入经独立线程，智能体不读输入也不会卡住超时、取消和清理。续接优先 `session/resume`，其次 `session/load`（回放的历史不计入本轮）；都不支持时续接直接失败，不会悄悄开新会话。
+- **验证范围**：协议行为只用测试里的模拟智能体（`tests/fake_acp_agent.py`）验证过，这台电脑没有用真实的 Gemini CLI 或 Cursor 跑过上述启动命令。
 
 ## 开发
 

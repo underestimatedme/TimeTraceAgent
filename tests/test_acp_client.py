@@ -1,0 +1,629 @@
+"""Probe tests: the generic ACP client against a fake agent (tests/fake_acp_agent.py) that speaks ACP v1 as the
+official schema describes it. No real Gemini CLI or Cursor is ever started."""
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from timetrace import process
+from timetrace.acp_client import AcpSession, choose_option, host_request
+from timetrace.billing import billing_env_keys
+from timetrace.dispatch import DispatchDenied
+from timetrace.mcp_access import McpAccess
+from timetrace.redact import redact
+
+FAKE = str(Path(__file__).with_name("fake_acp_agent.py"))
+TOKEN = "ttm_" + "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2"
+MCP_URL = "https://valley.example.test/timetrace/mcp"
+OPTIONS = [
+    {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+    {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+    {"optionId": "never", "name": "Never allow", "kind": "reject_always"},
+    {"optionId": "no", "name": "Reject", "kind": "reject_once"},
+]
+EDIT_CALL = {"toolCallId": "call-1", "title": "Edit app.py", "kind": "edit", "status": "pending",
+             "locations": [{"path": "app.py"}],
+             "rawInput": {"file_path": "app.py", "old_string": "a", "new_string": "b"}}
+
+
+class Host:
+    """Answers every permission prompt with `behavior`, optionally after waiting `delay` seconds (or until the
+    client withdraws the prompt)."""
+
+    def __init__(self, behavior="allow", delay=0.0, fail=False):
+        self.behavior, self.delay, self.fail = behavior, delay, fail
+        self.requests, self.withdrawn = [], []
+
+    def permission(self, request, cancelled):
+        self.requests.append(request)
+        if self.fail:
+            raise RuntimeError("host exploded")
+        if self.delay and cancelled.wait(self.delay):
+            self.withdrawn.append(request)
+            return {"behavior": "deny", "message": "withdrawn"}
+        return {"behavior": self.behavior}
+
+
+class AcpCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name).resolve()
+        self.transcript = self.d / "transcript.jsonl"
+        self.log = self.d / "run.log"
+
+    def run_session(self, scenario, prompt="do it", cmd=None, environ=None, **kwargs):
+        path = self.d / "scenario.json"
+        path.write_text(json.dumps(scenario))
+        env = {"TT_ACP_SCENARIO": str(path), "TT_ACP_TRANSCRIPT": str(self.transcript)}
+        env.update(environ or {})
+        with patch.dict(os.environ, env):
+            return AcpSession(cmd or [sys.executable, FAKE], str(self.d), str(self.log), prompt, **kwargs).run()
+
+    def records(self):
+        if not self.transcript.exists():
+            return []
+        return [json.loads(line) for line in self.transcript.read_text().splitlines() if line.strip()]
+
+    def received(self, method=None):
+        return [r["received"] for r in self.records()
+                if "received" in r and (method is None or r["received"].get("method") == method)]
+
+    def answers(self, method=None):
+        return [r["answer"]["response"] for r in self.records()
+                if "answer" in r and (method is None or r["answer"]["method"] == method)]
+
+    def log_text(self):
+        return self.log.read_text()
+
+
+class NormalTurnTest(AcpCase):
+    def test_a_turn_is_initialize_new_session_and_one_prompt_and_its_updates_become_the_result(self):
+        plan = {"sessionUpdate": "plan", "entries": [
+            {"content": "read the code", "priority": "high", "status": "completed"},
+            {"content": "write the fix", "priority": "high", "status": "in_progress"}]}
+        result = self.run_session({"turn": [
+            {"thought": "Let me look.\n"},
+            {"chunk": "Looking at the code.\n"},
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read app.py", "kind": "read",
+                        "status": "pending"}},
+            {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}},
+            {"update": plan},
+            {"update": {"sessionUpdate": "available_commands_update", "availableCommands": []}},
+            {"update": {"sessionUpdate": "a_variant_from_a_later_schema", "whatever": 1}},
+            {"chunk": "Done: "}, {"chunk": "all good."},
+            {"update": {"sessionUpdate": "usage_update", "used": 1200, "size": 200000}},
+        ]}, prompt="fix the bug")
+        self.assertIsNone(result.error)
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(result.session_id, "fake-session-1")
+        self.assertEqual(result.text, "Looking at the code.\nDone: all good.")
+        self.assertEqual(result.last_message, "Done: all good.", "the answer after the last tool call")
+        self.assertEqual(result.tool_calls, 1)
+        self.assertEqual([e["status"] for e in result.plan], ["completed", "in_progress"])
+        self.assertEqual(result.usage, {"used": 1200, "size": 200000})
+        self.assertEqual(result.exit_code, 0)
+
+        init = self.received("initialize")[0]
+        self.assertEqual(init["jsonrpc"], "2.0")
+        self.assertEqual(init["params"]["protocolVersion"], 1)
+        self.assertEqual(init["params"]["clientCapabilities"],
+                         {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False})
+        self.assertEqual(init["params"]["clientInfo"]["name"], "timetrace")
+        new = self.received("session/new")[0]["params"]
+        self.assertEqual(new, {"cwd": str(self.d), "mcpServers": []})
+        prompt = self.received("session/prompt")[0]["params"]
+        self.assertEqual(prompt, {"sessionId": "fake-session-1", "prompt": [{"type": "text", "text": "fix the bug"}]})
+        self.assertEqual(self.received("authenticate"), [], "the client never picks an auth method")
+
+        log = self.log_text()
+        for expected in ("-> initialize", "<- session/new: session fake-session-1", "[thought] Let me look.",
+                         "\nLooking at the code.\n", "[tool] read: Read app.py (pending)", "[tool] Read app.py: completed",
+                         "[plan] [x] read the code | [>] write the fix", "\nDone: all good.\n",
+                         "<- session/prompt: stopReason end_turn", "[usage] used 1200 of 200000 tokens",
+                         "--- exit 0 ---"):
+            self.assertIn(expected, log)
+        self.assertTrue(log.startswith("$ "))
+
+    def test_stderr_and_a_stray_stdout_line_are_shown_but_never_acted_on(self):
+        result = self.run_session({"garbage_first": True, "turn": [
+            {"stderr": "debug: warming up"}, {"garbage": "{not json either"}, {"chunk": "ok"}]})
+        self.assertEqual((result.error, result.stop_reason, result.text), (None, "end_turn", "ok"))
+        log = self.log_text()
+        self.assertIn("[stdout] this is not JSON", log)
+        self.assertIn("[stdout] {not json either", log)
+        self.assertIn("[stderr] debug: warming up", log)
+        self.assertIn("2 non-JSON stdout line(s) ignored", log)
+
+
+class PermissionTest(AcpCase):
+    def turn(self, options=None, tool_call=None):
+        return {"turn": [{"permission": {"toolCall": tool_call or EDIT_CALL, "options": options or OPTIONS}},
+                         {"chunk": "after"}]}
+
+    def outcome(self):
+        return self.answers("session/request_permission")[0]["result"]["outcome"]
+
+    def test_the_host_decides_and_the_answer_is_a_one_time_option(self):
+        host = Host("allow")
+        self.run_session(self.turn(), host=host)
+        self.assertEqual(self.outcome(), {"outcome": "selected", "optionId": "once"})
+        request = host.requests[0]
+        self.assertEqual((request["tool_name"], request["input"], request["require_phone"]),
+                         ("Edit", {"file_path": "app.py"}, False))
+        self.assertEqual(request["title"], "Edit app.py")
+        self.assertIn("[permission] Edit app.py -> once (host)", self.log_text())
+
+    def test_a_denial_is_reject_once(self):
+        self.run_session(self.turn(), host=Host("deny"))
+        self.assertEqual(self.outcome(), {"outcome": "selected", "optionId": "no"})
+
+    def test_without_a_host_or_with_a_broken_one_every_prompt_is_rejected_once(self):
+        for host in (None, Host(fail=True)):
+            with self.subTest(host=host):
+                if self.transcript.exists():
+                    self.transcript.unlink()
+                self.run_session(self.turn(), host=host)
+                self.assertEqual(self.outcome(), {"outcome": "selected", "optionId": "no"})
+
+    def test_an_always_option_is_never_chosen(self):
+        lasting = [o for o in OPTIONS if o["kind"].endswith("_always")]
+        for behavior in ("allow", "deny"):
+            with self.subTest(behavior=behavior):
+                if self.transcript.exists():
+                    self.transcript.unlink()
+                self.run_session(self.turn(options=lasting), host=Host(behavior))
+                # Only lasting options on offer: neither is taken, the prompt is withdrawn instead.
+                self.assertEqual(self.outcome(), {"outcome": "cancelled"})
+        for allow in (True, False):
+            for subset in ([OPTIONS[0], OPTIONS[3]], [OPTIONS[2], OPTIONS[1]], OPTIONS, OPTIONS[::-1]):
+                chosen = choose_option(subset, allow).get("optionId")
+                self.assertNotIn(chosen, ("always", "never"))
+
+    def test_a_mode_switch_is_refused_without_asking_anyone(self):
+        host = Host("allow")
+        self.run_session(self.turn(tool_call={"toolCallId": "m", "title": "Switch to auto-accept", "kind": "switch_mode"}),
+                         host=host)
+        self.assertEqual(host.requests, [])
+        self.assertEqual(self.outcome(), {"outcome": "selected", "optionId": "no"})
+
+    def test_time_spent_waiting_for_a_decision_does_not_count_toward_the_timeout(self):
+        result = self.run_session(self.turn(), host=Host("allow", delay=1.5), timeout=1.0)
+        self.assertEqual((result.error, result.stop_reason), (None, "end_turn"))
+
+    def test_tool_calls_are_described_in_the_rule_tables_words(self):
+        root = str(self.d)
+        bash = host_request({"kind": "execute", "title": "ls", "rawInput": {"command": "ls -la"}}, root)
+        self.assertEqual((bash["tool_name"], bash["input"], bash["require_phone"]), ("Bash", {"command": "ls -la"}, False))
+        here = host_request({"kind": "execute", "rawInput": {"command": "ls", "dir_path": "."}}, root)
+        self.assertFalse(here["require_phone"])
+        elsewhere = host_request({"kind": "execute", "rawInput": {"command": "cat x", "dir_path": "/etc"}}, root)
+        self.assertTrue(elsewhere["require_phone"], "relative paths of a command run elsewhere cannot be judged")
+        subdir = host_request({"kind": "execute", "rawInput": {"command": "cat ../../x", "dir_path": "src/a"}}, root)
+        self.assertTrue(subdir["require_phone"])
+        read = host_request({"kind": "read", "rawInput": {"file_path": "a.py"}}, root)
+        self.assertEqual((read["tool_name"], read["require_phone"]), ("Read", True))
+        many = host_request({"kind": "edit", "locations": [{"path": p} for p in "abcd"]}, root)
+        self.assertEqual((many["input"], many["require_phone"]),
+                         ({"file_path": "a", "path": "b", "notebook_path": "c"}, True))
+        delete = host_request({"kind": "delete", "rawInput": {"path": "a.py"}}, root)
+        self.assertEqual((delete["tool_name"], delete["require_phone"]), ("Edit", True))
+        unknown = host_request({"kind": "other", "title": "get_task (timetrace)", "rawInput": {"id": 3}}, root)
+        self.assertEqual((unknown["tool_name"], unknown["input"]), ("acp:other", {"id": 3, "title": "get_task (timetrace)"}))
+        no_command = host_request({"kind": "execute", "title": "Shell"}, root)
+        self.assertEqual(no_command["tool_name"], "acp:execute")
+        self.assertIsNone(host_request({"kind": "switch_mode"}, root))
+
+    def test_the_rule_table_refuses_a_write_outside_the_worktree_and_allows_one_inside(self):
+        from timetrace import approvals
+        root = str(self.d)
+        inside = host_request(EDIT_CALL, root)
+        self.assertEqual(approvals.evaluate(inside["tool_name"], inside["input"], root).action, approvals.ALLOW)
+        outside = host_request(dict(EDIT_CALL, locations=[{"path": "/etc/hosts"}], rawInput={}), root)
+        self.assertEqual(approvals.evaluate(outside["tool_name"], outside["input"], root).action, approvals.DENY)
+        push = host_request({"kind": "execute", "rawInput": {"command": "git push origin main"}}, root)
+        self.assertEqual(approvals.evaluate(push["tool_name"], push["input"], root).action, approvals.DENY)
+
+
+class RefusedRequestsTest(AcpCase):
+    def test_fs_terminal_and_unknown_requests_are_method_not_found(self):
+        result = self.run_session({"turn": [
+            {"request": {"method": "fs/read_text_file", "params": {"path": str(self.d / "x"), "sessionId": "s"}}},
+            {"request": {"method": "terminal/create", "params": {"command": "ls"}}},
+            {"request": {"method": "_vendor/something", "params": {}}},
+            {"chunk": "still fine"}]})
+        self.assertEqual((result.error, result.text), (None, "still fine"))
+        errors = [a["error"]["code"] for a in self.answers()]
+        self.assertEqual(errors, [-32601, -32601, -32601])
+        self.assertIn("refused fs/read_text_file (this client advertises no fs capability)", self.log_text())
+
+
+class ResumeTest(AcpCase):
+    REPLAY = [{"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "earlier ask"}},
+              {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "earlier answer"}},
+              {"sessionUpdate": "tool_call", "toolCallId": "old", "title": "old edit", "kind": "edit"}]
+
+    def test_load_replays_history_that_is_not_counted_as_this_turn(self):
+        result = self.run_session({"initialize": {"loadSession": True}, "replay": self.REPLAY,
+                                   "turn": [{"chunk": "continuing"}]}, session_id="sess-9")
+        self.assertEqual(self.received("session/new"), [])
+        load = self.received("session/load")[0]["params"]
+        self.assertEqual(load, {"sessionId": "sess-9", "cwd": str(self.d), "mcpServers": []})
+        self.assertEqual((result.session_id, result.text, result.tool_calls), ("sess-9", "continuing", 0))
+        self.assertIn("3 earlier updates replayed", self.log_text())
+        self.assertNotIn("earlier answer", self.log_text())
+
+    def test_resume_is_preferred_when_offered(self):
+        result = self.run_session({"initialize": {"loadSession": True, "resume": True}, "turn": [{"chunk": "x"}]},
+                                  session_id="sess-9")
+        self.assertEqual(len(self.received("session/resume")), 1)
+        self.assertEqual(self.received("session/load"), [])
+        self.assertEqual((result.error, result.session_id), (None, "sess-9"))
+
+    def test_an_agent_that_cannot_resume_fails_and_never_starts_a_new_session(self):
+        result = self.run_session({"turn": [{"chunk": "x"}]}, session_id="sess-9")
+        self.assertTrue(result.error.startswith("resume_unsupported"))
+        self.assertIsNone(result.session_id)
+        self.assertEqual(self.received("session/new") + self.received("session/prompt"), [])
+
+
+class CancelTest(AcpCase):
+    def test_a_cancel_mid_turn_sends_session_cancel_and_ends_the_group(self):
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        started = time.monotonic()
+        result = self.run_session({"turn": [{"chunk": "working"}, {"wait_cancel": 20}]}, cancel_event=cancel)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(len(self.received("session/cancel")), 1)
+        self.assertEqual(self.received("session/cancel")[0]["params"], {"sessionId": "fake-session-1"})
+        self.assertTrue(result.cancelled)
+        self.assertEqual((result.error, result.stop_reason, result.text), ("cancelled", "cancelled", "working"))
+
+    def test_the_queue_stop_request_is_bounded_and_reports_the_signal(self):
+        stop = process.StopRequest()
+        threading.Timer(0.5, stop.request, args=("SIGTERM",)).start()
+        result = self.run_session({"turn": [{"wait_cancel": 20}]}, cancel_event=stop)
+        self.assertTrue(stop.tool_signalled)
+        self.assertEqual(result.error, "cancelled")
+        self.assertIn("stop requested (SIGTERM): signalling the agent's process group", self.log_text())
+        self.assertIn("--- exit", self.log_text())
+
+    def test_an_open_permission_prompt_is_withdrawn_on_cancel(self):
+        cancel = threading.Event()
+        host = Host("allow", delay=20)
+        threading.Timer(0.5, cancel.set).start()
+        result = self.run_session({"turn": [{"permission": {"toolCall": EDIT_CALL, "options": OPTIONS}},
+                                            {"wait_cancel": 20}]}, host=host, cancel_event=cancel)
+        self.assertEqual(self.answers("session/request_permission")[0]["result"]["outcome"], {"outcome": "cancelled"})
+        self.assertEqual(len(host.withdrawn), 1, "the host stopped waiting")
+        self.assertEqual(result.stop_reason, "cancelled")
+
+    def test_the_timeout_cancels_and_stops_an_agent_that_does_not_answer(self):
+        started = time.monotonic()
+        result = self.run_session({"turn": [{"sleep": 30}]}, timeout=1.0)
+        self.assertLess(time.monotonic() - started, 9)
+        self.assertTrue(result.cancelled)
+        self.assertEqual((result.error, result.stop_reason), ("timed out after 1s", ""))
+        self.assertIn("timeout: stopping the agent's process group", self.log_text())
+
+    def test_an_already_cancelled_run_never_spawns(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(DispatchDenied):
+            self.run_session({"turn": []}, cancel_event=cancel)
+        self.assertEqual(self.records(), [])
+
+
+class FailureTest(AcpCase):
+    def test_a_crash_mid_turn_is_an_error_with_the_exit_code(self):
+        result = self.run_session({"turn": [{"chunk": "partial"}, {"crash": 3}]})
+        self.assertIn("closed its output before answering session/prompt", result.error)
+        self.assertEqual((result.failed_method, result.exit_code, result.text), ("session/prompt", 3, "partial"))
+
+    def test_a_slow_initialize_times_out_and_the_agent_is_stopped(self):
+        started = time.monotonic()
+        result = self.run_session({"initialize": {"delay": 30}}, request_timeout=0.5)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(result.error, "initialize: no answer within 0.5s")
+        self.assertEqual(self.received("session/new"), [])
+        self.assertIsNotNone(result.exit_code)
+
+    def test_another_protocol_version_is_refused(self):
+        result = self.run_session({"initialize": {"protocolVersion": 2}})
+        self.assertIn("speaks ACP protocol 2", result.error)
+        self.assertEqual(self.received("session/new"), [])
+
+    def test_an_agent_that_wants_authentication_is_never_authenticated_for_the_user(self):
+        result = self.run_session({"new_session": {"error": {"code": -32000, "message": "Authentication required"}}})
+        self.assertEqual(result.error, "session/new failed (-32000): Authentication required")
+        self.assertEqual(self.received("authenticate"), [])
+
+    def test_a_missing_binary_is_an_error_not_an_exception(self):
+        result = self.run_session({}, cmd=[str(self.d / "no-such-agent"), "--acp"])
+        self.assertEqual((result.exit_code, result.failed_method), (127, "spawn"))
+        self.assertIn("could not start no-such-agent", result.error)
+
+    def test_whatever_the_agent_started_is_killed_with_its_group(self):
+        result = self.run_session({"spawn_child": True, "ignore_eof": True, "turn": [{"chunk": "x"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertLess(result.exit_code, 0, "an agent that stays after EOF is stopped by a signal")
+        child = next(r["child"] for r in self.records() if "child" in r)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.05)
+        else:
+            self.fail("the agent's child is still running")
+
+
+class SecretsTest(AcpCase):
+    def access(self):
+        return McpAccess(url=MCP_URL, token=TOKEN, expires_at=time.time() + 600)
+
+    def test_the_mcp_token_travels_only_inside_the_protocol(self):
+        result = self.run_session({"initialize": {"mcpHttp": True}, "env_probe": ["TIMETRACE_MCP_TOKEN"],
+                                   "turn": [{"chunk": "I can see " + TOKEN + " here\n"}]}, mcp=self.access())
+        servers = self.received("session/new")[0]["params"]["mcpServers"]
+        self.assertEqual(servers, [{"type": "http", "name": "timetrace", "url": MCP_URL,
+                                    "headers": [{"name": "Authorization", "value": "Bearer " + TOKEN}]}])
+        self.assertTrue(result.mcp_attached)
+        argv = next(r["argv"] for r in self.records() if "argv" in r)
+        self.assertNotIn(TOKEN, json.dumps(argv))
+        env = next(r["env"] for r in self.records() if "env" in r)
+        self.assertIsNone(env["TIMETRACE_MCP_TOKEN"], "the token is not in the agent's environment")
+        log = self.log_text()
+        self.assertNotIn(TOKEN, log)
+        self.assertNotIn("Bearer", log, "a header value is never written")
+        self.assertIn("mcp: timetrace attached (http, %s)" % MCP_URL, log)
+        self.assertNotIn(TOKEN, result.text)
+
+    def test_an_agent_without_http_mcp_runs_without_it(self):
+        result = self.run_session({"turn": [{"chunk": "x"}]}, mcp=self.access())
+        self.assertEqual(self.received("session/new")[0]["params"]["mcpServers"], [])
+        self.assertFalse(result.mcp_attached)
+        self.assertIn("mcp: skipped (the agent does not advertise http MCP servers)", self.log_text())
+        self.assertNotIn(TOKEN, self.transcript.read_text())
+
+    def test_billing_variables_never_reach_the_agent(self):
+        leak = {"GEMINI_API_KEY": "g", "GOOGLE_API_KEY": "k", "GOOGLE_GENAI_USE_VERTEXAI": "true",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/sa.json", "GOOGLE_CLOUD_PROJECT": "p", "TT_ACP_KEEP": "1"}
+        self.run_session({"env_probe": sorted(leak), "turn": []}, environ=leak,
+                         drop_env=billing_env_keys("gemini"))
+        env = next(r["env"] for r in self.records() if "env" in r)
+        self.assertEqual({k: v for k, v in env.items() if v is not None}, {"TT_ACP_KEEP": "1"})
+
+
+
+class BlockedWriteTest(AcpCase):
+    """Review blocker 3: an agent that stops reading stdin must not hold the run. Each run is driven from a thread;
+    if it is still blocked after the bound, the test stops the agent's group itself (so it never hangs) and fails."""
+
+    def run_bounded(self, bound, **kwargs):
+        spawned, outcome = [], {}
+        real_popen = subprocess.Popen
+
+        def popen(*args, **kw):
+            proc = real_popen(*args, **kw)
+            spawned.append(proc)
+            return proc
+
+        def target():
+            outcome["result"] = self.run_session({"stop_reading_after": "session/new", "turn": [{"chunk": "x"}]},
+                                                 prompt="p" * (1024 * 1024), **kwargs)
+        with patch("timetrace.acp_client.subprocess.Popen", popen):
+            started = time.monotonic()
+            worker = threading.Thread(target=target, daemon=True)
+            worker.start()
+            worker.join(bound)
+            blocked = worker.is_alive()
+            elapsed = time.monotonic() - started
+            if blocked:
+                for proc in spawned:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                worker.join(10)
+        self.assertFalse(blocked, "the run was still blocked writing the prompt after %ss" % bound)
+        return outcome["result"], elapsed
+
+    def test_the_timeout_ends_a_run_whose_agent_stopped_reading(self):
+        result, elapsed = self.run_bounded(10, timeout=0.5)
+        self.assertLess(elapsed, 10)
+        self.assertEqual(result.error, "timed out after 0.5s")
+        self.assertTrue(result.cancelled)
+
+    def test_a_cancel_ends_a_run_whose_agent_stopped_reading(self):
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        result, _ = self.run_bounded(10, cancel_event=cancel)
+        self.assertEqual(result.error, "cancelled")
+
+
+class RedactionTest(AcpCase):
+    """Review blocker 4: agent-supplied text is masked whole before it is cut, wherever it goes."""
+
+    def leaks(self, text):
+        return [piece for piece in (TOKEN, TOKEN[:10]) if piece in text]
+
+    def test_a_token_in_an_error_message_never_reaches_the_error_or_the_log(self):
+        for message in ("upstream said " + TOKEN,                      # whole, short
+                        "e" * 280 + " " + TOKEN + " and more"):      # straddling the 300-character cut
+            with self.subTest(length=len(message)):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.run_session({"turn": [{"error": {"code": -32603, "message": message}}]})
+                self.assertTrue(result.error.startswith("session/prompt failed (-32603)"))
+                self.assertEqual(self.leaks(result.error), [])
+                self.assertEqual(self.leaks(redact(result.error)), [])
+                self.assertEqual(self.leaks(self.log_text()), [])
+
+    def test_a_token_in_a_tool_title_or_a_stray_line_is_masked_before_the_cut(self):
+        title = "t" * 280 + " " + TOKEN
+        self.run_session({"turn": [
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": title, "kind": "other"}},
+            {"garbage": "g" * 290 + " " + TOKEN},
+            {"chunk": "ok"}]})
+        self.assertEqual(self.leaks(self.log_text()), [])
+
+
+
+# ---- second review (d8f1d62): each of these fails on that commit ----------------------------------------------------
+
+LONG_TOKEN = "ttm_" + "Ab1-Cd2_" * 8   # 68 characters: long enough that either half of a split is a 20-character run
+
+
+def token_runs(text):
+    """Every 20-character run of LONG_TOKEN found in `text` (a fragment long enough to matter)."""
+    return [LONG_TOKEN[i:i + 20] for i in range(len(LONG_TOKEN) - 19) if LONG_TOKEN[i:i + 20] in text]
+
+
+class TokenFragmentTest(AcpCase):
+    def assertNowhere(self, result):
+        from timetrace.adapters.acp import run_result
+        for where, text in (("log", self.log_text()), ("text", result.text), ("last_message", result.last_message),
+                            ("RunResult.output", run_result(result, None).output)):
+            self.assertEqual(token_runs(text), [], where)
+
+    def test_a_token_at_the_trim_point_of_the_kept_text_never_leaves_a_fragment(self):
+        from timetrace.acp_client import MAX_TEXT_CHARS
+        total = 2 * MAX_TEXT_CHARS + 100            # one chunk long enough to be trimmed...
+        start = MAX_TEXT_CHARS + 90                 # ...with the trim point 10 characters into the token
+        chunk = "a" * start + LONG_TOKEN + "b" * (total - start - len(LONG_TOKEN))
+        result = self.run_session({"turn": [{"chunk": chunk}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertNowhere(result)
+
+    def test_a_token_across_a_forced_log_flush_never_leaves_a_fragment(self):
+        result = self.run_session({"turn": [{"chunk": "a" * 70000 + LONG_TOKEN[:34]},
+                                            {"chunk": LONG_TOKEN[34:] + " done\n"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertNowhere(result)
+
+    def test_a_string_error_code_is_masked_too(self):
+        result = self.run_session({"turn": [{"error": {"code": "E-" + LONG_TOKEN, "message": "bad"}}]})
+        self.assertEqual(token_runs(result.error), [])
+        self.assertEqual(token_runs(self.log_text()), [])
+
+    def test_an_unknown_stop_reason_is_reported_as_other(self):
+        result = self.run_session({"turn": [{"stop": "custom " + LONG_TOKEN}]})
+        self.assertEqual(result.stop_reason, "other")
+        self.assertEqual(token_runs(self.log_text()), [])
+        known = self.run_session({"turn": [{"stop": "max_turn_requests"}]})
+        self.assertEqual(known.stop_reason, "max_turn_requests")
+
+
+
+# ---- third review (ec54723): fails on that commit ------------------------------------------------------------------
+
+class InterleavedStreamsTest(AcpCase):
+    """Finding 5: a [stderr] line arriving in the middle of a message ended the message's pending text and wrote the
+    token's first characters, then the rest. Streams now keep their own pending text."""
+
+    def test_a_stderr_line_between_two_pieces_of_a_token_never_splits_it(self):
+        from timetrace.redact import masking
+        with masking([LONG_TOKEN]):
+            result = self.run_session({"turn": [
+                {"chunk": "key: " + LONG_TOKEN[:19]},
+                {"sleep": 0.3},
+                {"stderr": "warning: something unrelated"},
+                {"sleep": 0.3},
+                {"chunk": LONG_TOKEN[19:] + " end\n"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        log = self.log_text()
+        self.assertIn("[stderr] warning: something unrelated", log)
+        runs = [LONG_TOKEN[i:i + 12] for i in range(len(LONG_TOKEN) - 11) if LONG_TOKEN[i:i + 12] in log]
+        self.assertEqual(runs, [], "no 12-character run of the token in the log")
+        self.assertIn("key: [REDACTED:timetrace] end", log)
+
+
+
+# ---- review of af043e1: each fails on that commit -------------------------------------------------------------------
+
+def fragments(text, size=12):
+    return [LONG_TOKEN[i:i + size] for i in range(len(LONG_TOKEN) - size + 1) if LONG_TOKEN[i:i + size] in text]
+
+
+class SessionIdTest(AcpCase):
+    """An agent's sessionId reaches results and checkpoints: one holding a token, or of any odd shape, is refused."""
+
+    def test_a_session_id_that_holds_a_token_is_never_kept(self):
+        from timetrace.adapters.acp import run_result
+        for session in (LONG_TOKEN, "s-" + LONG_TOKEN, "has space", "a/b", "x" * 129, ""):
+            with self.subTest(session=session[:20]):
+                if self.transcript.exists():
+                    self.transcript.unlink()
+                result = self.run_session({"new_session": {"sessionId": session}, "turn": [{"chunk": "x"}]})
+                self.assertIsNone(result.session_id)
+                self.assertIn("session id", result.error or "")
+                self.assertEqual(self.received("session/prompt"), [], "no turn without an accepted session")
+                res = run_result(result, None)
+                self.assertIsNone(res.session_id)
+                self.assertEqual(fragments(json.dumps(res.__dict__, default=str)), [])
+        self.assertEqual(fragments(self.log_text()), [])
+        ok = self.run_session({"new_session": {"sessionId": "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc"}, "turn": []})
+        self.assertEqual(ok.session_id, "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc")
+
+
+class TokenAcrossToolCallTest(AcpCase):
+    """The final message starts after the last tool call; a token straddling that point must still be masked whole
+    (the review's sequence: 19 characters of a token, a tool call, the remaining 49)."""
+
+    def test_no_fragment_survives_in_the_final_message(self):
+        from timetrace.adapters.acp import run_result
+        from timetrace.redact import masking
+        self.assertEqual((len(LONG_TOKEN[:19]), len(LONG_TOKEN[19:])), (19, 49))
+        with masking([LONG_TOKEN]):
+            result = self.run_session({"turn": [
+                {"chunk": "here: " + LONG_TOKEN[:19]},
+                {"update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read x", "kind": "read"}},
+                {"chunk": LONG_TOKEN[19:] + " done"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        for where, text in (("last_message", result.last_message), ("text", result.text),
+                            ("RunResult.output", run_result(result, None).output), ("log", self.log_text())):
+            self.assertEqual(fragments(text), [], where)
+        self.assertTrue(result.last_message.endswith(" done"))
+
+
+
+# ---- review of b3237bf: fails on that commit ------------------------------------------------------------------------
+
+BAD_SESSION_IDS = (LONG_TOKEN, "s-" + LONG_TOKEN, "has space", "a/b", "x" * 129)
+
+
+class ResumeSessionIdTest(AcpCase):
+    """The caller's resume id passes the same rule as the agent's: an invalid one is refused before anything is
+    spawned, and never kept."""
+
+    def test_an_invalid_resume_id_is_refused_before_spawning(self):
+        from timetrace.redact import masking
+        for session in BAD_SESSION_IDS:
+            for caps in ({"loadSession": True}, {"resume": True}):
+                with self.subTest(session=session[:20], caps=caps), masking([LONG_TOKEN]):
+                    if self.transcript.exists():
+                        self.transcript.unlink()
+                    result = self.run_session({"initialize": caps, "turn": [{"chunk": "x"}]}, session_id=session)
+                    self.assertIsNone(result.session_id)
+                    self.assertEqual(result.error, "invalid session id")
+                    self.assertEqual(self.records(), [], "nothing was spawned")
+        self.assertFalse(self.log.exists() and fragments(self.log_text()), "nothing about the id was logged")
+
+    def test_a_normal_resume_id_is_unaffected(self):
+        for session in ("g-7", "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc", "a.b:c_d-1", "x" * 128):
+            with self.subTest(session=session[:20]):
+                result = self.run_session({"initialize": {"loadSession": True}, "turn": []}, session_id=session)
+                self.assertEqual((result.error, result.session_id), (None, session))
+
+
+if __name__ == "__main__":
+    unittest.main()

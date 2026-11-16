@@ -14,6 +14,9 @@ STATES = (PENDING, RUNNABLE, RUNNING, BLOCKED, DONE, FAILED)
 CLAUDE = "claude"
 CODEX = "codex"
 TOOLS = (CLAUDE, CODEX)
+# Agents driven over the Agent Client Protocol (timetrace.adapters.acp); registered only when configured, never
+# picked automatically by the local queue.
+ACP_TOOLS = ("gemini", "cursor")
 
 # Event types (spec §4)
 EV_RATE_LIMIT = "rate_limit"

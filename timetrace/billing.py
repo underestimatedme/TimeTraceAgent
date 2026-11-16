@@ -14,6 +14,11 @@ The check is read-only (`claude auth status`, `codex login status`); it never
 starts a model run, so verifying costs nothing. Anything unknown stays
 unverified with a machine-readable reason. Verdicts are cached briefly and
 re-checked right before a spawn.
+
+The ACP agents (Gemini CLI, Cursor) have no verifier: their zero-spend and
+credential isolation could not be verified, so their adapters carry a fixed
+unverified verdict and are never dispatched. Their billing variables are still
+listed below, so check commands and any ACP child never inherit them.
 """
 import json
 import os
@@ -32,6 +37,14 @@ BILLING_ENV_KEYS: Dict[str, Tuple[str, ...]] = {
         "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
     ),
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"),
+    # Gemini CLI: an API key, Vertex AI, a service account or a Cloud project each moves a run off the personal
+    # Google login onto metered or organisation billing; the base URLs reroute it to another endpoint.
+    "gemini": (
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
+        "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID",
+        "GOOGLE_GEMINI_BASE_URL", "GOOGLE_VERTEX_BASE_URL",
+    ),
+    "cursor": ("CURSOR_API_KEY",),
 }
 
 STATUS_TIMEOUT_SECONDS = 20.0

@@ -6,7 +6,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import IO, List, Optional, Sequence, Tuple
+from typing import IO, List, Mapping, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.redact import mask_timetrace_tokens, redact
@@ -70,10 +70,11 @@ class StopRequest(threading.Event):
         return True
 
 
-def child_env(drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = None) -> dict:
-    """The AI tool's environment: this process's, minus `CLAUDE*`, the
-    billing keys in `drop_env` and every secret-named variable (M-2)."""
-    run_env = dict(os.environ)
+def child_env(drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = None,
+              base: Optional[Mapping[str, str]] = None) -> dict:
+    """The AI tool's environment: this process's (or `base`, a snapshot the caller already checked: then nothing is
+    re-read from os.environ), minus `CLAUDE*`, the billing keys in `drop_env` and every secret-named variable (M-2)."""
+    run_env = dict(os.environ if base is None else base)
     for key in list(run_env):
         if key.startswith("CLAUDE") or key in set(drop_env or ()) or SECRET_ENV_NAME.search(key):
             run_env.pop(key, None)

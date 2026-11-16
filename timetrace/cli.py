@@ -28,7 +28,7 @@ from timetrace.credentials import CredentialStore, SessionManager, device_identi
 from timetrace.db import Database
 from timetrace.dispatch import SlotLimits, adapter_capabilities, lock_diagnostics
 from timetrace.models import (BLOCKED, CODEX, EV_SAMPLE_FAILURE, EV_TASK_INTERRUPTED, EV_TASK_WAITING, FAILED,
-                         PENDING, RUNNABLE, RUNNING, TOOLS, Sample)
+                         PENDING, RUNNABLE, RUNNING, TOOLS, ACP_TOOLS, Sample)
 
 
 def _open(args: argparse.Namespace):
@@ -591,7 +591,9 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) 
     flag is the adapter's verified capability, never inferred from a binary."""
     tools = []
     for name, adapter in adapters.items():
-        binary = str(cfg.get(name, {}).get("bin", name))
+        # An ACP adapter knows its own default (Cursor's binary is `cursor-agent`, not `cursor`).
+        binary_of = getattr(adapter, "binary", None)
+        binary = str(binary_of()) if callable(binary_of) else str(cfg.get(name, {}).get("bin", name))
         tier = adapter.plan_tier() if hasattr(adapter, "plan_tier") else None
         from timetrace.routing import identity
         routing_account, routing_model = identity(adapter)
@@ -619,7 +621,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
     state = {"sessions": SessionManager(CredentialStore(), cloud)}
     # Absolute `<tool>.bin` paths (and the node next to them) reach PATH even
     # when the LaunchAgent was installed before the tool was.
-    toolpath.extend_runtime_path(str((cfg.get(name) or {}).get("bin") or "") for name in TOOLS)
+    toolpath.extend_runtime_path(str((cfg.get(name) or {}).get("bin") or "") for name in TOOLS + ACP_TOOLS)
     adapters = _adapters(cfg)
 
     def token() -> str:
@@ -1036,6 +1038,33 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolu
     return lines, verified
 
 
+# Why doctor says an ACP agent is never dispatched. Advice only: nothing here logs in or edits settings.
+_ACP_FIX = {
+    "gemini": "TimeTrace 从不给 Gemini 派发任务：无法核验零付费和凭据隔离（会自动执行的工作区/用户配置、凭据类型、"
+              "MCP OAuth 令牌缓存、PATH/node 解析、版本）。ACP 运行本身可用，派发要等在真实安装上完成审计",
+    "cursor": "TimeTrace 从不给 Cursor 派发任务：Cursor 套餐可能按用量计费，CLI 没有可核验的信号。ACP 运行本身可用",
+}
+
+
+def _acp_tool_lines(name: str, adapter: Any, details: Dict[str, Any]) -> List[str]:
+    """An ACP agent (configured in config.json): where its binary is, the launch command and the zero-spend verdict."""
+    try:
+        found, command = adapter.resolved_binary(), " ".join(shlex.quote(part) for part in adapter.command())
+    except Exception as exc:
+        return ["%s: 检查失败（%s）" % (name, exc.__class__.__name__)]
+    lines = ["%s: %s（ACP：%s）" % (name, found or "未找到", command)]
+    if not found:
+        lines.append("  修复: 在 ~/.timetrace/config.json 的 %s.bin 写入它的绝对路径，然后 timetrace agent install" % name)
+    if details.get("can_enforce_zero_spend") is True:
+        lines.append("  零付费核验: 通过（%s，%s）" % (details.get("auth_method"), _iso_local(details.get("verified_at"))))
+    else:
+        lines.append("  零付费核验: 未通过（%s，%s）→ 该工具不会被派发任务" % (
+            _billing_login_label(details), details.get("unsupported_reason") or "unknown"))
+        if name in _ACP_FIX:
+            lines.append("  说明: " + _ACP_FIX[name])
+    return lines
+
+
 def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
     """LaunchAgent installed / running, and when the Runner last reached Valley."""
     lines = []
@@ -1085,6 +1114,10 @@ def cmd_agent_doctor(args: argparse.Namespace) -> int:
             print(line)
         if name in adapters:
             _print_tool_quota(adapters[name])
+    for name in ACP_TOOLS:
+        if name in adapters:
+            for line in _acp_tool_lines(name, adapters[name], _tool_billing_details(name, adapters)):
+                print(line)
     for line in _statusline_lines(home, db, cfg):
         print(line)
     print("电脑端版本: %s（协议 %d）" % (__version__, PROTOCOL_VERSION))
