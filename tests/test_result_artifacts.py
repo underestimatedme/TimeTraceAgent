@@ -119,6 +119,51 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(got["dropped_artifacts"], 0)
         self.assertEqual(got["dropped_draft"], True)
 
+    def test_a_report_is_kept_bounded_and_redacted(self):
+        self.write({"artifacts": [], "report": {
+            "verdict": " needs_review ", "summary": "  did it with " + SECRET + "  ",
+            "unfinished": ["windows steps", "", 3, "x" * 400] + ["more"] * 20, "review_focus": None, "extra": 1}})
+        got = self.collect()
+        self.assertTrue(got["valid"])
+        self.assertIs(got["dropped_report"], False)
+        report = got["result"]["report"]
+        self.assertEqual(set(report), {"verdict", "summary", "unfinished", "review_focus"})
+        self.assertEqual(report["verdict"], "needs_review")
+        self.assertIn("[REDACTED:aws]", report["summary"])
+        self.assertNotIn(SECRET, json.dumps(got))
+        self.assertEqual(len(report["unfinished"]), results.REPORT_ITEMS_MAX)
+        self.assertEqual(report["unfinished"][0], "windows steps")
+        self.assertEqual(len(report["unfinished"][1]), results.REPORT_ITEM_CHARS)
+        self.assertTrue(report["unfinished"][1].endswith("…"))
+        self.assertEqual(report["review_focus"], [])
+
+    def test_a_secret_across_the_cut_is_redacted_before_the_cut(self):
+        # A token that ends past the limit would lose the tail its pattern needs if the text were cut first.
+        token = "ghp_" + "A" * 36
+        self.assertIn("[REDACTED", results.redact(token))
+        summary_pad = "x" * (results.REPORT_SUMMARY_CHARS - 41) + " "
+        item_pad = "y" * (results.REPORT_ITEM_CHARS - 41) + " "
+        self.write({"report": {"verdict": "success", "summary": summary_pad + token + " trailing",
+                               "unfinished": [item_pad + token + " t"], "review_focus": [item_pad + token + " t"]}})
+        got = self.collect()
+        uploaded = json.dumps(got)
+        self.assertNotIn("A" * 20, uploaded)
+        report = got["result"]["report"]
+        self.assertLessEqual(len(report["summary"]), results.REPORT_SUMMARY_CHARS)
+        for key in ("unfinished", "review_focus"):
+            self.assertLessEqual(len(report[key][0]), results.REPORT_ITEM_CHARS)
+
+    def test_an_unusable_report_is_dropped_alone(self):
+        for bad in ("done", [], {"summary": "no verdict"}, {"verdict": "passed"},
+                    {"verdict": "success", "summary": 3}, {"verdict": "success", "unfinished": "x"}):
+            self.write({"artifacts": [{"kind": "link", "ref": "https://example.com/1"}],
+                        "subtasks": [{"key": "a", "title": "A"}], "report": bad})
+            got = self.collect()
+            self.assertTrue(got["valid"], bad)
+            self.assertIs(got["dropped_report"], True, bad)
+            self.assertEqual(set(got["result"]), {"subtasks"}, bad)
+            self.assertEqual(len(got["artifacts"]), 1, bad)
+
     def test_a_path_string_is_read_as_a_doc_artifact(self):
         (self.root / "docs").mkdir()
         (self.root / "docs" / "req.md").write_text("# req\n")
@@ -333,6 +378,19 @@ class AgentResultTest(unittest.TestCase):
         event, _ = self.run_job(json.dumps({"pipeline_draft": "a → b"}))
         self.assertNotIn("result_invalid", event)
         self.assertIn("忽略格式无效的 pipeline_draft", event["message"])
+
+    def test_completion_event_carries_the_report(self):
+        event, _ = self.run_job(json.dumps({"artifacts": [], "report": {
+            "verdict": "blocked", "summary": "tests need a database", "unfinished": ["migrations"]}}))
+        self.assertNotIn("result_invalid", event)
+        self.assertEqual(event["result"], {"report": {"verdict": "blocked", "summary": "tests need a database",
+                                                      "unfinished": ["migrations"], "review_focus": []}})
+
+    def test_dropped_report_is_noted_without_invalidating(self):
+        event, _ = self.run_job(json.dumps({"artifacts": [], "report": {"verdict": "great"}}))
+        self.assertNotIn("result_invalid", event)
+        self.assertIn("忽略格式无效的 report", event["message"])
+        self.assertNotIn("result", event)
 
     def test_valid_result_is_not_flagged(self):
         event, _ = self.run_job(json.dumps({"artifacts": []}))
