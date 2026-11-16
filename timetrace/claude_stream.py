@@ -94,6 +94,7 @@ class StreamSession:
         self.confirm_session = confirm_session
         self._user_acks = {}
         self._session_confirmed = False
+        self._session_error: Optional[Exception] = None
         self.lines: List[str] = []
         self._lock = threading.Lock()          # stdin writes, counters, close decision
         self._log_lock = threading.Lock()
@@ -135,16 +136,18 @@ class StreamSession:
 
     def _send_confirmed_locked(self, input_id, text, finish):
         """Caller holds self._lock. The CLI replays this UUID on acceptance."""
+        if not self.host.provider_input_allowed(check_gate=False):
+            return False
         message_uuid = str(uuid.uuid5(uuid.UUID(self.confirm_session), input_id))
         self._user_acks[message_uuid] = finish
         if self._write(user_message(text, message_uuid)):
             self._sent += 1
             self._last_was_result = False
+        return True
 
     def send_confirmed(self, input_id, text, finish):
         with self._lock:
-            if self._stdin_open and not self._last_was_result:
-                self._send_confirmed_locked(input_id, text, finish)
+            if self._stdin_open and not self._last_was_result and self._send_confirmed_locked(input_id, text, finish):
                 return
         finish("rejected")
 
@@ -158,8 +161,8 @@ class StreamSession:
             return
         kind = msg.get("type")
         if kind == "system" and msg.get("subtype") == "init" and not self._session_confirmed:
-            self._session_confirmed = True
             self.host.provider_session(self.confirm_session)
+            self._session_confirmed = True
         if kind == "user" and msg.get("isReplay") is True:
             with self._lock:
                 finish = self._user_acks.pop(msg.get("uuid"), None)
@@ -212,7 +215,12 @@ class StreamSession:
             self._log(log, shown + "\n")
             kind = msg.get("type") if isinstance(msg, dict) else None
             if self.confirm_session and isinstance(msg, dict):
-                self._interactive_message(msg)
+                try:
+                    self._interactive_message(msg)
+                except Exception as exc:
+                    self._session_error = exc
+                    self._ended.set()
+                    return
             if kind == "control_request":
                 self._on_control_request(msg)
                 continue
@@ -269,7 +277,7 @@ class StreamSession:
                     if self.confirm_session:
                         def respond(answer):
                             with self._lock:
-                                if cancelled.is_set() or (self.cancel_event is not None and self.cancel_event.is_set()):
+                                if cancelled.is_set() or not self.host.provider_input_allowed(check_gate=False):
                                     return False
                                 return self._write(permission_response(request_id, request.get("tool_use_id"),
                                                                        answer, request.get("input")))
@@ -313,7 +321,8 @@ class StreamSession:
                 self._write({"type": "control_request", "request_id": INIT_REQUEST_ID,
                              "request": {"subtype": "initialize"}})
                 if self.confirm_session:
-                    self._send_confirmed_locked(self.host.message_id, self.prompt, self._initial_echo)
+                    if not self._send_confirmed_locked(self.host.message_id, self.prompt, self._initial_echo):
+                        self._close_stdin_locked()
                 elif self._write(user_message(self.prompt)):
                     self._sent += 1
             out.start()
@@ -326,6 +335,9 @@ class StreamSession:
             started = time.monotonic()
             try:
                 while proc.poll() is None:
+                    if self._ended.is_set():
+                        self._terminate(proc)
+                        break
                     if self.cancel_event is not None and self.cancel_event.wait(.1):
                         self._terminate(proc)
                         break
@@ -358,6 +370,8 @@ class StreamSession:
                 proc.stdout.close()
                 proc.stderr.close()
                 log.write("--- exit %s ---\n" % proc.returncode)
+        if self._session_error is not None:
+            raise RuntimeError("Claude session confirmation failed") from self._session_error
         return int(proc.returncode), list(self.lines)
 
     @staticmethod

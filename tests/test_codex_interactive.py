@@ -69,6 +69,9 @@ class Host:
     def __init__(self):
         self.delivery, self.replies, self.requests = [], [], []
 
+    def provider_input_allowed(self, *, check_gate=True):
+        return True
+
     def provider_session(self, session_id):
         self.session_id = session_id
 

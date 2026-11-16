@@ -2,6 +2,7 @@ import subprocess
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from tests.test_remote_jobs import Adapter, Base, ControlCloud
@@ -131,6 +132,135 @@ class WorkSessionRunnerTest(Base):
         restarted.attach_interactive(lambda *args: self.fail("reserved input was sent again"))
         restarted.apply_lease(lease)
         self.assertIn(("two", "uncertain"), [(e["control_id"], e["status"]) for e in restarted.take_events()])
+
+    def test_renewal_controls_require_current_authority(self):
+        adapter = SessionAdapter()
+        cloud = ControlCloud([])
+        agent = self.agent(cloud, adapter)
+        claim = {"job": job("first"), "attempt_id": "attempt-1", "lease_epoch": 1}
+        for case in ("late", "cancel", "wrong_attempt", "wrong_epoch", "expired_renewal", "new_gate", "local_stop", "local_cancel"):
+            with self.subTest(case=case):
+                claim["job"].pop("desired_action", None)
+                clock = [1000.0]
+                ack = []
+                control = RunControl("first", self.home, threading.Event(), turn_id="turn-first")
+                control.attach_interactive(lambda key, text, done: (ack.append(key), done("applied")))
+                payload = {"attempt_id": "attempt-1", "lease_epoch": 1,
+                           "lease_expires_at": "1970-01-01T00:33:20Z",
+                           "controls": [{"id": "append-1", "action": "append", "text": "do more",
+                                         "work_session_turn_id": "turn-first"}]}
+                allowed = [True]
+                stopped = [False]
+                def renew(*args):
+                    if case == "late":
+                        clock[0] = 1002.0
+                    elif case == "cancel":
+                        payload["desired_action"] = "cancel"
+                    elif case == "wrong_attempt":
+                        payload["attempt_id"] = "attempt-2"
+                    elif case == "wrong_epoch":
+                        payload["lease_epoch"] = True
+                    elif case == "expired_renewal":
+                        payload["lease_expires_at"] = "1970-01-01T00:00:01Z"
+                    elif case == "new_gate":
+                        allowed[0] = False
+                    elif case == "local_stop":
+                        stopped[0] = True
+                    elif case == "local_cancel":
+                        control.cancel_event.set()
+                    return payload
+                cloud.renew = renew
+                with patch("timetrace.agent.time.time", side_effect=lambda: clock[0]), patch.object(
+                        agent, "_stop_reason", side_effect=lambda: "runner_stopped" if stopped[0] else ""):
+                    _, reason = agent._renew(claim, adapter, 1001.0,
+                                             gate=lambda _: "" if allowed[0] else "billing_unverified",
+                                             control=control)
+                self.assertTrue(reason)
+                self.assertEqual(ack, [])
+
+    def test_checkpoints_native_session_before_publishing_and_blocks_changed_crash_checkout(self):
+        cloud = ControlCloud([job("first"), job("second", provider_session_id="native-thread")])
+        case = self
+
+        class Crashed(SessionAdapter):
+            def work_session(self, prompt, cwd, session_id, log_file, cancel_event, *,
+                             control, resuming, read_only, mcp=None):
+                self.calls.append(cwd)
+                control.provider_session("native-thread")
+                from timetrace.db import Database
+                db = Database(case.db.path)
+                try:
+                    checkpoint = db.get_checkpoint("work-session:session-1")
+                    case.assertIsNotNone(checkpoint)
+                    case.assertEqual(checkpoint.provider_session_id, "native-thread")
+                    case.assertEqual(checkpoint.execution_path, cwd)
+                finally:
+                    db.close()
+                (Path(cwd) / "change-during-crash").write_text("unverified")
+                raise RuntimeError("provider process died")
+
+        adapter = Crashed()
+        agent = self.agent(cloud, adapter)
+        self.assertEqual(agent.run_once(), "job first → failed")
+        checkpoint = self.db.get_checkpoint("work-session:session-1")
+        self.assertIsNotNone(checkpoint)
+        self.assertIn("checkpoint git state changed", agent.run_once())
+        self.assertEqual(len(adapter.calls), 1)
+
+    def test_execute_requires_a_clean_git_delivery(self):
+        (self.repo / "tracked").write_text("original")
+        subprocess.check_call(["git", "-C", str(self.repo), "add", "tracked"])
+        subprocess.check_call(["git", "-C", str(self.repo), "-c", "user.name=Fixture",
+                               "-c", "user.email=fixture@example.test", "commit", "-qm", "Initial tracked file"])
+        for changed in ("untracked", "tracked", "reserved_output", None):
+            with self.subTest(changed=changed):
+                class WorktreeChanges(SessionAdapter):
+                    def work_session(self, prompt, cwd, session_id, log_file, cancel_event, **kwargs):
+                        control = kwargs["control"]
+                        control.provider_session("native-thread")
+                        root = Path(cwd)
+                        if changed == "tracked":
+                            (root / "tracked").write_text("work in progress")
+                        elif changed == "untracked":
+                            (root / "uncommitted").write_text("work in progress")
+                        elif changed == "reserved_output":
+                            (root / ".timetrace" / "out" / "scratch").write_text("reserved")
+                        return RunResult(ok=True, session_id="native-thread", output="answer")
+
+                key = changed or "unchanged"
+                entry = job(key)
+                entry["work_session_id"] = "session-" + key
+                cloud = ControlCloud([entry])
+                expected = "failed" if changed in ("untracked", "tracked") else "awaiting_review"
+                self.assertEqual(self.agent(cloud, WorktreeChanges()).run_once(), "job %s → %s" % (key, expected))
+                if expected == "failed":
+                    self.assertNotIn("output_commit", self.events(cloud, key)[-1])
+
+    def test_deferred_approval_and_append_cannot_write_after_local_expiry(self):
+        sent = []
+        runner = RunControl("first", self.home, threading.Event(), root=str(self.repo),
+                            turn_id="turn-1", message_id="message-1", input_gate=lambda _: True)
+        runner.authorize_provider_input(1005.0)
+        request = {"tool_name": "Bash", "input": {"command": "touch marker"}}
+        worker = threading.Thread(target=runner.permission, args=(request, threading.Event()),
+                                  kwargs={"respond": lambda reply: sent.append(reply)}, daemon=True)
+        clock = [1000.0]
+        with patch("timetrace.remote_control.time.time", side_effect=lambda: clock[0]):
+            worker.start()
+            try:
+                self.assertTrue(runner.pending.wait(2))
+                approval = runner.take_events()[0]
+                runner.apply_lease({"controls": [{"id": "append-1", "action": "append", "text": "add",
+                                                 "work_session_turn_id": "turn-1"}]})
+                clock[0] = 1006.0
+                runner.attach_interactive(lambda key, text, done: sent.append(key))
+                runner.apply_lease({"approvals": [{"request_id": approval["request_id"], "decision": "approve"}]})
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(sent, [])
+                self.assertEqual(runner.take_events()[0]["outcome"], "expired")
+            finally:
+                runner.close()
 
     def test_missing_local_checkpoint_does_not_create_a_replacement_worktree(self):
         cloud = ControlCloud([job("missing", provider_session_id="native-thread")])

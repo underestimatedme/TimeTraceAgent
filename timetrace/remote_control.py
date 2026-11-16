@@ -36,7 +36,8 @@ class RunControl:
                  clock: Callable[[], float] = time.monotonic, user_home: Optional[str] = None,
                  log: Callable[[str], None] = None, *, turn_id: str = "", message_id: str = "",
                  reserve_input: Optional[Callable[[str], bool]] = None,
-                 observe: Optional[Callable[[], str]] = None):
+                 observe: Optional[Callable[[], str]] = None,
+                 input_gate: Optional[Callable[[float], bool]] = None):
         self.job_id, self.home, self.cancel_event = job_id, Path(home), cancel_event
         self.root = root
         self.approvals_enabled = approvals_enabled
@@ -67,6 +68,10 @@ class RunControl:
         self.turn_id, self.message_id = turn_id, message_id
         self._reserve_input = reserve_input
         self._observe = observe
+        self._input_gate = input_gate
+        self._input_deadline = None
+        self.persist_provider_session = None
+        self.provider_session_id = ""
         self._initial_status = ""
         self._interactive_send = None
         self._inflight = None
@@ -168,8 +173,28 @@ class RunControl:
         self.initial_delivery("uncertain")
         return False
 
+    def authorize_provider_input(self, deadline: float) -> None:
+        self._input_deadline = deadline
+
+    def provider_input_allowed(self, *, check_gate: bool = True) -> bool:
+        deadline = self._input_deadline
+        if self._closed or self.cancel_event.is_set() or (deadline is not None and time.time() >= deadline):
+            return False
+        if check_gate and self._input_gate is not None:
+            try:
+                if deadline is None or not self._input_gate(deadline):
+                    return False
+            except Exception:
+                return False
+            # The gate may have blocked in a local capability probe.
+            return self.provider_input_allowed(check_gate=False)
+        return True
+
     def provider_session(self, session_id: str) -> None:
+        if self.persist_provider_session is not None:
+            self.persist_provider_session(session_id)
         with self._cond:
+            self.provider_session_id = session_id
             self._emit({"type": "provider_session", "provider_session_id": session_id})
 
     def initial_delivery(self, status: str) -> None:
@@ -212,7 +237,9 @@ class RunControl:
                 self._ack(control_id, status)
             self._dispatch_append()
         try:
-            if self._reserve_input is not None and not self._reserve_input(control_id):
+            if not self.provider_input_allowed():
+                finish("rejected")
+            elif self._reserve_input is not None and not self._reserve_input(control_id):
                 finish("uncertain")
             else:
                 send(control_id, text, finish)
@@ -284,7 +311,7 @@ class RunControl:
     def permission(self, request: Dict[str, Any], cancelled: threading.Event, *, respond=None) -> Dict[str, Any]:
         try:
             decision = self._permission(request, cancelled, respond)
-            if respond is not None and decision is not None and not cancelled.is_set() and not self.cancel_event.is_set():
+            if respond is not None and decision is not None and not cancelled.is_set() and self.provider_input_allowed():
                 respond(decision)
             return decision or {}
         finally:
@@ -354,7 +381,7 @@ class RunControl:
         if respond is not None:
             written = False
             try:
-                if not (cancelled.is_set() or self._closed or self.cancel_event.is_set()):
+                if not cancelled.is_set() and self.provider_input_allowed():
                     written = respond(response)
             finally:
                 with self._cond:

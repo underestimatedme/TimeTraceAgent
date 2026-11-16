@@ -68,8 +68,10 @@ class CodexTurn:
         with self.lock:
             return self._write_locked(msg)
 
-    def _call(self, method, params, callback):
+    def _call(self, method, params, callback, *, sends_input=False):
         with self.lock:
+            if sends_input and not self.host.provider_input_allowed(check_gate=False):
+                return False
             self.next_id += 1
             id_ = self.next_id
             self.calls[id_] = callback
@@ -125,7 +127,7 @@ class CodexTurn:
             else:
                 finish("applied" if result.get("turnId") == self.turn_id else "uncertain")
 
-        if not self._call("turn/steer", params, answered):
+        if not self._call("turn/steer", params, answered, sends_input=True):
             finish("uncertain")
 
     def _notification(self, method, params):
@@ -225,7 +227,7 @@ class CodexTurn:
 
         def answer(decision):
             with self.lock:
-                if self.ended or self.cancel.is_set() or cancelled.is_set():
+                if self.ended or self.cancel.is_set() or cancelled.is_set() or not self.host.provider_input_allowed(check_gate=False):
                     return False
                 choice = "accept" if decision.get("behavior") == "allow" else "decline"
                 return self._write_locked({"id": id_, "result": {"decision": choice}})
@@ -256,9 +258,10 @@ class CodexTurn:
         if not isinstance(actual, str) or not actual or (session_id and actual != session_id):
             self.result.error = "Codex session unavailable" if session_id else "Codex could not start a session"
             return
-        self.thread_id = self.result.session_id = actual
         self.host.provider_session(actual)
-        if self.cancel.is_set():
+        self.thread_id = self.result.session_id = actual
+        if self.cancel.is_set() or not self.host.provider_input_allowed():
+            self.result.error = "Codex did not start a turn without a valid lease"
             return
 
         def started(result):
@@ -276,7 +279,7 @@ class CodexTurn:
 
         self.initial_sent = self._call("turn/start", {
             "threadId": actual, "input": _input(prompt), "clientUserMessageId": self.host.message_id,
-        }, started)
+        }, started, sends_input=True)
 
     def run(self, prompt, session_id, params, log_file):
         env = child_env(billing_env_keys(CODEX), self.env)

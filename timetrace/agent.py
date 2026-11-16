@@ -53,6 +53,7 @@ SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 FOLDER_HEAD = "folder"
 # The block reason of a job the daemon stopped (SIGTERM / SIGINT / stop()).
 STOPPED = "runner_stopped"
+LEASE_OWNER_CHANGED = "lease owner changed"
 # While an AI process runs, a failed renewal or gate check is retried as long
 # as the current lease has more than this left; only then is the run stopped.
 RENEW_HOLD_MARGIN_SECONDS = 15.0
@@ -927,10 +928,14 @@ class Agent:
     def _renew(self, claim, adapter, deadline, gate=None, control=None):
         """`gate(deadline)` → block reason; default: the AI job gate. A
         protocol-2 response's controls[] / approvals[] go to `control`."""
-        gate = gate or (lambda at: self._gate(adapter, claim["job"], at))
+        job = claim["job"]
+        session = bool(job.get("work_session_id"))
+        gate = gate or (lambda at: self._gate(adapter, job, at))
         # Once a lease expires the old owner cannot regain execution authority.
-        reason = gate(deadline)
+        reason = (self._stop_reason() if session else "") or gate(deadline)
         if reason:
+            if session and control is not None:
+                control.authorize_provider_input(0)
             return deadline, reason
         done = threading.Event()
         answer = []
@@ -950,6 +955,9 @@ class Agent:
         lease = answer[0] if answer else None
         if not isinstance(lease, dict):
             return deadline, "lease renewal failed"
+        if session:
+            return self._renew_work_session(claim, deadline, gate, control, lease)
+
         if lease.get("desired_action") == "cancel":
             claim["job"]["desired_action"] = "cancel"
         if control is not None:
@@ -960,6 +968,33 @@ class Agent:
         if time.time() >= deadline and claim["job"].get("desired_action") != "cancel":
             return deadline, "lease_expired"
         return renewed, gate(renewed)
+
+    def _renew_work_session(self, claim, deadline, gate, control, lease):
+        job = claim["job"]
+        if ("attempt_id" in lease and lease["attempt_id"] != claim["attempt_id"]
+                or "lease_epoch" in lease and (type(lease["lease_epoch"]) is not int
+                                               or lease["lease_epoch"] != claim["lease_epoch"])):
+            if control is not None:
+                control.authorize_provider_input(0)
+            return deadline, LEASE_OWNER_CHANGED
+        if lease.get("desired_action") == "cancel":
+            job["desired_action"] = "cancel"
+        renewed = self._deadline(dict(lease, job=job))
+        local_cancel = (control is not None and control.cancel_event.is_set() and not control.interrupted)
+        reason = self._stop_reason() or ("cancelled" if local_cancel else "") or gate(renewed)
+        if job.get("desired_action") == "cancel" or job.get("status") == "cancelled":
+            reason = "cancelled"
+        if min(deadline, renewed) <= time.time() and not reason:
+            reason = "lease_expired"
+        if reason:
+            if control is not None:
+                control.authorize_provider_input(0)
+            return min(deadline, renewed) if reason == "lease_expired" else deadline, reason
+        if control is not None:
+            control.authorize_provider_input(renewed)
+            if not control.cancel_event.is_set():
+                control.apply_lease(lease)
+        return renewed, ""
 
     def _blocked(self, claim, plan_key, reason, checkpoint=None, seq=1, observed_at=None, note="", event_type="waiting_input"):
         """`note`: a folder run changed files outside its output directory
@@ -1016,7 +1051,10 @@ class Agent:
             approvals_enabled=job.get("work_session_mode") != "chat",
             reserve_input=(lambda key: self.db.reserve_work_session_input(work_session, key)) if work_session else None,
             observe=self._observed_now if work_session else None,
+            input_gate=(lambda at: not (self._stop_reason() or self._gate(adapter, job, at))) if work_session else None,
         )
+        if work_session:
+            control.authorize_provider_input(deadline)
         control.started = False
         self._track(cancel_event)
         with self._controls_lock:
@@ -1042,7 +1080,7 @@ class Agent:
         if not reason:
             return renewed, ""
         job = claim["job"]
-        hard = (reason in ("cancelled", STOPPED) or job.get("desired_action") == "cancel"
+        hard = (reason in ("cancelled", STOPPED, LEASE_OWNER_CHANGED) or job.get("desired_action") == "cancel"
                 or job.get("status") == "cancelled")
         left = renewed - time.time()
         if not hard and left > RENEW_HOLD_MARGIN_SECONDS:
@@ -1105,14 +1143,17 @@ class Agent:
         work_session = bool(job.get("work_session_id"))
         read_only = job.get("work_session_mode") == "chat"
 
-        def retain_session(sid):
+        def retain_session(sid, baseline=None):
             if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid)):
                 raise ValueError("provider did not confirm a native session")
             if checkpoint and sid != checkpoint.provider_session_id:
                 raise ValueError("provider resumed a different native session")
-            worktree.verify_metadata(execution_path, workspace["path"])
-            worktree.verify_branch(execution_path, prepared_branch)
-            head, dirty_digest = worktree.snapshot(execution_path)
+            if baseline is None:
+                worktree.verify_metadata(execution_path, workspace["path"])
+                worktree.verify_branch(execution_path, prepared_branch)
+                head, dirty_digest = worktree.snapshot(execution_path)
+            else:
+                head, dirty_digest = baseline
             if read_only and (head, dirty_digest) != (checkpoint.git_head, checkpoint.dirty_paths_digest):
                 raise ValueError("read-only work session changed the worktree")
             self.db.save_checkpoint(Checkpoint(
@@ -1155,7 +1196,7 @@ class Agent:
                                       "observed_at": observed_end or self._observed_now()}])
                 self.db.update_remote_claim(job_id, "reported")
                 return "job %s → failed" % job_id
-            sid = getattr(result, "session_id", None) or ""
+            sid = (control.provider_session_id if work_session else getattr(result, "session_id", None)) or ""
             if not (isinstance(sid, str) and SESSION_ID.fullmatch(sid)):
                 sid = ""
             if not work_session and spawned and execution_path:
@@ -1303,6 +1344,13 @@ class Agent:
                             self.log(skip_note("the access had run out by this turn"))
                     return kw
                 if work_session:
+                    worktree.verify_metadata(execution_path, workspace["path"])
+                    worktree.verify_branch(execution_path, prepared_branch)
+                    baseline = worktree.snapshot(execution_path)
+                    if checkpoint and baseline != (checkpoint.git_head, checkpoint.dirty_paths_digest):
+                        return self._blocked(claim, plan_key, "checkpoint git state changed", checkpoint)
+                    control.persist_provider_session = lambda sid: retain_session(sid, baseline)
+
                     def run(prompt, cwd, session, log, cancel):
                         kw = {"mcp": mcp} if mcp is not None and still_usable(mcp) else {}
                         return adapter.work_session(prompt, cwd, session, log, cancel, control=control,
@@ -1419,8 +1467,11 @@ class Agent:
                                     cancel_event.set()
                             next_renew = time.time() + self._renew_wait(reason, deadline, control)
                 checkpoint_error = ""
-                if work_session and result is not None and (result.session_id or result.ok):
+                if work_session and result is not None and (control.provider_session_id or result.ok):
                     try:
+                        if not control.provider_session_id or (result.session_id and result.session_id != control.provider_session_id):
+                            raise ValueError("provider did not confirm the expected native session")
+                        result.session_id = control.provider_session_id
                         retain_session(result.session_id)
                     except Exception as exc:
                         checkpoint_error = "work session checkpoint capture failed: %s" % exc
@@ -1428,6 +1479,8 @@ class Agent:
                     if checkpoint_error:
                         self.log("job %s: %s" % (job_id, checkpoint_error))
                     return interrupted(result)
+                if work_session and result is not None and not control.provider_session_id:
+                    result.session_id = None
                 # An interrupt that lost the race to completion is not a cancel.
                 cancelled_by = "" if user_interrupted() else self._cancel_reason(cancel_event)
                 reason = reason or cancelled_by or self._gate(adapter, job, deadline)
@@ -1503,10 +1556,12 @@ class Agent:
             self.db.update_remote_claim(job_id, "reported")
             self.maintain(force=True)
             return "job %s → replied" % job_id
-        if result.ok and not in_folder and job.get("stage_iteration"):
+        if result.ok and not in_folder and (job.get("stage_iteration") or work_session):
             try:
                 from .pipeline_inputs import committed_pipeline_output
                 workflow_output, left_out = committed_pipeline_output(workspace["path"], execution_path)
+                if work_session and left_out:
+                    raise ValueError("任务副本还有未提交的文件，请在副本中提交后重试；文件已保留")
             except Exception as exc:
                 self._report(claim, [{"seq": 2, "type": "failed", "message": redact(str(exc))[:1000],
                                       "output_tail": tail_text(log_file), "observed_at": observed_end}])
@@ -1614,7 +1669,7 @@ class Agent:
             if result.ok:
                 event["reply"] = control.terminal_reply(result.output)
                 base = workflow_input["head"]
-                commit = event.get("output_commit") or worktree.head(execution_path, workspace["path"])
+                commit = workflow_output
                 event.update(input_head=base, output_commit=commit)
                 changed = worktree.diff_stat(workspace["path"], base, commit)
                 if changed:
