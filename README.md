@@ -401,6 +401,8 @@ Runner 只在「运行任务不可能产生新增费用」时才派发。这不�
 | --- | --- | --- |
 | Claude Code | `claude auth status` 报告 `loggedIn=true`、`authMethod=claude.ai`、`apiProvider=firstParty` 且有 `subscriptionType` | `timetrace/billing.py: verify_claude` |
 | Codex | `codex login status` 报告 `Logged in using ChatGPT`，且 `~/.codex/auth.json` 的 `auth_mode=chatgpt`、无 `OPENAI_API_KEY` | `timetrace/billing.py: verify_codex` |
+| Gemini CLI（ACP） | `~/.gemini/settings.json` 选用 `oauth-personal`，环境变量和 `.env` 文件里没有 API key、Vertex 或 Cloud 项目 | `timetrace/billing.py: verify_gemini` |
+| Cursor（ACP） | 永不通过（`cursor_billing_unverifiable`） | `timetrace/adapters/cursor.py` |
 
 另外两条对两个工具都生效：
 
@@ -466,6 +468,24 @@ timetrace statusline --uninstall   # 移除；原来有自己的状态栏时原�
 | 执行 | `claude -p --output-format stream-json --session-id <uuid>` | `codex exec --json -s workspace-write -C <worktree>` |
 | 续接 | `claude -p --resume <session_id>` | `codex exec resume <thread_id>` |
 | 撞限流 | `rate_limit_info.status == rejected` 或 HTTP 429 | JSONL `error` 事件含 "usage limit"，退出码 1；重置时间取自 app-server |
+
+## Gemini CLI 与 Cursor：通过 ACP 运行（候选实现）
+
+Runner 还可以用 Agent Client Protocol（ACP：JSON-RPC 2.0，经标准输入输出逐行传递）驱动 Gemini CLI 和 Cursor。两者共用一个只依赖 Python 标准库的客户端（`timetrace/acp_client.py`），启动命令沿用 Codeg 项目的固定写法：
+
+| 工具 | 启动命令 | 零付费核验 | 派发 |
+|---|---|---|---|
+| Gemini CLI（≥0.60） | `gemini --acp --skip-trust` | 只读 `~/.gemini/settings.json` 和 `.env` 文件，不启动模型 | 核验通过才派发 |
+| Cursor | `cursor-agent acp` | 固定为未通过 | 永远不派发 |
+
+在 `~/.timetrace/config.json` 写入配置段才会登记这两个工具，例如 `"gemini": {"bin": "gemini"}`、`"cursor": {"bin": "cursor-agent"}`；可选 `extra_args`（追加在启动命令后）和 `timeout_seconds`（缺省 3600）。改完后运行 `timetrace agent install` 重启 Runner，再用 `timetrace agent doctor` 查看路径、启动命令和核验结论。
+
+- **Gemini 的零付费规则**：只有个人 Google 账号登录（Login with Google，`settings.json` 的 `security.auth.selectedType`，旧版为顶层 `selectedAuthType`，等于 `oauth-personal`）才通过；`enforcedType`、外部认证或系统级设置文件改掉它也不通过。环境变量 `GEMINI_API_KEY`、`GOOGLE_API_KEY`、`GOOGLE_GENAI_USE_VERTEXAI`、`GOOGLE_GENAI_USE_GCA`、`GOOGLE_APPLICATION_CREDENTIALS`、`GOOGLE_CLOUD_PROJECT` 等任一存在，或出现在 `~/.gemini/.env`（没有时为 `~/.env`）里，都不通过；无论结论如何，这些变量都不会传给 Gemini 子进程，也不会进入检查命令的环境。
+- **每次启动前还查运行目录**：Gemini CLI 会从工作目录逐级向上加载第一个 `.gemini/.env` 或 `.env`，项目的 `.env` 常有给应用本身用的 `GEMINI_API_KEY`；工作区的 `.gemini/settings.json` 也是仓库内容。发现这类计费路径时本次不启动，报 `billing_unverified`。客户端从不调用 ACP 的 `authenticate`，不替你选认证方式。
+- **Cursor 的规则**：Cursor 套餐可能按用量计费，CLI 又没有可在派发前核验的信号，所以核验结论固定为 `cursor_billing_unverifiable`，门禁始终返回 `billing_unverified`。没有任何配置项能绕过；运行路径已实现，留待以后有可核验的信号再开放。
+- **权限**：客户端声明不提供文件系统和终端能力，智能体调用 `fs/*`、`terminal/*` 或其他未知方法一律回 `-32601`。权限请求先过本机规则，再按需问手机，只回答一次性选项（`allow_once` / `reject_once`），从不选「始终允许 / 始终拒绝」；没有手机审批通道（如本地队列）时一律拒绝，切换模式的请求直接拒绝。
+- **MCP 与日志**：智能体声明支持 http MCP 时，本次运行的 TimeTrace MCP 以 http 服务器 `timetrace` 随 `session/new` 交给它，令牌只在请求头里，不进命令行参数、环境变量和日志；不支持时不接入，并在日志注明。日志是可读的对话记录（请求、工具调用、计划、权限决定、智能体文本），令牌一律脱敏。续接优先 `session/resume`，其次 `session/load`（回放的历史不计入本轮）；都不支持时续接直接失败，不会悄悄开新会话。
+- **验证范围**：协议行为只用测试里的模拟智能体（`tests/fake_acp_agent.py`）验证过。这台电脑没有用真实的 Gemini CLI 或 Cursor 跑过上述启动命令，Gemini 设置项的键名也未在真机核对；上线前需要在装有真实 CLI 的电脑上实测，并确认 Valley 能派发这两个工具的任务。
 
 ## 开发
 

@@ -1,32 +1,25 @@
-"""Cursor adapter — management tier only.
+"""Cursor over the Agent Client Protocol: `cursor-agent acp`.
 
-Until Cursor's real headless command surface and billing behaviour are verified
-(with saved, de-identified fixtures and a verification date), this adapter only
-records/represents the tool. It never fakes start/resume, so dispatch and resume
-stay disabled and no unattended execution is possible.
+The run itself works like Gemini's (one generic ACP client), but Cursor is never dispatched: its plans can bill
+on-demand usage beyond the included amount, and the CLI exposes no signal this runner could check before a spawn.
+The billing verdict is therefore fixed at unverified, and adapter_dispatch_problem keeps answering
+`billing_unverified`. There is deliberately no configuration that changes this.
 """
-from typing import Any, Dict, Optional
+from timetrace.adapters.acp import AcpAdapter, safe_capabilities  # noqa: F401 (safe_capabilities: compatibility)
+from timetrace.billing import StaticBilling
 
-from timetrace.adapters.base import ToolAdapter
-from timetrace.quota import merge_capabilities
-
-
-def safe_capabilities() -> Dict[str, bool]:
-    """Conservative management-mode defaults: record only. Dispatch, resume and
-    zero-spend enforcement stay off until proven per tool."""
-    return {"can_record": True, "can_read_quota": False, "can_dispatch": False,
-            "can_resume": False, "can_enforce_zero_spend": False}
+CURSOR_BILLING_REASON = "cursor_billing_unverifiable"
 
 
-class CursorAdapter(ToolAdapter):
+class CursorAdapter(AcpAdapter):
     name = "cursor"
-    adapter_version = "cursor/unverified"
+    adapter_version = "cursor-agent/acp-1"
+    default_bin = "cursor-agent"
+    launch_args = ("acp",)
 
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
-        self.cfg = cfg or {}
+    def __init__(self, cfg=None, which=None):
+        # No `billing` parameter: not even code can hand this adapter a verified verdict.
+        super().__init__(cfg, billing=None, which=which)
 
-    def capabilities(self) -> Dict[str, bool]:
-        return merge_capabilities(safe_capabilities())
-
-    # No start/resume override: the base raises NotImplementedError, so an
-    # unverified tool can never be dispatched or resumed.
+    def default_billing(self):
+        return StaticBilling(False, CURSOR_BILLING_REASON, provider="cursor")

@@ -1,21 +1,24 @@
-"""Gemini adapter — management tier only (same posture as Cursor).
+"""Gemini CLI over the Agent Client Protocol: `gemini --acp --skip-trust`.
 
-Delivers record/represent capability now; dispatch/resume/zero-spend stay off
-until the real command surface and billing safety are verified.
+The launch command is the one the Codeg project pins for Gemini CLI >= 0.60 (it runs twenty agents over ACP); it was
+not exercised against a real Gemini CLI on this machine. Dispatch is allowed only with a verified personal Google
+login (billing.verify_gemini), and each run first checks what its own directory would add: the .env file Gemini
+CLI loads from there and the workspace's .gemini/settings.json (billing.gemini_workspace_problem). The child never
+inherits the Gemini / Google Cloud billing variables.
 """
-from typing import Any, Dict, Optional
-
-from timetrace.adapters.base import ToolAdapter
-from timetrace.adapters.cursor import safe_capabilities
-from timetrace.quota import merge_capabilities
+from timetrace.adapters.acp import AcpAdapter
+from timetrace.billing import gemini_verifier, gemini_workspace_problem
 
 
-class GeminiAdapter(ToolAdapter):
+class GeminiAdapter(AcpAdapter):
     name = "gemini"
-    adapter_version = "gemini/unverified"
+    adapter_version = "gemini-cli/acp-1"
+    default_bin = "gemini"
+    launch_args = ("--acp", "--skip-trust")
 
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
-        self.cfg = cfg or {}
+    def default_billing(self):
+        # Reads files only (no command, no model call); cached, and forced fresh at the gate before every spawn.
+        return gemini_verifier(self.cfg)
 
-    def capabilities(self) -> Dict[str, bool]:
-        return merge_capabilities(safe_capabilities())
+    def preflight(self, cwd: str) -> str:
+        return gemini_workspace_problem(cwd)

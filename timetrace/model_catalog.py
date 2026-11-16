@@ -70,6 +70,10 @@ def read_catalog(adapter):
     result = {'version': 1, 'account': account, 'source': provider + ('_model_list' if provider == 'codex' else '_initialize'),
               'checked_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
               'status': 'error', 'models': []}
+    if provider not in ('claude', 'codex'):
+        # The ACP agents have no read-only model list we could use without starting a session.
+        result['status'] = 'unsupported'
+        return result
     if not account:
         result['status'] = 'login_required'
         return result
