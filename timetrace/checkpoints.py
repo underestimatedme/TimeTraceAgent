@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 CHECKPOINT_SCHEMA_VERSION = 2
+WORK_SESSION_PREFIX = "work-session:"
 
 
 @dataclass

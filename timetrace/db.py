@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS remote_outbox (
     abandoned_at INTEGER,
     UNIQUE(job_id, attempt_id, seq)
 );
+CREATE TABLE IF NOT EXISTS work_session_input (
+    session_id TEXT NOT NULL,
+    input_id   TEXT NOT NULL,
+    PRIMARY KEY (session_id, input_id)
+);
 CREATE TABLE IF NOT EXISTS checkpoint (
     plan_id    TEXT PRIMARY KEY,
     data       TEXT NOT NULL,
@@ -663,6 +668,28 @@ class Database:
 
     def plan_started(self, plan_id: str) -> bool:
         return self.conn.execute("SELECT 1 FROM remote_plan_started WHERE plan_id=?", (plan_id,)).fetchone() is not None
+
+    def work_session_retention_ids(self, after: str, limit: int) -> List[str]:
+        from timetrace.checkpoints import WORK_SESSION_PREFIX
+        return [str(row[0]) for row in self.conn.execute(
+            "SELECT session_id FROM (SELECT session_id FROM work_session_input"
+            " UNION SELECT substr(plan_id, ?) FROM checkpoint WHERE plan_id LIKE ?)"
+            " WHERE session_id > ? ORDER BY session_id LIMIT ?",
+            (len(WORK_SESSION_PREFIX) + 1, WORK_SESSION_PREFIX + "%", after, limit),
+        )]
+
+    def release_work_session(self, session_id: str) -> None:
+        from timetrace.checkpoints import WORK_SESSION_PREFIX
+        with self.transaction():
+            self.delete_checkpoint(WORK_SESSION_PREFIX + session_id)
+            self.conn.execute("DELETE FROM work_session_input WHERE session_id=?", (session_id,))
+
+    def reserve_work_session_input(self, session_id: str, input_id: str) -> bool:
+        """Before the provider write, durably claim the message without storing its text."""
+        return self.conn.execute(
+            "INSERT OR IGNORE INTO work_session_input (session_id, input_id) VALUES (?,?)",
+            (session_id, input_id),
+        ).rowcount == 1
 
     def save_checkpoint(self, checkpoint: Any, now: Optional[int] = None) -> None:
         """Atomically persist one checkpoint per plan (INSERT OR REPLACE is a

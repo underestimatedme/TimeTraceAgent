@@ -595,10 +595,12 @@ def _runner_tools(cfg: Dict[str, Any], adapters: Dict[str, Any], catalogs=None) 
         tier = adapter.plan_tier() if hasattr(adapter, "plan_tier") else None
         from timetrace.routing import identity
         routing_account, routing_model = identity(adapter)
+        capabilities = adapter_capabilities(adapter)
         tools.append({
             "id": name + "-default", "provider": name, "version": "local",
             "routing_version": 1, "routing_account": routing_account, "routing_model": routing_model,
-            "can_enforce_zero_spend": adapter_capabilities(adapter).get("can_enforce_zero_spend") is True,
+            "can_enforce_zero_spend": capabilities.get("can_enforce_zero_spend") is True,
+            "can_interact": capabilities.get("can_interact") is True,
             "status": "available" if shutil.which(binary) else "unavailable",
             "plan_tier": tier or "",
         })

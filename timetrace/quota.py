@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-# The five capabilities from the total plan. All default False; only an adapter's
+# All capabilities default False; only an adapter's
 # real check or verified local config may raise one.
 CAPABILITY_KEYS = (
     "can_record",
     "can_read_quota",
     "can_dispatch",
     "can_resume",
+    "can_interact",
     "can_enforce_zero_spend",
 )
 

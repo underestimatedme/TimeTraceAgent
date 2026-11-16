@@ -34,7 +34,10 @@ class RunControl:
     def __init__(self, job_id: str, home: Path, cancel_event: threading.Event, root: Optional[str] = None,
                  approvals_enabled: bool = True, approval_timeout: float = APPROVAL_TIMEOUT_SECONDS,
                  clock: Callable[[], float] = time.monotonic, user_home: Optional[str] = None,
-                 log: Callable[[str], None] = None):
+                 log: Callable[[str], None] = None, *, turn_id: str = "", message_id: str = "",
+                 reserve_input: Optional[Callable[[str], bool]] = None,
+                 observe: Optional[Callable[[], str]] = None,
+                 input_gate: Optional[Callable[[float], bool]] = None):
         self.job_id, self.home, self.cancel_event = job_id, Path(home), cancel_event
         self.root = root
         self.approvals_enabled = approvals_enabled
@@ -62,6 +65,17 @@ class RunControl:
         self._decisions: Dict[str, Dict[str, Any]] = {}
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._remembered = set()
+        self.turn_id, self.message_id = turn_id, message_id
+        self._reserve_input = reserve_input
+        self._observe = observe
+        self._input_gate = input_gate
+        self._input_deadline = None
+        self.persist_provider_session = None
+        self.provider_session_id = ""
+        self._initial_status = ""
+        self._interactive_send = None
+        self._inflight = None
+        self._last_reply = ""
 
     # ---- job thread: lease responses and events ---------------------------
     def apply_lease(self, lease: Any) -> None:
@@ -76,6 +90,8 @@ class RunControl:
         for decision in lease.get("approvals") or []:
             if isinstance(decision, dict):
                 self._decision(decision)
+        if self.turn_id:
+            self._dispatch_append()
 
     def take_events(self) -> List[Dict[str, Any]]:
         with self._cond:
@@ -88,6 +104,8 @@ class RunControl:
         """Caller holds self._cond."""
         if event.get("type") == "approval_requested":
             self.emitted_at[str(event.get("request_id"))] = time.monotonic()
+        if self._observe is not None:
+            event["observed_at"] = self._observe()
         self._events.append(event)
         self.wakeup.set()
         self.pending.set()
@@ -105,6 +123,9 @@ class RunControl:
                 # The run already ended: Valley rejects the control itself.
                 return
             self._seen_controls.add(control_id)
+            if self.turn_id and action == "append" and control.get("work_session_turn_id") != self.turn_id:
+                self._ack(control_id, "rejected", "追加指令所属轮次已经结束")
+                return
             if action == "interrupt":
                 self.interrupted = True
                 self.interrupt_id = control_id
@@ -118,6 +139,9 @@ class RunControl:
             text = control.get("text")
             if not isinstance(text, str) or not text.strip():
                 self._ack(control_id, "rejected", "追加指令为空")
+                return
+            if self.turn_id:
+                self._queued.append((control_id, text))
                 return
             send = self._send
         # Writing to the tool happens outside the lock (the session takes its own).
@@ -143,15 +167,102 @@ class RunControl:
         with self._cond:
             self._send = send
 
+    def reserve_initial(self) -> bool:
+        if self._reserve_input is None or self._reserve_input(self.message_id):
+            return True
+        self.initial_delivery("uncertain")
+        return False
+
+    def authorize_provider_input(self, deadline: float) -> None:
+        self._input_deadline = deadline
+
+    def provider_input_allowed(self, *, check_gate: bool = True) -> bool:
+        deadline = self._input_deadline
+        if self._closed or self.cancel_event.is_set() or (deadline is not None and time.time() >= deadline):
+            return False
+        if check_gate and self._input_gate is not None:
+            try:
+                if deadline is None or not self._input_gate(deadline):
+                    return False
+            except Exception:
+                return False
+            # The gate may have blocked in a local capability probe.
+            return self.provider_input_allowed(check_gate=False)
+        return True
+
+    def provider_session(self, session_id: str) -> None:
+        if self.persist_provider_session is not None:
+            self.persist_provider_session(session_id)
+        with self._cond:
+            self.provider_session_id = session_id
+            self._emit({"type": "provider_session", "provider_session_id": session_id})
+
+    def initial_delivery(self, status: str) -> None:
+        if status not in ("applied", "uncertain"):
+            return
+        with self._cond:
+            if not self._initial_status:
+                self._initial_status = status
+                kind = "message_delivered" if status == "applied" else "message_uncertain"
+                self._emit({"type": kind, "work_session_message_id": self.message_id})
+
+    def assistant_message(self, reply: str) -> None:
+        if isinstance(reply, str) and reply.strip():
+            with self._cond:
+                self._last_reply = reply
+                self._emit({"type": "assistant_message", "reply": reply})
+
+    def terminal_reply(self, reply: str) -> str:
+        with self._cond:
+            return "" if self._last_reply == reply else reply
+
+    def attach_interactive(self, send) -> None:
+        with self._cond:
+            self._interactive_send = send
+        self._dispatch_append()
+
+    def _dispatch_append(self) -> None:
+        with self._cond:
+            send = self._interactive_send
+            if not (send and self._queued and not self._pending and not self._inflight
+                    and not self._finished and not self.cancel_event.is_set()):
+                return
+            control_id, text = self._queued.pop(0)
+            self._inflight = control_id
+        def finish(status):
+            with self._cond:
+                if self._inflight != control_id:
+                    return
+                self._inflight = None
+                self._ack(control_id, status)
+            self._dispatch_append()
+        try:
+            if not self.provider_input_allowed():
+                finish("rejected")
+            elif self._reserve_input is not None and not self._reserve_input(control_id):
+                finish("uncertain")
+            else:
+                send(control_id, text, finish)
+        except Exception:
+            finish("uncertain")
+
     def detach(self) -> None:
         with self._cond:
             self._send = None
+            self._interactive_send = None
 
     def next_followup(self, ok: bool) -> Optional[Tuple[str, str]]:
         """After a turn: the next queued instruction to run as a resumed turn
         in the same job, or None — then the run is finished and a later
         interrupt or append no longer applies."""
         with self._cond:
+            if self.turn_id:
+                if self._inflight:
+                    self._ack(self._inflight, "uncertain")
+                    self._inflight = None
+                for control_id, _ in self._queued:
+                    self._ack(control_id, "rejected", "追加指令所属轮次已经结束")
+                self._queued.clear()
             if ok and not self.interrupted and not self.cancel_event.is_set() and self._queued:
                 return self._queued.pop(0)
             self._finished = True
@@ -197,7 +308,19 @@ class RunControl:
         self._decisions.pop(request_id, None)
         self._emit({"type": "approval_resolved", "request_id": request_id, "outcome": outcome})
 
-    def permission(self, request: Dict[str, Any], cancelled: threading.Event) -> Dict[str, Any]:
+    def permission(self, request: Dict[str, Any], cancelled: threading.Event, *, respond=None) -> Dict[str, Any]:
+        try:
+            decision = self._permission(request, cancelled, respond)
+            if respond is not None and decision is not None and not cancelled.is_set() and self.provider_input_allowed():
+                respond(decision)
+            return decision or {}
+        finally:
+            if self.turn_id:
+                # The provider has its decision. Resume messages queued during
+                # the permission wait without delaying for another renewal.
+                self._dispatch_append()
+
+    def _permission(self, request: Dict[str, Any], cancelled: threading.Event, respond) -> Optional[Dict[str, Any]]:
         """Answer one `can_use_tool` prompt: local rules, then what the job
         remembered, then the phone (waiting at most approval_timeout)."""
         tool = approvals.tool_label(request.get("tool_name"))
@@ -211,9 +334,9 @@ class RunControl:
             audit.record(self.home, "approval", job_id=self.job_id, tool=tool, decision="deny", source="local",
                          reason=verdict.reason, summary=summary)
             return {"behavior": "deny", "message": approvals.DENY_PREFIX + verdict.reason}
-        if verdict.action == approvals.ALLOW:
+        if verdict.action == approvals.ALLOW and not request.get("require_phone"):
             return {"behavior": "allow"}
-        key = approvals.remember_key(tool, tool_input)
+        key = None if self.turn_id else approvals.remember_key(tool, tool_input)
         with self._cond:
             remembered = key is not None and key in self._remembered
         if remembered:
@@ -224,16 +347,13 @@ class RunControl:
             return {"behavior": "deny", "message": NO_PHONE_DENY}
         request_id = "perm-" + uuid.uuid4().hex[:24]
         with self._cond:
-            if self._closed:
+            if self._closed or cancelled.is_set() or self.cancel_event.is_set():
                 return {"behavior": "deny", "message": NO_PHONE_DENY}
             self._pending[request_id] = {"tool": tool, "key": key}
             self._emit({"type": "approval_requested", "request_id": request_id, "tool": tool, "summary": summary,
                         "input": approvals.safe_input(tool_input), "message": summary})
             deadline = self.clock() + self.approval_timeout
             while True:
-                decision = self._decisions.get(request_id)
-                if decision is not None:
-                    break
                 if cancelled.is_set() or self._closed or self.cancel_event.is_set():
                     self._resolve(request_id, "expired")
                     return {"behavior": "deny", "message": TIMEOUT_DENY}
@@ -243,17 +363,42 @@ class RunControl:
                     audit.record(self.home, "approval", job_id=self.job_id, request_id=request_id, tool=tool,
                                  decision="deny", source="timeout", summary=summary)
                     return {"behavior": "deny", "message": TIMEOUT_DENY}
+                decision = self._decisions.get(request_id)
+                if decision is not None:
+                    break
                 self._cond.wait(min(left, .25))
-            approved = decision.get("decision") == "approve"
             expired = decision.get("reason") == "expired"
+            approved = decision.get("decision") == "approve" and not expired
             remember = approved and decision.get("remember") is True and key is not None
             if remember:
                 self._remembered.add(key)
             outcome = "approved" if approved else ("expired" if expired else "denied")
-            self._resolve(request_id, outcome)
+            if respond is None:
+                self._resolve(request_id, outcome)
+        response = {"behavior": "allow"} if approved else {
+            "behavior": "deny", "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000],
+        }
+        if respond is not None:
+            def approval_open():
+                return self.clock() < deadline
+
+            written = False
+            try:
+                if not cancelled.is_set() and self.provider_input_allowed():
+                    if approved and approval_open():
+                        written = respond(response, approval_open=approval_open)
+                    else:
+                        if approved:
+                            approved, expired, remember = False, True, False
+                            outcome = "expired"
+                            response = {"behavior": "deny", "message": TIMEOUT_DENY}
+                        written = respond(response)
+            finally:
+                if not written:
+                    approved, expired, remember = False, True, False
+                with self._cond:
+                    self._resolve(request_id, outcome if written else "expired")
         audit.record(self.home, "approval", job_id=self.job_id, request_id=request_id, tool=tool,
                      decision="allow" if approved else "deny", source="timeout" if expired else "phone",
                      remember=remember, summary=summary)
-        if approved:
-            return {"behavior": "allow"}
-        return {"behavior": "deny", "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000]}
+        return response if respond is None else None

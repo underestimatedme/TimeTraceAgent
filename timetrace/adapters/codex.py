@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from timetrace import __version__
-from timetrace.adapters.base import PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
+from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace import tiers, worktree
 from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.redact import mask_file, masking
@@ -348,7 +348,7 @@ def _int_or_none(v: Any) -> Optional[int]:
 
 class CodexAdapter(ToolAdapter):
     name = CODEX
-    adapter_version = "codex-cli/0.151"
+    adapter_version = "codex-cli/work-sessions-1"
     # Execution runs in a worktree take the job's TimeTrace MCP access (`mcp=`).
     supports_mcp = True
 
@@ -367,6 +367,7 @@ class CodexAdapter(ToolAdapter):
             "can_read_quota": True,
             "can_dispatch": True,
             "can_resume": True,
+            "can_interact": self.cfg.get("sandbox", "workspace-write") in ("workspace-write", "read-only"),
             "can_enforce_zero_spend": self.billing.verdict().verified,
         })
 
@@ -421,6 +422,45 @@ class CodexAdapter(ToolAdapter):
                 return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
             finally:
                 mask_file(log_file + ".last.md")
+
+    def work_session(self, prompt, cwd, session_id, log_file, cancel_event, *,
+                     control, resuming, read_only, mcp=None) -> RunResult:
+        from timetrace.adapters.codex_interactive import CodexTurn
+
+        cmd = [self.cfg.get("bin", "codex"), "app-server"]
+        sandbox = "read-only" if read_only else self.cfg.get("sandbox", "workspace-write")
+        if sandbox not in ("workspace-write", "read-only"):
+            return RunResult(exit_code=1, error="unsupported interactive sandbox")
+        domains = network_domains(self.cfg) if sandbox == "workspace-write" else []
+        config = {}
+        if read_only:
+            cmd += ["--disable", "apps", "--disable", "plugins", "--disable", "hooks",
+                    "-c", "mcp_servers={}", "-c", 'web_search="disabled"']
+            config["mcp_servers"] = {}
+        params = {"cwd": cwd, "modelProvider": "openai",
+                  "approvalPolicy": "never" if read_only else "on-request", "approvalsReviewer": "user",
+                  "developerInstructions": CHAT_RULES if read_only else WORK_SESSION_RULES,
+                  "config": config}
+        if self.cfg.get("model"):
+            params["model"] = self.cfg["model"]
+        roots = self._writable_extras(cwd) if sandbox == "workspace-write" else []
+        if domains:
+            cmd += _network_profile(domains, roots)
+        else:
+            params["sandbox"] = sandbox
+            config["sandbox_workspace_write.network_access"] = False
+            config["sandbox_workspace_write.writable_roots"] = roots
+        if mcp is not None and not read_only:
+            config.update({
+                "mcp_servers.timetrace.url": mcp.url,
+                "mcp_servers.timetrace.bearer_token_env_var": ENV_NAME,
+                "mcp_servers.timetrace.default_tools_approval_mode": "approve",
+                "features.shell_snapshot": False,
+            })
+        env = mcp.env() if mcp is not None and not read_only else None
+        turn = CodexTurn(cmd, cwd, control, cancel_event, float(self.cfg.get("timeout_seconds", 3600)), read_only, env)
+        with masking([mcp.token] if env else []):
+            return turn.run(prompt, session_id if resuming else None, params, log_file)
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               mcp: Optional[McpAccess] = None) -> RunResult:
