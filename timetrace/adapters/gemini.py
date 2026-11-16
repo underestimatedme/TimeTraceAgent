@@ -1,17 +1,18 @@
 """Gemini CLI over the Agent Client Protocol: `gemini --acp --skip-trust`.
 
-The launch command is the one the Codeg project pins for Gemini CLI >= 0.60 (it runs twenty agents over ACP); it was
-not exercised against a real Gemini CLI on this machine. The zero-spend gate is hermetic and allow-only and runs
-nothing (billing.gemini_billing_problem): the binary's version is read from its package.json (0.60.x only), the
-user's settings must be exactly "personal Google login, AI credits never", the cached login a personal one, and no
-.env, workspace Gemini or agent configuration, user extension / command / skill / policy / agent directory or
-system configuration may exist. Each run repeats the whole check right before its spawn, starts exactly the binary
-that was checked, and gives the child only the allowlisted part of the run's one environment snapshot.
+The launch command is the one the Codeg project pins for Gemini CLI >= 0.60; it was not exercised against a real
+Gemini CLI on this machine. A Gemini run works technically (the generic ACP client), but Gemini is never dispatched:
+its zero-spend and credential isolation could not be verified without auditing a real install. Four review rounds
+kept finding configuration the CLI loads and executes on its own (workspace and user settings, MCP servers,
+extensions, commands, policies, agents), credential types beyond a personal login, a cached MCP OAuth token that may
+be refreshed against a cached third-party URL, and PATH / `node` resolution that can swap in other code. The billing
+verdict is therefore fixed at unverified until such an audit (see README), and there is deliberately no
+configuration, and no constructor argument, that changes this.
 """
-from typing import Dict, List, Optional, Tuple
-
 from timetrace.adapters.acp import AcpAdapter
-from timetrace.billing import BillingVerifier, gemini_billing_problem, gemini_child_env, verify_gemini
+from timetrace.billing import StaticBilling
+
+GEMINI_BILLING_REASON = "gemini_billing_unverifiable"
 
 
 class GeminiAdapter(AcpAdapter):
@@ -20,18 +21,10 @@ class GeminiAdapter(AcpAdapter):
     default_bin = "gemini"
     launch_args = ("--acp", "--skip-trust")
 
-    def default_billing(self):
-        # Reads files only (nothing is run); cached, and forced fresh at the gate before every spawn.
-        return BillingVerifier(lambda now: verify_gemini(
-            {"bin": self.binary(), "extra_args": self.cfg.get("extra_args") or []}, now=now))
+    def __init__(self, cfg=None, which=None):
+        # No `billing` parameter: not even code can hand this adapter a verified verdict.
+        super().__init__(cfg, billing=None, which=which)
 
-    def prepare(self, cwd: str) -> Tuple[str, Optional[Dict[str, str]], List[str]]:
-        # The run's one environment snapshot (taken by the base class) is what the whole check reads; its allowlisted
-        # part is the child's entire environment, and the child is the binary whose package.json was just read.
-        problem, snapshot, cmd = super().prepare(cwd)
-        if problem:
-            return problem, None, cmd
-        problem, resolved = gemini_billing_problem(snapshot, cwd, self.binary(), self.cfg.get("extra_args") or ())
-        if problem or resolved is None:
-            return problem or "gemini_version_unknown", None, cmd
-        return "", gemini_child_env(snapshot), [resolved] + cmd[1:]
+    def default_billing(self):
+        # Dispatch stays off until zero-spend and credential isolation are audited on a real install.
+        return StaticBilling(False, GEMINI_BILLING_REASON, provider="gemini")

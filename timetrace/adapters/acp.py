@@ -1,19 +1,20 @@
 """Coding agents driven over the Agent Client Protocol: the adapter surface Gemini CLI and Cursor share.
 
-One generic client (timetrace.acp_client) runs every turn; a subclass only names its launch command and its billing
-verdict. What the gates see is the same as for Claude Code and Codex:
+One generic client (timetrace.acp_client) runs every turn; a subclass only names its launch command. Neither agent is
+ever dispatched: both adapters have a fixed unverified billing verdict (zero-spend and credential isolation could
+not be verified, see README), so adapter_dispatch_problem always answers `billing_unverified`. The run path is kept
+working and hardened for whoever audits an agent on a real install:
 
-- can_dispatch / can_resume: the binary resolves (an absolute `bin` that is executable, or a name on PATH, which is
-  what Popen will look up). Whether the agent can resume a session is only known from its `initialize` answer; one
-  that cannot fails the resumed run with `resume_unsupported` instead of silently starting a new session.
-- can_enforce_zero_spend: from the billing verdict only. adapter_dispatch_problem therefore blocks every tool whose
-  billing is not verified, whatever its surface claims.
-- can_read_quota / can_interact: false. ACP has no quota read, and the work-session protocol (confirmed delivery of
-  each message) is Claude's / Codex's own; appended instructions run as resumed turns (`can_resume`).
+- one environment snapshot per run; the child gets only its allowlisted variables (ACP_ENV_ALLOWLIST), with PATH
+  reduced to its absolute entries;
+- the binary is resolved once against that PATH and started by its absolute real path, so what was resolved is what
+  runs (a relative PATH entry cannot swap in a project's own `gemini`, or `node` for a `#!/usr/bin/env node` script);
+- per-stream transcript buffers, redaction before any cut, bounded stdin writes and the MCP token only in the
+  session/new header (timetrace.acp_client).
 
-The run receives the job's RunControl (`control=`) as its permission host: the worktree's local rules, then the
-phone; without one every permission prompt is refused. The job's TimeTrace MCP access (`mcp=`) is offered to the
-agent as an http MCP server when the agent says it takes one.
+What the gates see: can_dispatch / can_resume follow the binary; can_enforce_zero_spend is the (fixed, false) billing
+verdict; can_read_quota / can_interact are false. A run receives the job's RunControl (`control=`) as its permission
+host and the job's TimeTrace MCP access (`mcp=`) as an http MCP server when the agent takes one.
 """
 import os
 import shutil
@@ -27,6 +28,47 @@ from timetrace.models import RunResult
 from timetrace.quota import merge_capabilities
 from timetrace.redact import masking
 from timetrace.toolpath import is_executable
+
+# The only variables an ACP child receives, from the run's one environment snapshot:
+#   PATH          finding `node` (both CLIs are node scripts) and the commands the model runs; absolute entries only
+#   HOME          where the CLI keeps its own login and settings
+#   USER, LOGNAME the account name tools such as git fall back to
+#   SHELL         the shell the CLI's command tool starts
+#   LANG, LC_*    text encoding of the CLI's and the tools' output
+#   TERM          output formatting of the tools the model runs
+#   TMPDIR        the per-user temporary directory macOS assigns (node's os.tmpdir())
+#   TZ            timestamps
+# Everything else stays out by construction: API keys, endpoint overrides (CODE_ASSIST_ENDPOINT, *_BASE_URL),
+# config-location overrides (GEMINI_CLI_HOME, ...), GOOGLE_APPLICATION_CREDENTIALS, proxies, extra CA certificates.
+ACP_ENV_ALLOWLIST = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ")
+ACP_ENV_ALLOWED_PREFIXES = ("LC_",)
+
+
+def absolute_path_entries(value: str) -> str:
+    """PATH with only its absolute entries: an empty or relative entry would resolve against the run's directory,
+    which holds repository content."""
+    return os.pathsep.join(entry for entry in (value or "").split(os.pathsep) if entry and os.path.isabs(entry))
+
+
+def acp_child_env(snapshot: Dict[str, str]) -> Dict[str, str]:
+    """An ACP child's whole environment: the allowlisted variables of the run's snapshot, nothing else."""
+    env = {key: value for key, value in snapshot.items()
+           if key in ACP_ENV_ALLOWLIST or key.startswith(ACP_ENV_ALLOWED_PREFIXES)}
+    if "PATH" in env:
+        env["PATH"] = absolute_path_entries(env["PATH"])
+    return env
+
+
+def resolve_binary(binary: str, path: str) -> Optional[str]:
+    """The absolute real path of `binary` (an absolute `bin`, or a name looked up on `path`), or None."""
+    if not binary:
+        return None
+    found = binary if os.path.isabs(binary) else shutil.which(binary, path=absolute_path_entries(path))
+    if not found or not is_executable(found):
+        return None
+    real = os.path.realpath(found)
+    return real if is_executable(real) else None
+
 
 # A prompt that failed with one of these is a usage limit (the session stays resumable), not a broken run.
 LIMIT_TEXT_MARKERS = ("rate limit", "usage limit", "quota", "resource_exhausted", "resource exhausted", "429")
@@ -71,7 +113,7 @@ class AcpAdapter(ToolAdapter):
                  which: Optional[Callable[[str], Optional[str]]] = None):
         self.cfg = cfg or {}
         self.billing = billing if billing is not None else self.default_billing()
-        self._which = which or shutil.which
+        self._which = which   # tests only; otherwise the same resolution a run uses
 
     def default_billing(self):
         return StaticBilling(False, "management_only", provider=self.name)
@@ -81,12 +123,9 @@ class AcpAdapter(ToolAdapter):
         return value.strip() if isinstance(value, str) and value.strip() else self.default_bin
 
     def resolved_binary(self) -> Optional[str]:
-        binary = self.binary()
-        if not binary:
-            return None
-        if os.path.isabs(binary):
-            return binary if is_executable(binary) else None
-        return self._which(binary)
+        if self._which is not None and not os.path.isabs(self.binary()):
+            return self._which(self.binary())
+        return resolve_binary(self.binary(), os.environ.get("PATH", ""))
 
     def command(self) -> List[str]:
         """The launch command: the pinned ACP entry point, then the user's own `extra_args`. Nothing secret is ever
@@ -101,10 +140,16 @@ class AcpAdapter(ToolAdapter):
         return merge_capabilities(caps)
 
     def prepare(self, cwd: str) -> Tuple[str, Optional[Dict[str, str]], List[str]]:
-        """(why this run must not start from `cwd`, "" to go ahead; the run's one environment snapshot; the command).
-        The snapshot is what a subclass checks and exactly what the child is started with (minus the billing keys and
-        secret-named variables): os.environ is not read again between the check and the spawn."""
-        return "", dict(os.environ), self.command()
+        """(why this run cannot start, "" to go ahead; the child's environment; the command). One snapshot of the
+        environment is taken here: the binary is resolved against its PATH (absolute entries only) and started by its
+        absolute real path, and its allowlisted variables are the child's whole environment. os.environ is not read
+        again before the spawn."""
+        env = acp_child_env(dict(os.environ))
+        cmd = self.command()
+        real = resolve_binary(cmd[0], env.get("PATH", ""))
+        if real is None:
+            return "could not start %s: not found on an absolute PATH entry" % os.path.basename(cmd[0]), None, cmd
+        return "", env, [real] + cmd[1:]
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               control=None, mcp: Optional[McpAccess] = None) -> RunResult:
@@ -119,14 +164,14 @@ class AcpAdapter(ToolAdapter):
         return self._run(prompt, cwd, session_id, log_file, cancel_event, control, mcp)
 
     def _run(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp) -> RunResult:
-        problem, snapshot, cmd = self.prepare(cwd)
+        problem, env, cmd = self.prepare(cwd)
         if problem:
             with open(log_file, "a", encoding="utf-8") as log:
-                log.write("--- not started: billing_unverified (%s) ---\n" % problem)
-            return RunResult(exit_code=1, session_id=session_id, error="billing_unverified: " + problem)
+                log.write("--- not started: %s ---\n" % problem)
+            return RunResult(exit_code=127, session_id=session_id, error=problem)
         # The rules go first in the one prompt ACP has (it has no system-prompt channel), as for Codex.
         session = AcpSession(cmd, cwd, log_file, SAFETY_RULES + "\n" + prompt, session_id=session_id,
                              host=control, mcp=mcp, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                             cancel_event=cancel_event, drop_env=billing_env_keys(self.name), base_env=snapshot)
+                             cancel_event=cancel_event, drop_env=billing_env_keys(self.name), base_env=env)
         with masking([mcp.token] if mcp is not None else []):
             return run_result(session.run(), session_id)

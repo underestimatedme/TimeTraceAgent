@@ -952,18 +952,9 @@ def _billing_login_label(details: Dict[str, Any]) -> str:
     if reason in ("auth_method_not_subscription:unknown", "api_provider_not_first_party:unknown"):
         return "无法核验"
     if reason.startswith(("auth_method_not_subscription:", "api_provider_not_first_party:",
-                          "api_key_fallback_in_env:", "api_key_fallback_in_settings:",
-                          "api_key_fallback_in_env_file:", "auth_type_enforced:", "system_settings_override:",
-                          "system_defaults_settings_override:", "workspace_settings_override:",
-                          "billing_overage_enabled:", "gemini_dotenv_present:", "gemini_system_config_present:",
-                          "gemini_workspace_config_present:", "gemini_agents_config_present:",
-                          "gemini_user_config_present:", "settings_key_not_allowed:",
-                          "gemini_credentials_not_personal:")) or reason in (
-                              "api_key_helper_configured", "api_key_fallback_in_auth_file", "external_auth_configured",
-                              "billing_overage_unset", "gemini_extra_args_unsupported"):
+                          "api_key_fallback_in_env:", "api_key_fallback_in_settings:")) or reason in (
+                              "api_key_helper_configured", "api_key_fallback_in_auth_file"):
         return "计费方式不符"
-    if reason in ("settings_missing", "auth_type_unset", "gemini_credentials_missing"):
-        return "未登录或登录已失效"
     return "无法核验"
 
 
@@ -1047,15 +1038,11 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolu
     return lines, verified
 
 
-# What doctor suggests when an ACP agent's zero-spend check fails. Advice only: nothing here logs in or edits settings.
+# Why doctor says an ACP agent is never dispatched. Advice only: nothing here logs in or edits settings.
 _ACP_FIX = {
-    "gemini": "只有同时满足这些条件才派发（核验不运行任何程序）：gemini 所属 package.json 是 @google/gemini-cli 0.60.x；"
-              "~/.gemini/settings.json 是严格 JSON，且只有 {\"security\": {\"auth\": {\"selectedType\": \"oauth-personal\"}}, "
-              "\"billing\": {\"overageStrategy\": \"never\"}}，不能有其他键；~/.gemini/oauth_creds.json 是个人登录；"
-              "~/.gemini 下没有 commands、skills、policies、agents 目录或非空 extensions；运行目录和家目录及其上级都没有 "
-              ".env、.agents 或其他 .gemini 目录；没有系统级 GeminiCli 配置目录；不设 extra_args。"
-              "子进程只拿到 PATH、HOME 等白名单环境变量",
-    "cursor": "Cursor 的套餐可能按用量计费，CLI 没有可核验的信号；TimeTrace 不会给 Cursor 派发任务",
+    "gemini": "TimeTrace 从不给 Gemini 派发任务：无法核验零付费和凭据隔离（会自动执行的工作区/用户配置、凭据类型、"
+              "MCP OAuth 令牌缓存、PATH/node 解析、版本）。ACP 运行本身可用，派发要等在真实安装上完成审计",
+    "cursor": "TimeTrace 从不给 Cursor 派发任务：Cursor 套餐可能按用量计费，CLI 没有可核验的信号。ACP 运行本身可用",
 }
 
 

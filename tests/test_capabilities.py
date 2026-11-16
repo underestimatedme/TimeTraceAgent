@@ -1,13 +1,9 @@
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from timetrace.adapters.cursor import CursorAdapter, safe_capabilities
 from timetrace.adapters.gemini import GeminiAdapter
-from timetrace import billing
-from timetrace.billing import StaticBilling, billing_env_keys
 
 
 class CapabilitiesTest(unittest.TestCase):
@@ -19,7 +15,7 @@ class CapabilitiesTest(unittest.TestCase):
 
     def test_acp_adapters_without_their_binary_are_management_only(self):
         for adapter in (CursorAdapter({}, which=lambda name: None),
-                        GeminiAdapter({}, billing=StaticBilling(False, "settings_missing"), which=lambda name: None)):
+                        GeminiAdapter({}, which=lambda name: None)):
             caps = adapter.capabilities()
             self.assertEqual(set(caps), {"can_record", "can_read_quota", "can_dispatch",
                                          "can_resume", "can_interact", "can_enforce_zero_spend"})
@@ -33,24 +29,15 @@ class CapabilitiesTest(unittest.TestCase):
 
     def test_a_run_whose_binary_is_missing_fails_without_raising(self):
         # Start / resume are implemented (through ACP) for both; the gate, not a NotImplementedError, keeps an
-        # unverified tool from running. A binary that does not exist is an ordinary failed run.
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HOME": d}), \
-                mock.patch.object(billing, "GEMINI_SYSTEM_DIRS", (str(Path(d) / "none"),)):
-            (Path(d) / ".gemini").mkdir()
-            (Path(d) / ".gemini" / "settings.json").write_text(
-                '{"security": {"auth": {"selectedType": "oauth-personal"}}, "billing": {"overageStrategy": "never"}}')
-            for name in billing_env_keys("gemini"):
-                os.environ.pop(name, None)   # restored by patch.dict
+        # unverified tool from being dispatched. A binary that does not exist is an ordinary failed run.
+        with tempfile.TemporaryDirectory() as d:
             missing = str(Path(d) / "missing-agent")
-            for adapter in (CursorAdapter({"bin": missing}), GeminiAdapter({"bin": missing}, billing=StaticBilling(True))):
+            for adapter in (CursorAdapter({"bin": missing}), GeminiAdapter({"bin": missing})):
                 for operation in ("start", "resume"):
                     with self.subTest(adapter=adapter.name, operation=operation):
                         result = getattr(adapter, operation)("prompt", d, "sess", str(Path(d) / "log"))
                         self.assertFalse(result.ok)
-                        # Gemini resolves and checks the binary before the spawn, so it never gets that far.
-                        self.assertIn("billing_unverified" if adapter.name == "gemini" else "could not start",
-                                      result.error)
-
+                        self.assertIn("could not start", result.error)
 
 if __name__ == "__main__":
     unittest.main()
