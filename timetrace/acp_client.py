@@ -287,10 +287,11 @@ class AcpSession:
         self._titles: Dict[str, str] = {}
         self._plan: Optional[List[Dict[str, Any]]] = None
         self._usage: Optional[Dict[str, Any]] = None
-        # The transcript's streamed text (message / thought chunks), written a whole line at a time so a token split
-        # across chunks is still masked.
-        self._stream_kind: Optional[str] = None
-        self._stream_buf = ""
+        # The transcript's streams (agent message text, thoughts, stray stdout, stderr), each with its own pending
+        # text. A stream's text is written only at its own newline, by a forced flush that keeps _HOLD_CHARS back, or
+        # at the very end, and always masked as a whole: a line of another stream never ends or flushes it, so a
+        # token arriving in pieces is masked once it is complete.
+        self._pending_text: Dict[str, str] = {}
 
     # ---- transcript ----------------------------------------------------------------------------------------------
     def _write_locked(self, text: str) -> None:
@@ -304,38 +305,40 @@ class AcpSession:
         except (OSError, ValueError):   # closed under a late reader: the run is over
             pass
 
-    def _end_stream_locked(self) -> None:
-        if self._stream_kind is not None and self._stream_buf:
-            self._write_locked(self._prefix(self._stream_kind) + mask_timetrace_tokens(self._stream_buf) + "\n")
-        self._stream_kind, self._stream_buf = None, ""
+    _PREFIXES = {"message": "", "thought": "[thought] ", "stdout": "[stdout] ", "stderr": "[stderr] "}
 
-    @staticmethod
-    def _prefix(kind: str) -> str:
-        return "" if kind == "message" else "[%s] " % kind
+    def _write_stream_locked(self, kind: str, text: str) -> None:
+        self._write_locked(self._PREFIXES[kind] + mask_timetrace_tokens(text) + "\n")
+
+    def _end_streams_locked(self) -> None:
+        """The very end: whatever each stream still holds, masked whole."""
+        for kind, text in list(self._pending_text.items()):
+            if text:
+                self._write_stream_locked(kind, text)
+        self._pending_text.clear()
 
     def _line(self, text: str) -> None:
+        """One complete line of the client's own (an event, a request, a decision). It is written at once and leaves
+        every stream's pending text where it is."""
         with self._log_lock:
-            self._end_stream_locked()
             self._write_locked(mask_timetrace_tokens(text) + "\n")
 
     def _stream(self, kind: str, chunk: str) -> None:
         with self._log_lock:
-            if self._stream_kind != kind:
-                self._end_stream_locked()
-                self._stream_kind = kind
-            self._stream_buf += chunk
-            while "\n" in self._stream_buf:
-                line, self._stream_buf = self._stream_buf.split("\n", 1)
-                self._write_locked(self._prefix(kind) + mask_timetrace_tokens(line) + "\n")
-            if len(self._stream_buf) > _FLUSH_CHARS:
+            text = self._pending_text.get(kind, "") + chunk
+            while "\n" in text:
+                line, text = text.split("\n", 1)
+                self._write_stream_locked(kind, line)
+            if len(text) > _FLUSH_CHARS:
                 # A line this long is written in pieces, always keeping _HOLD_CHARS back and never cutting a token:
                 # one that is still arriving is masked once it is complete. Whitespace is preferred (no token has any).
-                cut = len(self._stream_buf) - _HOLD_CHARS
-                space = self._stream_buf.rfind(" ", 0, cut)
-                cut = space + 1 if space >= 0 else _safe_cut(self._stream_buf, cut)
+                cut = len(text) - _HOLD_CHARS
+                space = text.rfind(" ", 0, cut)
+                cut = space + 1 if space >= 0 else _safe_cut(text, cut)
                 if cut > 0:
-                    self._write_locked(self._prefix(kind) + mask_timetrace_tokens(self._stream_buf[:cut]) + "\n")
-                    self._stream_buf = self._stream_buf[cut:]
+                    self._write_stream_locked(kind, text[:cut])
+                    text = text[cut:]
+            self._pending_text[kind] = text
 
     # ---- the wire ------------------------------------------------------------------------------------------------
     def _send(self, message: Dict[str, Any]) -> bool:
@@ -390,7 +393,7 @@ class AcpSession:
                 if not isinstance(message, dict):
                     # ACP reserves stdout for JSON-RPC; a stray line is shown, never acted on.
                     self.garbage_lines += 1
-                    self._line("[stdout] " + _short(raw))
+                    self._stream("stdout", line if line.endswith("\n") else line + "\n")
                     continue
                 try:
                     self._dispatch(message)
@@ -404,7 +407,7 @@ class AcpSession:
     def _read_stderr(self, stream) -> None:
         try:
             for line in iter(stream.readline, ""):
-                self._line("[stderr] " + line.rstrip("\n"))
+                self._stream("stderr", line)
         except (OSError, ValueError):
             pass
 
@@ -800,6 +803,8 @@ class AcpSession:
                 stream.close()
             except (OSError, ValueError):
                 pass
+        with self._log_lock:
+            self._end_streams_locked()
         for line in self._summary_lines():
             self._line(line)
         return problem

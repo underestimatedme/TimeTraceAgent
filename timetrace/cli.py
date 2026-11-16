@@ -955,7 +955,8 @@ def _billing_login_label(details: Dict[str, Any]) -> str:
                           "api_key_fallback_in_env:", "api_key_fallback_in_settings:",
                           "api_key_fallback_in_env_file:", "auth_type_enforced:", "system_settings_override:",
                           "system_defaults_settings_override:", "workspace_settings_override:",
-                          "billing_overage_enabled:")) or reason in (
+                          "billing_overage_enabled:", "gemini_dotenv_present:", "gemini_system_settings_present:",
+                          "auth_override_present:")) or reason in (
                               "api_key_helper_configured", "api_key_fallback_in_auth_file", "external_auth_configured",
                               "billing_overage_unset"):
         return "计费方式不符"
@@ -1046,11 +1047,10 @@ def _tool_check(name: str, cfg: Dict[str, Any], adapters: Dict[str, Any], resolu
 
 # What doctor suggests when an ACP agent's zero-spend check fails. Advice only: nothing here logs in or edits settings.
 _ACP_FIX = {
-    "gemini": "在这台 Mac 上运行 gemini，选择 Login with Google（个人 Google 账号）登录；不要设置 GEMINI_API_KEY、"
-              "GOOGLE_API_KEY、Vertex AI 或 GOOGLE_CLOUD_PROJECT（环境变量、任何 .env 文件和 settings.json 都算）；"
-              "在 ~/.gemini/settings.json 明确写入 \"billing\": {\"overageStrategy\": \"never\"}（不设即默认 ask，不通过）；"
-              "不支持 GEMINI_CLI_HOME、GEMINI_CLI_SYSTEM_SETTINGS_PATH、GEMINI_CLI_SYSTEM_DEFAULTS_PATH、"
-              "advanced.ignoreLocalEnv 和 --ignore-env",
+    "gemini": "只有同时满足这些条件才派发：gemini --version 为 0.60.x；~/.gemini/settings.json 是严格 JSON，"
+              "security.auth 只有 selectedType = \"oauth-personal\"，billing.overageStrategy = \"never\"；"
+              "运行目录到根目录、以及家目录下没有任何 .env 或 .gemini/.env；没有系统级 GeminiCli 设置文件；"
+              "工作区 .gemini/settings.json 不含 security、billing、advanced。子进程只拿到 PATH、HOME 等白名单环境变量",
     "cursor": "Cursor 的套餐可能按用量计费，CLI 没有可核验的信号；TimeTrace 不会给 Cursor 派发任务",
 }
 

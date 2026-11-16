@@ -523,5 +523,29 @@ class TokenFragmentTest(AcpCase):
         self.assertEqual(known.stop_reason, "max_turn_requests")
 
 
+
+# ---- third review (ec54723): fails on that commit ------------------------------------------------------------------
+
+class InterleavedStreamsTest(AcpCase):
+    """Finding 5: a [stderr] line arriving in the middle of a message ended the message's pending text and wrote the
+    token's first characters, then the rest. Streams now keep their own pending text."""
+
+    def test_a_stderr_line_between_two_pieces_of_a_token_never_splits_it(self):
+        from timetrace.redact import masking
+        with masking([LONG_TOKEN]):
+            result = self.run_session({"turn": [
+                {"chunk": "key: " + LONG_TOKEN[:19]},
+                {"sleep": 0.3},
+                {"stderr": "warning: something unrelated"},
+                {"sleep": 0.3},
+                {"chunk": LONG_TOKEN[19:] + " end\n"}]})
+        self.assertEqual(result.stop_reason, "end_turn")
+        log = self.log_text()
+        self.assertIn("[stderr] warning: something unrelated", log)
+        runs = [LONG_TOKEN[i:i + 12] for i in range(len(LONG_TOKEN) - 11) if LONG_TOKEN[i:i + 12] in log]
+        self.assertEqual(runs, [], "no 12-character run of the token in the log")
+        self.assertIn("key: [REDACTED:timetrace] end", log)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,8 @@ Behaviour comes from the JSON file named by $TT_ACP_SCENARIO:
    "replay": [update, ...],        session/load sends these before it answers
    "turn": [step, ...],            what session/prompt does
    "garbage_first": bool, "ignore_eof": bool, "env_probe": [NAME, ...], "spawn_child": bool,
-   "stop_reading_after": method}  after that request, stdin is never read again (the client's writes then block)
+   "stop_reading_after": method,  after that request, stdin is never read again (the client's writes then block)
+   "version": "0.60.0"}           what `--version` prints (the default when there is no scenario yet)
 Steps:
   {"chunk": text} {"thought": text} {"update": {...session update...}} {"stderr": text} {"garbage": text}
   {"permission": {"toolCall": {...}, "options": [...]}}   ask, wait for the answer, record it
@@ -45,7 +46,25 @@ def record(obj):
             fh.write(json.dumps(obj) + "\n")
 
 
+def version():
+    """`--version`: print the scenario's version and exit, recording the environment it was asked with (in a file of
+    its own, so a version check never looks like a started session)."""
+    try:
+        with open(os.environ["TT_ACP_SCENARIO"], encoding="utf-8") as fh:
+            printed = json.load(fh).get("version", "0.60.0")
+    except (KeyError, OSError, ValueError):
+        printed = "0.60.0"
+    path = os.environ.get("TT_ACP_TRANSCRIPT")
+    if path:
+        with open(path + ".version", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"env": sorted(os.environ), "cwd": os.getcwd()}) + "\n")
+    print(printed)
+
+
 def main():
+    if sys.argv[1:] == ["--version"]:
+        version()
+        return
     with open(os.environ["TT_ACP_SCENARIO"], encoding="utf-8") as fh:
         scenario = json.load(fh)
     record({"argv": sys.argv[1:]})

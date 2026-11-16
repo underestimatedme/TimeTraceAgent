@@ -15,16 +15,17 @@ starts a model run, so verifying costs nothing. Anything unknown stays
 unverified with a machine-readable reason. Verdicts are cached briefly and
 re-checked right before a spawn.
 
-The ACP agents follow the same rule: Gemini CLI is verified from its own
-settings and .env files (personal Google login, no key / Vertex / Cloud
-project anywhere it would load one); Cursor has no signal we can check, so its
-adapter stays unverified and is never dispatched.
+The ACP agents follow the same rule. Gemini CLI is gated hermetically: an
+allowlisted child environment, no .env or system settings file anywhere the
+CLI could read one, exact user settings (personal Google login, AI credits
+"never"), no billing keys in workspace settings, and the audited CLI version.
+Cursor has no signal we can check, so it stays unverified and is never
+dispatched.
 """
 import json
 import os
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,32 +197,45 @@ def verify_codex(cfg: Mapping[str, object], run: Callable[[Sequence[str], float]
 
 
 # ---- Gemini CLI ---------------------------------------------------------------------------------------------------
-# Gemini CLI has no read-only "auth status" command, so the verdict comes from the files it decides by (not run
-# against a real Gemini CLI on this machine; paths and keys follow its settings code). The rule is to refuse rather
-# than model: whatever changes WHERE the CLI reads its settings or .env from, or what this code cannot evaluate
-# exactly the way the child will, leaves the verdict unverified with a precise reason. What is accepted: "Login with
-# Google" on a personal account (`oauth-personal`), paid AI credits explicitly off, and no key, Vertex AI or Cloud
-# project in the environment or in any .env file the CLI could load.
+# Gemini CLI has no read-only "auth status" command, and modelling how it resolves its configuration proved fragile
+# (settings layers, .env discovery, path overrides, endpoint variables). The gate is therefore hermetic and allow-only:
+# the child gets an allowlisted environment, and a run is verified only when the few files that decide its billing
+# exist exactly as required and nothing else that could change them exists at all. Anything else is refused with a
+# precise reason. Paths and keys follow Gemini CLI v0.60.0; no real Gemini CLI was run on this machine.
 GEMINI_PERSONAL_LOGIN = "oauth-personal"
+GEMINI_OVERAGE_OFF = "never"
+GEMINI_AUDITED_MINOR = (0, 60)       # the CLI version these rules were written against: 0.60.x only
+GEMINI_VERSION_TIMEOUT_SECONDS = 15.0
+# The system settings file of each platform; its system-defaults.json sits next to it. Existence alone refuses.
 GEMINI_SYSTEM_SETTINGS = {"darwin": "/Library/Application Support/GeminiCli/settings.json",
                           "linux": "/etc/gemini-cli/settings.json"}
-# Variables that move Gemini CLI's settings, login or .env lookup elsewhere. Set at all (absolute or relative, even
-# empty) -> refused: a relative value would resolve against the task's directory in the child but this process's
-# here, and their exact semantics were not verified against the CLI's source.
-GEMINI_SETTINGS_PATH_VARS = ("GEMINI_CLI_HOME", "GEMINI_CLI_SYSTEM_SETTINGS_PATH", "GEMINI_CLI_SYSTEM_DEFAULTS_PATH")
-# billing.overageStrategy: what Gemini CLI does with paid AI credits once the plan's quota runs out. "always" spends
-# them without asking; the default ("ask", also when unset) asks, and it was not shown from the CLI's source that an
-# ACP run can never answer that question with "spend". So only an explicit "never" is accepted.
-GEMINI_OVERAGE_OFF = "never"
-_DOTENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:=|:\s)\s*(.*)$")
+# The only variables the Gemini child receives, from the run's one environment snapshot:
+#   PATH          finding `node` (an npm-installed CLI is a node script) and the commands the model runs (git, ...)
+#   HOME          where the CLI keeps its login and user settings - exactly the ones verified here
+#   USER, LOGNAME the account name tools such as git fall back to
+#   SHELL         the shell the CLI's command tool starts
+#   LANG, LC_*    text encoding of the CLI's and the tools' output
+#   TERM          output formatting of the tools the model runs
+#   TMPDIR        the per-user temporary directory macOS assigns (node's os.tmpdir())
+#   TZ            timestamps
+# Everything else stays out by construction: API keys, Vertex / Cloud project settings, endpoint overrides such as
+# CODE_ASSIST_ENDPOINT, GEMINI_CLI_HOME and the system-settings path variables, proxies and extra CA certificates (a
+# network that needs them fails closed: the run cannot connect, so it cannot spend).
+GEMINI_ENV_ALLOWLIST = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ")
+GEMINI_ENV_ALLOWED_PREFIXES = ("LC_",)
+# The top-level keys a workspace's .gemini/settings.json must not set (auth, billing, environment handling).
+GEMINI_WORKSPACE_FORBIDDEN_KEYS = ("security", "billing", "advanced")
+_GEMINI_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+
+
+def gemini_child_env(snapshot: Mapping[str, str]) -> Dict[str, str]:
+    """The Gemini child's whole environment: the allowlisted variables of the run's snapshot, nothing else."""
+    return {key: value for key, value in snapshot.items()
+            if key in GEMINI_ENV_ALLOWLIST or key.startswith(GEMINI_ENV_ALLOWED_PREFIXES)}
 
 
 def gemini_home(env: Mapping[str, str]) -> Tuple[Optional[Path], str]:
-    """The home Gemini CLI will use, from the run's environment snapshot only (its HOME; os.homedir() reads the same
-    variable), or why it cannot be known exactly: a settings-path override is set, HOME is missing or relative."""
-    for name in GEMINI_SETTINGS_PATH_VARS:
-        if name in env:
-            return None, "gemini_settings_path_override:" + name
+    """The home the child will use: the snapshot's HOME (os.homedir() reads the same variable), or why not."""
     home = env.get("HOME")
     if not home:
         return None, "home_unset"
@@ -230,10 +244,15 @@ def gemini_home(env: Mapping[str, str]) -> Tuple[Optional[Path], str]:
     return Path(home), ""
 
 
-def _gemini_env_files(start: Optional[str], home: Path) -> List[Path]:
-    """Every .env file Gemini CLI could load for a run started in `start`: each `.gemini/.env` and `.env` on the way
-    up to the filesystem root, and the home's. The CLI stops at the first one it finds (and, with settings this code
-    refuses anyway, may skip some); checking all of them needs no model of that search."""
+def _shown(path: Path, home: Path) -> str:
+    """A path for a reason string, with the home shown as ~ (reasons reach doctor output and run errors)."""
+    text = str(path)
+    return "~" + text[len(str(home)):] if text == str(home) or text.startswith(str(home) + os.sep) else text
+
+
+def _dotenv_candidates(start: Optional[str], home: Path) -> List[Path]:
+    """Every .env file Gemini CLI could load: each `.gemini/.env` and `.env` from the run directory up to the
+    filesystem root, and the home's two. Their content is never read: existence alone refuses."""
     files: List[Path] = []
     if start is not None:
         current = Path(os.path.abspath(start))
@@ -243,200 +262,139 @@ def _gemini_env_files(start: Optional[str], home: Path) -> List[Path]:
                 break
             current = current.parent
     files += [home / ".gemini" / ".env", home / ".env"]
-    return [path for path in dict.fromkeys(files) if path.exists()]
+    return list(dict.fromkeys(files))
 
 
-def _dotenv_keys(path: Path) -> Dict[str, str]:
-    """KEY=value pairs of a .env file (dotenv syntax, read generously: a value that only might be set counts)."""
-    values: Dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = _DOTENV_LINE.match(line)
-        if not match or line.lstrip().startswith("#"):
-            continue
-        value = match.group(2).strip()
-        if value[:1] in ("'", '"', "`"):
-            value = value[1:].split(value[0], 1)[0]
-        else:
-            value = value.split("#", 1)[0].strip()
-        values[match.group(1)] = value
-    return values
+def _system_files(system_settings_path: Optional[str], system_defaults_path: Optional[str]) -> List[Path]:
+    settings = [Path(p) for p in GEMINI_SYSTEM_SETTINGS.values()]
+    if system_settings_path:
+        settings.append(Path(system_settings_path))
+    files = settings + [p.parent / "system-defaults.json" for p in settings]
+    if system_defaults_path:
+        files.append(Path(system_defaults_path))
+    return list(dict.fromkeys(files))
 
 
-def _env_file_problem(path: Path) -> str:
+def _read_json_object(path: Path) -> Optional[Dict[str, object]]:
+    """The file as one strict JSON object, or None (unreadable, not JSON, not an object)."""
     try:
-        values = _dotenv_keys(path)
-    except OSError:
-        return "env_file_unreadable"
-    for key in billing_env_keys("gemini"):
-        if values.get(key):
-            return "api_key_fallback_in_env_file:" + key
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _user_settings_problem(home: Path) -> str:
+    """~/.gemini/settings.json must exist, be strict JSON and say exactly: security.auth.selectedType ==
+    "oauth-personal" (the layout v0.60.0 reads; the old top-level selectedAuthType does not count) with no other
+    auth setting, and billing.overageStrategy == "never"."""
+    path = home / ".gemini" / "settings.json"
+    if not path.exists():
+        return "settings_missing"
+    settings = _read_json_object(path)
+    if settings is None:
+        return "settings_unreadable"
+    security = settings.get("security") if isinstance(settings.get("security"), dict) else {}
+    auth = security.get("auth") if isinstance(security.get("auth"), dict) else {}
+    selected = auth.get("selectedType")
+    if selected is None:
+        return "auth_type_unset"
+    if selected != GEMINI_PERSONAL_LOGIN:
+        return "auth_method_not_subscription:%s" % selected
+    extra = sorted(key for key in auth if key != "selectedType")
+    if extra:
+        return "auth_override_present:security.auth.%s" % extra[0]
+    billing = settings.get("billing") if isinstance(settings.get("billing"), dict) else {}
+    if "overageStrategy" not in billing:
+        return "billing_overage_unset"
+    if billing["overageStrategy"] != GEMINI_OVERAGE_OFF:
+        return "billing_overage_enabled:%s" % billing["overageStrategy"]
     return ""
 
 
-def _strip_json_comments(text: str) -> str:
-    """Gemini CLI reads settings.json with // and /* */ comments allowed (JSONC); strings are kept as they are."""
-    out, i, n, in_string = [], 0, len(text), False
-    while i < n:
-        ch = text[i]
-        if in_string:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            in_string = ch != '"'
-            i += 1
-        elif ch == '"':
-            in_string = True
-            out.append(ch)
-            i += 1
-        elif text.startswith("//", i):
-            end = text.find("\n", i)
-            i = n if end < 0 else end
-        elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end < 0 else end + 2
-            out.append(" ")
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
+def _workspace_settings_problem(cwd: str, home: Path) -> str:
+    """Each .gemini/settings.json from the run directory up to its repository root (the first directory holding
+    .git), never above the home (whose file is the user's): none may set security, billing or advanced."""
+    current = Path(os.path.abspath(cwd))
+    while current != home:
+        path = current / ".gemini" / "settings.json"
+        if path.exists():
+            settings = _read_json_object(path)
+            if settings is None:
+                return "workspace_settings_unreadable"
+            for key in GEMINI_WORKSPACE_FORBIDDEN_KEYS:
+                if key in settings:
+                    return "workspace_settings_override:%s" % key
+        if (current / ".git").exists() or current.parent == current:
+            break
+        current = current.parent
+    return ""
 
 
-def _gemini_settings(path: Path) -> Dict[str, object]:
-    """The settings document; raises OSError / ValueError when it cannot be read as one JSON object."""
-    value = json.loads(_strip_json_comments(path.read_text(encoding="utf-8")))
-    if not isinstance(value, dict):
-        raise ValueError("settings is not an object")
-    return value
+def _version_problem(binary: str, env: Mapping[str, str], cwd: str, run: Callable = subprocess.run) -> str:
+    """`<bin> --version` (it prints the version and exits: no model call), with the child's hermetic environment;
+    only a plain 0.60.x is accepted."""
+    try:
+        proc = run([binary, "--version"], capture_output=True, text=True, timeout=GEMINI_VERSION_TIMEOUT_SECONDS,
+                   stdin=subprocess.DEVNULL, env=gemini_child_env(env), cwd=cwd)
+    except Exception as exc:   # missing binary, timeout, permission: all mean "not the audited CLI"
+        return "gemini_version_unaudited:" + type(exc).__name__
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    match = _GEMINI_VERSION.fullmatch(lines[-1]) if proc.returncode == 0 and lines else None
+    if match is None:
+        return "gemini_version_unaudited:unparsable"
+    if (int(match.group(1)), int(match.group(2))) != GEMINI_AUDITED_MINOR:
+        return "gemini_version_unaudited:%s.%s.%s" % match.groups()
+    return ""
 
 
-def _section(settings: Mapping[str, object], *keys: str) -> Mapping[str, object]:
-    for key in keys:
-        settings = settings.get(key) if isinstance(settings.get(key), dict) else {}
-    return settings
-
-
-# One leaf each of the settings that decide billing or where .env comes from, read from one document (None: this
-# layer does not set it). The login type moved from a top-level `selectedAuthType` to security.auth.selectedType.
-_GEMINI_KEYS: Dict[str, Callable[[Mapping[str, object]], object]] = {
-    "selectedType": lambda s: (_section(s, "security", "auth").get("selectedType")
-                               if "selectedType" in _section(s, "security", "auth") else s.get("selectedAuthType")),
-    "enforcedType": lambda s: _section(s, "security", "auth").get("enforcedType"),
-    "useExternal": lambda s: _section(s, "security", "auth").get("useExternal"),
-    "overageStrategy": lambda s: _section(s, "billing").get("overageStrategy"),
-    "ignoreLocalEnv": lambda s: _section(s, "advanced").get("ignoreLocalEnv"),
-}
-
-
-def _gemini_layers(home: Path, cwd: Optional[str], system_settings_path: Optional[str],
-                   system_defaults_path: Optional[str]) -> Tuple[List[Tuple[str, Mapping[str, object]]], str]:
-    """The settings documents Gemini CLI merges, lowest precedence first: the system defaults, the user's, the
-    workspace's (the run's directory, repository content) and the system override; or why they cannot all be read.
-    Only the user's file is required: it is where a login is recorded. The system paths are the CLI's fixed ones
-    (their override variables are refused before this point)."""
-    system = Path(system_settings_path or GEMINI_SYSTEM_SETTINGS.get(sys.platform, GEMINI_SYSTEM_SETTINGS["linux"]))
-    defaults = Path(system_defaults_path or system.parent / "system-defaults.json")
-    user = home / ".gemini" / "settings.json"
-    workspace = Path(os.path.abspath(cwd)) / ".gemini" / "settings.json" if cwd is not None else None
-    layers: List[Tuple[str, Mapping[str, object]]] = []
-    for label, path in (("system_defaults", defaults), ("user", user),
-                        ("workspace", workspace if workspace != user else None), ("system", system)):
-        if path is None:
-            continue
-        if not path.exists():
-            if label == "user":
-                return [], "settings_missing"
-            continue
-        try:
-            layers.append((label, _gemini_settings(path)))
-        except (OSError, ValueError):
-            return [], "settings_unreadable" if label == "user" else label + "_settings_unreadable"
-    return layers, ""
-
-
-def _effective(layers: Sequence[Tuple[str, Mapping[str, object]]], key: str) -> Tuple[str, object]:
-    """(layer, value) of one setting after the merge: the highest-precedence layer that sets it wins."""
-    found: Tuple[str, object] = ("", None)
-    for label, settings in layers:
-        value = _GEMINI_KEYS[key](settings)
-        if value is not None and value != "":
-            found = (label, value)
-    return found
-
-
-def _ignores_env(extra_args: Sequence[object]) -> bool:
-    return any(str(arg) == "--ignore-env" or str(arg).startswith("--ignore-env=") for arg in extra_args or ())
-
-
-def gemini_billing_problem(env: Mapping[str, str], cwd: Optional[str] = None, extra_args: Sequence[object] = (),
-                           system_settings_path: Optional[str] = None,
-                           system_defaults_path: Optional[str] = None) -> Tuple[str, str]:
-    """(why a Gemini run could bill, or could not be judged exactly; the effective login type). The reason is ""
-    only when every check passed. `env` is the run's environment snapshot: the same one the child is started with.
-    Without `cwd` it judges what every run shares (the verifier); with it, also what that run's directory adds."""
-    reason = _env_fallback("gemini", env)
-    if reason:
-        return reason, ""
+def gemini_billing_problem(env: Mapping[str, str], cwd: Optional[str] = None, binary: str = "gemini",
+                           system_settings_path: Optional[str] = None, system_defaults_path: Optional[str] = None,
+                           run: Callable = subprocess.run) -> str:
+    """Why a Gemini run is not verified zero-spend, "" when every allow condition holds. `env` is the run's one
+    environment snapshot (the child gets its allowlisted part); without `cwd` it judges what every run shares (the
+    verifier), with it also the run's own directory (right before the spawn)."""
     home, reason = gemini_home(env)
     if home is None:
-        return reason, ""
-    if _ignores_env(extra_args):
-        return "gemini_env_discovery_unsupported:--ignore-env", ""
-    layers, reason = _gemini_layers(home, cwd, system_settings_path, system_defaults_path)
+        return reason
+    for path in _system_files(system_settings_path, system_defaults_path):
+        if path.exists():
+            return "gemini_system_settings_present:%s" % path
+    for path in _dotenv_candidates(cwd, home):
+        if path.exists():
+            return "gemini_dotenv_present:%s" % _shown(path, home)
+    reason = _user_settings_problem(home)
     if reason:
-        return reason, ""
-    if _effective(layers, "ignoreLocalEnv")[1] not in (None, False):
-        return "gemini_env_discovery_unsupported:advanced.ignoreLocalEnv", ""
-    for env_file in _gemini_env_files(cwd, home):
-        reason = _env_file_problem(env_file)
+        return reason
+    if cwd is not None:
+        reason = _workspace_settings_problem(cwd, home)
         if reason:
-            return reason, ""
-    label, selected = _effective(layers, "selectedType")
-    selected = str(selected) if selected is not None else ""
-    if _effective(layers, "useExternal")[1] not in (None, False):
-        return "external_auth_configured", selected
-    enforced = _effective(layers, "enforcedType")[1]
-    if enforced is not None and enforced != GEMINI_PERSONAL_LOGIN:
-        return "auth_type_enforced:%s" % enforced, selected
-    if not selected:
-        return "auth_type_unset", ""
-    if selected != GEMINI_PERSONAL_LOGIN:
-        if label == "user":
-            return "auth_method_not_subscription:%s" % selected, selected
-        return "%s_settings_override:%s" % (label, selected), selected
-    label, overage = _effective(layers, "overageStrategy")
-    if overage is None:
-        return "billing_overage_unset", selected
-    if overage != GEMINI_OVERAGE_OFF:
-        if label == "user":
-            return "billing_overage_enabled:%s" % overage, selected
-        return "%s_settings_override:billing.overageStrategy=%s" % (label, overage), selected
-    return "", selected
+            return reason
+    return _version_problem(binary, env, cwd if cwd is not None else str(home), run)
 
 
 def verify_gemini(cfg: Mapping[str, object], env: Optional[Mapping[str, str]] = None,
                   system_settings_path: Optional[str] = None, system_defaults_path: Optional[str] = None,
-                  now: Optional[float] = None) -> BillingVerdict:
+                  now: Optional[float] = None, run: Callable = subprocess.run) -> BillingVerdict:
     now = time.time() if now is None else now
     env = dict(os.environ) if env is None else env
-    reason, selected = gemini_billing_problem(env, None, cfg.get("extra_args") or (), system_settings_path,
-                                              system_defaults_path)
+    reason = gemini_billing_problem(env, None, str(cfg.get("bin") or "gemini"), system_settings_path,
+                                    system_defaults_path, run)
     if reason:
-        return _unverified("gemini", reason, selected, now)
-    return BillingVerdict(provider="gemini", verified=True, reason="", auth_method=selected, verified_at=now)
+        return _unverified("gemini", reason, "", now)
+    return BillingVerdict(provider="gemini", verified=True, reason="", auth_method=GEMINI_PERSONAL_LOGIN,
+                          verified_at=now)
 
 
-def gemini_workspace_problem(cwd: str, env: Mapping[str, str], extra_args: Sequence[object] = (),
+def gemini_workspace_problem(cwd: str, env: Mapping[str, str], binary: str = "gemini",
                              system_settings_path: Optional[str] = None,
-                             system_defaults_path: Optional[str] = None) -> str:
-    """The whole check again for one run, right before it is spawned, against the snapshot `env` the child will be
-    started with, now with what its directory adds: every .env file on the way up from there (a project's `.env`
-    often holds a GEMINI_API_KEY for the app itself) and the workspace's .gemini/settings.json, repository content
-    merged over the user's settings. "" to go ahead."""
+                             system_defaults_path: Optional[str] = None, run: Callable = subprocess.run) -> str:
+    """The whole check again for one run, right before it is spawned, against the snapshot whose allowlisted part
+    the child gets, now with the run's directory: every .env on the way up from there and its workspace settings.
+    "" to go ahead."""
     if not isinstance(env, Mapping):
         raise TypeError("env must be the run's environment snapshot")
-    return gemini_billing_problem(env, cwd, extra_args, system_settings_path, system_defaults_path)[0]
+    return gemini_billing_problem(env, cwd, binary, system_settings_path, system_defaults_path, run)
 
 
 class BillingVerifier:
