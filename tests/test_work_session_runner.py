@@ -85,7 +85,7 @@ class WorkSessionRunnerTest(Base):
                             turn_id="turn-1", message_id="message-1")
         sent = []
         runner.attach_interactive(lambda key, text, done: (sent.append(("append", text)), done("applied")))
-        def respond(answer):
+        def respond(answer, **kwargs):
             sent.append(("permission", answer["behavior"]))
             return True
         request = {"tool_name": "Bash", "input": {"command": "touch marker"}}

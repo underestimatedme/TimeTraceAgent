@@ -357,18 +357,18 @@ class RunControl:
                 if cancelled.is_set() or self._closed or self.cancel_event.is_set():
                     self._resolve(request_id, "expired")
                     return {"behavior": "deny", "message": TIMEOUT_DENY}
-                decision = self._decisions.get(request_id)
-                if decision is not None:
-                    break
                 left = deadline - self.clock()
                 if left <= 0:
                     self._resolve(request_id, "expired")
                     audit.record(self.home, "approval", job_id=self.job_id, request_id=request_id, tool=tool,
                                  decision="deny", source="timeout", summary=summary)
                     return {"behavior": "deny", "message": TIMEOUT_DENY}
+                decision = self._decisions.get(request_id)
+                if decision is not None:
+                    break
                 self._cond.wait(min(left, .25))
-            approved = decision.get("decision") == "approve"
             expired = decision.get("reason") == "expired"
+            approved = decision.get("decision") == "approve" and not expired
             remember = approved and decision.get("remember") is True and key is not None
             if remember:
                 self._remembered.add(key)
@@ -379,11 +379,23 @@ class RunControl:
             "behavior": "deny", "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000],
         }
         if respond is not None:
+            def approval_open():
+                return self.clock() < deadline
+
             written = False
             try:
                 if not cancelled.is_set() and self.provider_input_allowed():
-                    written = respond(response)
+                    if approved and approval_open():
+                        written = respond(response, approval_open=approval_open)
+                    else:
+                        if approved:
+                            approved, expired, remember = False, True, False
+                            outcome = "expired"
+                            response = {"behavior": "deny", "message": TIMEOUT_DENY}
+                        written = respond(response)
             finally:
+                if not written:
+                    approved, expired, remember = False, True, False
                 with self._cond:
                     self._resolve(request_id, outcome if written else "expired")
         audit.record(self.home, "approval", job_id=self.job_id, request_id=request_id, tool=tool,

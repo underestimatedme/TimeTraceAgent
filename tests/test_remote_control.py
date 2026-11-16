@@ -170,6 +170,41 @@ class ApprovalTest(Base):
                 resolved, _ = self.wait_event("approval_resolved")
                 self.assertEqual(resolved["outcome"], outcome)
 
+    def test_expiry_precedes_an_approval_already_waiting_in_the_lease(self):
+        clock = [1000.0]
+        self.control.clock = lambda: clock[0]
+        self.control.approval_timeout = 1
+        box, worker, _ = self.ask_async({"tool_name": "Bash", "input": {"command": "touch marker"}})
+        asked, _ = self.wait_event("approval_requested")
+        with self.control._cond:
+            clock[0] = 1001.0
+            self.control.apply_lease({"approvals": [{"request_id": asked["request_id"], "decision": "approve"}]})
+        worker.join(2)
+        self.assertEqual(box["answer"], {"behavior": "deny", "message": TIMEOUT_DENY})
+        self.assertEqual(self.control.take_events()[0]["outcome"], "expired")
+
+    def test_approval_expiring_during_provider_gate_is_denied(self):
+        clock = [1000.0]
+        def gate(_):
+            clock[0] = 1001.0
+            return True
+        self.control = RunControl("job1", self.home, self.cancel, root=str(self.root),
+                                  turn_id="turn-1", clock=lambda: clock[0], approval_timeout=1, input_gate=gate)
+        self.control.authorize_provider_input(time.time() + 5)
+        sent = []
+        def respond(answer, **kwargs):
+            sent.append(answer)
+            return True
+        worker = threading.Thread(target=self.control.permission,
+                                  args=({"tool_name": "Bash", "input": {"command": "touch marker"}}, threading.Event()),
+                                  kwargs={"respond": respond}, daemon=True)
+        worker.start()
+        asked, _ = self.wait_event("approval_requested")
+        self.control.apply_lease({"approvals": [{"request_id": asked["request_id"], "decision": "approve"}]})
+        worker.join(2)
+        self.assertEqual(sent, [{"behavior": "deny", "message": TIMEOUT_DENY}])
+        self.assertEqual(self.control.take_events()[0]["outcome"], "expired")
+
     def test_no_decision_within_the_timeout_denies_with_the_spec_message(self):
         self.control.approval_timeout = 0.3
         answer = self.control.permission({"tool_name": "WebFetch", "input": {"url": "https://x.test"}},

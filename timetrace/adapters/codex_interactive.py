@@ -225,12 +225,14 @@ class CodexTurn:
                 return
             self.permission_requests[id_] = cancelled
 
-        def answer(decision):
+        def answer(decision, *, approval_open=None):
             with self.lock:
                 if self.ended or self.cancel.is_set() or cancelled.is_set() or not self.host.provider_input_allowed(check_gate=False):
                     return False
-                choice = "accept" if decision.get("behavior") == "allow" else "decline"
-                return self._write_locked({"id": id_, "result": {"decision": choice}})
+                expired = approval_open is not None and not approval_open()
+                choice = "accept" if not expired and decision.get("behavior") == "allow" else "decline"
+                written = self._write_locked({"id": id_, "result": {"decision": choice}})
+                return written and not expired
 
         def permission():
             try:

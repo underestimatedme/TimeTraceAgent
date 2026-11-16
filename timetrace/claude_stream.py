@@ -45,6 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.redact import mask_structure, mask_timetrace_tokens
+from timetrace.remote_control import TIMEOUT_DENY
 from timetrace.process import MAX_CAPTURED_LINES, MAX_LOG_BYTES, _kill_group, _shell_quote, child_env
 
 INIT_REQUEST_ID = "timetrace-init"
@@ -275,12 +276,16 @@ class StreamSession:
             else:
                 try:
                     if self.confirm_session:
-                        def respond(answer):
+                        def respond(answer, *, approval_open=None):
                             with self._lock:
                                 if cancelled.is_set() or not self.host.provider_input_allowed(check_gate=False):
                                     return False
-                                return self._write(permission_response(request_id, request.get("tool_use_id"),
-                                                                       answer, request.get("input")))
+                                expired = approval_open is not None and not approval_open()
+                                if expired:
+                                    answer = {"behavior": "deny", "message": TIMEOUT_DENY}
+                                written = self._write(permission_response(request_id, request.get("tool_use_id"),
+                                                                          answer, request.get("input")))
+                                return written and not expired
                         self.host.permission(request, cancelled, respond=respond)
                         return
                     decision = self.host.permission(mask_structure(request), cancelled) or {}
