@@ -251,5 +251,62 @@ class TimeTraceTokenTest(unittest.TestCase):
         self.assertEqual(mask_timetrace_tokens("nothing to see"), "nothing to see")
 
 
+
+class IntentTextTest(unittest.TestCase):
+    """redact.intent_text: the AI's one-sentence plan as it may leave this computer (AI 思路上报)."""
+
+    def f(self, value):
+        from timetrace.redact import intent_text
+        return intent_text(value)
+
+    def test_an_ordinary_plan_passes_unchanged(self):
+        plan = "先找出深色下对比度不足的 3 处，再改 token，不改布局"
+        self.assertEqual(self.f(plan), plan)
+        self.assertEqual(self.f("Update src/theme.ts then run the tests on 2026-11-14"),
+                         "Update src/theme.ts then run the tests on 2026-11-14")
+
+    def test_secrets_are_cut(self):
+        for secret in (GH_CLASSIC, OPENAI, ANTHROPIC, AWS_ID, JWT, SLACK):
+            out = self.f("先用 %s 推送再验证" % secret)
+            self.assertNotIn(secret, out)
+            self.assertNotIn("REDACTED", out)
+            self.assertIn("推送再验证", out)
+        self.assertNotIn("hunter2hunter2", self.f("用 password=hunter2hunter2 登录"))
+        self.assertNotIn("s3cretpass", self.f("连 https://admin:s3cretpass@db.example.com 看看"))
+
+    def test_emails_and_phone_numbers_are_cut(self):
+        out = self.f("改完通知 alex.chen+ci@example.co.uk 和 13812345678、+86 138 1234 5678、(415) 555-0100、010-12345678")
+        for value in ("alex.chen", "example.co.uk", "13812345678", "138 1234 5678", "555-0100", "12345678"):
+            self.assertNotIn(value, out)
+        self.assertTrue(out.startswith("改完通知"))
+
+    def test_code_and_long_unbroken_strings_are_cut(self):
+        self.assertEqual(self.f("改 `parseConfig()` 的默认值"), "改… 的默认值")
+        self.assertEqual(self.f("```python\nimport os\nprint(os.environ)\n```"), "")
+        self.assertEqual(self.f("先看 ```rm -rf build``` 能否省掉"), "先看… 能否省掉")
+        digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        self.assertEqual(self.f("比较 %s 和上一版" % digest), "比较… 和上一版")
+        self.assertEqual(self.f("a" * 41), "")
+        self.assertEqual(self.f("a" * 40), "a" * 40)
+        # CJK text has no spaces and is not an "unbroken string".
+        self.assertEqual(self.f("改" * 60), "改" * 60)
+
+    def test_assignments_and_env_lines_are_cut(self):
+        self.assertEqual(self.f("export NODE_ENV=production"), "")
+        self.assertEqual(self.f("DATABASE_URL=postgres://u@h/db"), "")
+        out = self.f("设置 API_BASE=http://127.0.0.1:8080 后重跑")
+        self.assertNotIn("127.0.0.1", out)
+        self.assertEqual(out, "设置… 后重跑")
+
+    def test_empty_and_the_120_character_cap(self):
+        self.assertEqual(self.f(""), "")
+        self.assertEqual(self.f(None), "")
+        self.assertEqual(self.f("  `x`  …  "), "")
+        out = self.f("先" * 300)
+        self.assertEqual(len(out), 120)
+        self.assertTrue(out.endswith("…"))
+        self.assertEqual(self.f("一  二\n三"), "一 二 三")
+
+
 if __name__ == "__main__":
     unittest.main()

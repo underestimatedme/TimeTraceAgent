@@ -215,3 +215,55 @@ def redact(text: Optional[str]) -> str:
     out = _URL_CREDENTIALS.sub(lambda m: m.group(1) + MASK + m.group(2), out)
     out = _ASSIGNMENT.sub(_assignment, out)
     return out
+
+
+# ---- AI 思路上报: the one-sentence plan a task run reports (`intent`) ---------
+# What an intent line may not carry beyond what redact() masks. The line is the
+# model's own words about how it will do the work; anything shaped like data is cut.
+INTENT_CHARS = 120
+_ELIDED = "…"
+_CODE_FENCE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)")
+_INLINE_CODE = re.compile(r"`[^`\n]*`?")
+_EMAIL = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_PHONES = [
+    # Mainland China mobile, with or without +86 and separators.
+    re.compile(r"(?<![\d+])(?:\+?86[-\s]?)?1[3-9]\d(?:[-\s]?\d{4}){2}(?!\d)"),
+    # Any number written with a leading +country code.
+    re.compile(r"\+\d{1,3}(?:[-\s.]?\(?\d{1,4}\)?){2,5}(?!\d)"),
+    # Landline with an area code: 010-12345678, 0755 1234 5678.
+    re.compile(r"(?<!\d)0\d{2,3}[-\s]\d{3,4}[-\s]?\d{4}(?!\d)"),
+    # North American style: (415) 555-0100, 415-555-0100, 415.555.0100.
+    re.compile(r"(?<!\d)\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}(?!\d)"),
+]
+# KEY=value and `export KEY=value`: the value of a variable is data, not a plan.
+_ASSIGNED = re.compile(r"(?:\bexport\s+)?(?<![\w$-])[A-Za-z_][A-Za-z0-9_]*=\S*")
+# An unbroken run of printable ASCII longer than 40 characters: a hash, a token, base64, a long path or URL.
+# (CJK text has no spaces, so only ASCII runs count.)
+_LONG_ASCII = re.compile(r"[!-~]{41,}")
+_REDACTED_MARK = re.compile(r"\[REDACTED(?::[a-z-]+)?\]")
+_NOTHING_LEFT = re.compile(r"[\s….,，。;；:：!！?？、\-—_*#>\"'“”‘’()（）\[\]【】]+")
+
+
+def intent_text(text: Optional[str], limit: int = INTENT_CHARS) -> str:
+    """One line of the AI's stated plan as it may leave this computer, or "" when nothing is left: secrets masked
+    (redact()), then code (fences and inline code), e-mail addresses, phone numbers, `KEY=value` assignments and
+    unbroken strings longer than 40 characters cut out, whitespace collapsed and the result cut to `limit` characters."""
+    if not text:
+        return ""
+    out = redact(str(text))
+    out = _REDACTED_MARK.sub(_ELIDED, out)
+    out = _CODE_FENCE.sub(_ELIDED, out)
+    out = _INLINE_CODE.sub(_ELIDED, out)
+    out = out.replace("`", "")
+    out = _EMAIL.sub(_ELIDED, out)
+    for pattern in _PHONES:
+        out = pattern.sub(_ELIDED, out)
+    out = _ASSIGNED.sub(_ELIDED, out)
+    out = _LONG_ASCII.sub(_ELIDED, out)
+    out = " ".join(out.split())
+    out = re.sub(r"(?:\s*…)+", _ELIDED, out).strip()
+    if not _NOTHING_LEFT.sub("", out):
+        return ""
+    if len(out) > limit:
+        out = out[:limit - 1].rstrip() + _ELIDED
+    return out

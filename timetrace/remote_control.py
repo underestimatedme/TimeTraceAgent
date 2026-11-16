@@ -7,7 +7,10 @@ A RunControl sits between three parties:
   computer acknowledges them, so both are de-duplicated here), and which
   drains `take_events()` into the job's event stream;
 - the tool run: a Claude stream session calls `attach()` / `detach()` and
-  `permission()`; any adapter's run ends with `next_followup()`;
+  `permission()`; any adapter's run ends with `next_followup()`; when the
+  claim asked for it (`narrate()`), a Claude session shows each assistant
+  message to `observe()` and a Codex run each output line to `observe_line()`
+  (AI 思路上报, see run_intent);
 - the phone, through Valley: interrupt, append, approval decisions.
 
 Interrupt and completion race: whichever reaches this computer first wins.
@@ -21,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from timetrace import approvals, audit
+from timetrace import approvals, audit, run_intent
 
 APPROVAL_TIMEOUT_SECONDS = 600
 # What the AI is told (spec §4).
@@ -62,6 +65,8 @@ class RunControl:
         self._decisions: Dict[str, Dict[str, Any]] = {}
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._remembered = set()
+        # AI 思路上报: set by narrate() only when the claim allows progress events.
+        self._narrator: Optional[run_intent.Narrator] = None
 
     # ---- job thread: lease responses and events ---------------------------
     def apply_lease(self, lease: Any) -> None:
@@ -91,6 +96,13 @@ class RunControl:
         self._events.append(event)
         self.wakeup.set()
         self.pending.set()
+
+    def _emit_side(self, event: Dict[str, Any]) -> None:
+        """Caller holds self._cond. A progress / intent event: it wakes the job's
+        own loop (which queues it with the next report) but not the
+        ApprovalPump, whose fast uploads stay for approvals and acknowledgements."""
+        self._events.append(event)
+        self.wakeup.set()
 
     def _ack(self, control_id: str, status: str, message: str = "") -> None:
         self._emit({"type": "control_applied", "control_id": control_id, "status": status, "message": message})
@@ -156,6 +168,7 @@ class RunControl:
                 return self._queued.pop(0)
             self._finished = True
             self._send = None
+            self._stop_narrating()
             return None
 
     def followup_started(self, control_id: str) -> None:
@@ -166,6 +179,7 @@ class RunControl:
         with self._cond:
             self._ack(control_id, "rejected", message)
             self._finished = True
+            self._stop_narrating()
 
     @property
     def finished(self) -> bool:
@@ -181,7 +195,50 @@ class RunControl:
             self._closed = True
             self._finished = True
             self._send = None
+            self._stop_narrating()
             self._cond.notify_all()
+
+    # ---- AI 思路上报 (progress / intent) -------------------------------------
+    def narrate(self, report_intent: bool, interval: Optional[float] = None, max_intents: Optional[int] = None) -> None:
+        """Report what the run does: called only when the claim has
+        `report_progress: true` (an older Valley rejects the event types)."""
+        with self._cond:
+            self._narrator = run_intent.Narrator(
+                report_intent,
+                interval=run_intent.PROGRESS_INTERVAL_SECONDS if interval is None else interval,
+                max_intents=run_intent.MAX_INTENTS if max_intents is None else max_intents)
+
+    @property
+    def narrating(self) -> bool:
+        return self._narrator is not None
+
+    def observe(self, msg: Any) -> None:
+        """A Claude stream-json message (already masked), from the session's reader thread."""
+        if self._narrator is not None:
+            self._narrate(run_intent.from_claude(msg, self.root, self.user_home))
+
+    def observe_line(self, line: Any) -> None:
+        """One line a Codex run printed on stdout (already masked), from its reader thread."""
+        if self._narrator is not None:
+            self._narrate(run_intent.from_codex(line, self.root, self.user_home))
+
+    def tick(self) -> None:
+        """From the job's wait loop: send a progress line whose window has passed."""
+        if self._narrator is not None:
+            self._narrate([])
+
+    def _narrate(self, seen) -> None:
+        with self._cond:
+            narrator = self._narrator
+            if narrator is None or self._finished:
+                return
+            for event in narrator.observe(seen, self.clock()):
+                self._emit_side(event)
+
+    def _stop_narrating(self) -> None:
+        """Caller holds self._cond. A line still waiting for its window is dropped."""
+        if self._narrator is not None:
+            self._narrator.stop()
 
     # ---- permissions ------------------------------------------------------
     def _decision(self, decision: Dict[str, Any]) -> None:

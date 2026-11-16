@@ -18,8 +18,8 @@ from typing import Any, Callable, Dict
 from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
-from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, runner_state, sync,
-                       worktree)
+from timetrace import (approvals, audit, checks, dev_status, folder, pause, quota, results, run_intent, runner_state,
+                       sync, worktree)
 from timetrace.remote_control import RunControl
 from timetrace import approval_delivery
 from timetrace.approval_delivery import ApprovalPump
@@ -1200,6 +1200,16 @@ class Agent:
                 # A fresh run never inherits an earlier run's result.json.
                 results.prepare_out_dir(execution_path, fresh=not resuming)
                 extra_kw = {"control": control} if interactive else {}
+                # AI 思路上报: only for a claim from a Valley that accepts the event
+                # types (`report_progress: true`), and only for a tool whose run can
+                # be watched (Claude's stream session, Codex's output lines).
+                report_progress, report_intent = run_intent.claim_flags(job) if control is not None else (False, False)
+                observable = interactive or getattr(adapter, "observes_runs", False) is True
+                report_progress = report_progress and observable
+                report_intent = report_intent and report_progress
+                if report_progress:
+                    control.narrate(report_intent)
+                    extra_kw.setdefault("control", control)
                 mcp = self._mcp_access(claim, adapter, in_folder)
                 def turn_kw():
                     """What a turn is started with: the MCP access only while it has time left (a follow-up may come long after the claim)."""
@@ -1223,6 +1233,9 @@ class Agent:
                     def followup_run(prompt, cwd, session, log, cancel):
                         return adapter.resume(prompt, cwd, session, log, cancel, **turn_kw())
                 prompt = self._run_prompt(job, resuming)
+                if report_intent:
+                    # Appended instructions (follow-up turns) do not repeat it.
+                    prompt = run_intent.with_instruction(prompt)
                 observed_start = None
                 adapter_entered = threading.Event()
                 def authority():
@@ -1304,6 +1317,8 @@ class Agent:
                         if control is None:
                             result = future.result(timeout=max(.001, next_renew - time.time()))
                         else:
+                            # A progress line whose throttle window has passed.
+                            control.tick()
                             # Wake for approval requests / acknowledgements too.
                             control.wakeup.wait(max(.001, min(next_renew - time.time(), 1.0)))
                             if control.started and control.wakeup.is_set() and not future.done():

@@ -773,6 +773,36 @@ only), so a release run can reach `*.apple.com` without opening everything.
   and SSH) and `example.com` are refused. With real `codex exec` runs, start and resume: the same network results, the
   commit, and a read-only App Store Connect query by a script in the repository, with no key in the run's log.
 
+## Addendum 2026-11-14: AI 思路上报 (`progress` / `intent` events) — unreleased
+
+Two new event types on a task job's existing event stream (`POST /runner/attempts/:id/events`), for the run canvas's
+"AI 思路" pane. **They need a Valley that sends `report_progress: true` in the claim**: an older Valley never sends it
+and rejects a whole batch holding an unknown event type, so without it the Runner sends neither type, adds nothing to the
+prompt and behaves exactly as before. Roll out Valley first, the Runner last.
+
+- *Gating.* Read strictly from the claim's job (`report_progress is True`, `report_intent is True`; a string or `1` is
+  off). Only task runs with a RunControl and a tool whose run can be watched: Claude's stream session (each `assistant`
+  message, masked, through the optional `host.observe`) and Codex's `--json` output lines (`run_streaming(on_line=)`).
+  Chat, review, check, import and other jobs never send them.
+- *`progress`.* One action-level line per live tool call (Claude `tool_use`; Codex `item.started` command_execution and
+  file_change items), built by `approvals.summary()`: "运行 npm test", "修改文件 src/a.ts" (paths shown relative to the
+  worktree). A shell command up to its first line only; no command output, file contents, reasoning or TodoWrite text;
+  redacted; ≤ 200 characters. At most one per job per 10 s: the latest line of a window wins, an exact repeat is
+  skipped, a line still waiting when the run ends is dropped.
+- *`intent`.* Only with `report_intent: true` (the account's consent, default off). The run prompt and the resume prompt
+  then end with: 「在改动任何内容之前，先单独写一行以 INTENT: 开头的话，用不超过 120 个字说明你打算怎么完成这项工作（只写做法，不要包含代码、命令输出、密钥或个人信息）。如果之后做法有实质变化，再写一行新的 INTENT:。」
+  (appended follow-up instructions do not repeat it). Lines starting `INTENT:` in assistant text (Claude `text` blocks,
+  Codex `agent_message`) go through `redact.intent_text()`: `redact()`, then code fences / inline code, e-mail
+  addresses, phone numbers, `KEY=value` / `export` lines and unbroken ASCII runs over 40 characters are cut; ≤ 120
+  characters; empty → not sent. Sent only when it differs from the last one, at most 5 per attempt. Without consent no
+  `INTENT:` line is read, even if the model writes one.
+- *Sequence.* Both ride `RunControl.take_events()` and `Agent._report`, so they take contiguous sequence numbers before
+  the terminal event. They wake the job's own loop, not the ApprovalPump's fast upload path.
+- *Residual risk.* The filters are shape-based. A secret or personal detail written in an unknown shape inside the
+  model's sentence, or a short command line that itself names something private, can still be sent. Valley stores an
+  `intent` with an empty message if the account's preference is not `true` when it arrives.
+- *Tests.* `tests/test_run_intent.py`, `tests/test_redact.py` (`IntentTextTest`).
+
 ## Verification
 
 - Conversation import: `tests/test_import_parse.py`.
