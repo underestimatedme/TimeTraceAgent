@@ -233,11 +233,15 @@ def _safe_cut(text: str, cut: int) -> int:
     return cut
 
 
-def acceptable_session_id(value: Any) -> bool:
-    """A session id that may be kept in a result and a checkpoint: the conservative SESSION_ID shape, and no
-    TimeTrace token (by shape, or by the value of one this process handed out)."""
-    return (isinstance(value, str) and SESSION_ID.fullmatch(value) is not None
-            and not holds_timetrace_token(value.encode("utf-8")) and mask_timetrace_tokens(value) == value)
+def safe_session_id(value: Any) -> Optional[str]:
+    """The one rule for every session id that enters or leaves an ACP run (the caller's resume id, the agent's
+    answer, every result and fallback): `value` when it has the conservative SESSION_ID shape and holds no TimeTrace
+    token (by shape, or by the value of one this process handed out); None otherwise. Ids end up in results and
+    checkpoints, so nothing else is ever kept."""
+    if (isinstance(value, str) and SESSION_ID.fullmatch(value) is not None
+            and not holds_timetrace_token(value.encode("utf-8")) and mask_timetrace_tokens(value) == value):
+        return value
+    return None
 
 
 def stop_reason(value: Any) -> str:
@@ -660,11 +664,11 @@ class AcpSession:
             answer = self._call("session/new", {"cwd": self.cwd, "mcpServers": servers}, self.request_timeout,
                                 " cwd=%s%s" % (self.cwd, shown))
             session = answer.get("sessionId")
-            if not acceptable_session_id(session):
+            if safe_session_id(session) is None:
                 raise AcpError("session/new answered without a session id this client accepts", method="session/new")
             self._session = session
             self._line("<- session/new: session %s" % session)
-        result.session_id = self._session
+        result.session_id = safe_session_id(self._session)
         self._prompt_pending = self._request("session/prompt", {
             "sessionId": self._session, "prompt": [{"type": "text", "text": self.prompt}],
         }, " (%d characters)" % len(self.prompt))
@@ -731,6 +735,10 @@ class AcpSession:
     # ---- lifecycle -------------------------------------------------------------------------------------------------
     def run(self) -> AcpResult:
         result = AcpResult()
+        if self.session_id is not None and safe_session_id(self.session_id) is None:
+            # Refused before anything is spawned or logged: the id is never sent, written or kept.
+            result.error, result.failed_method, result.exit_code = "invalid session id", "session/resume", 1
+            return result
         # With `base_env` the child gets that snapshot (the one a billing check read), not a fresh os.environ.
         run_env = child_env(self.drop_env, self.env, base=self.base_env)
         stopping = isinstance(self.cancel_event, StopRequest)

@@ -20,7 +20,7 @@ import os
 import shutil
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from timetrace.acp_client import AcpResult, AcpSession, safe_text
+from timetrace.acp_client import AcpResult, AcpSession, safe_session_id, safe_text
 from timetrace.adapters.base import SAFETY_RULES, ToolAdapter
 from timetrace.billing import StaticBilling, billing_env_keys
 from timetrace.mcp_access import McpAccess
@@ -84,7 +84,7 @@ def safe_capabilities() -> Dict[str, bool]:
 def run_result(acp: AcpResult, session_id: Optional[str]) -> RunResult:
     """An ACP turn as the scheduler / agent read a run. Only a turn that ended with `end_turn` succeeded; how the
     idle agent was stopped afterwards (its exit code is usually a signal) says nothing about the work."""
-    res = RunResult(session_id=acp.session_id or session_id,
+    res = RunResult(session_id=safe_session_id(acp.session_id) or safe_session_id(session_id),
                     output=(acp.last_message.strip() or acp.text.strip()))
     if acp.error is None and acp.stop_reason == "end_turn":
         res.ok, res.exit_code = True, 0
@@ -161,6 +161,9 @@ class AcpAdapter(ToolAdapter):
                control=None, mcp: Optional[McpAccess] = None) -> RunResult:
         if not session_id:
             return RunResult(exit_code=1, error="no session to resume")
+        if safe_session_id(session_id) is None:
+            # Refused before anything is prepared or spawned, and the id is not kept anywhere.
+            return RunResult(exit_code=1, error="invalid session id")
         return self._run(prompt, cwd, session_id, log_file, cancel_event, control, mcp)
 
     def _run(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp) -> RunResult:
@@ -168,7 +171,7 @@ class AcpAdapter(ToolAdapter):
         if problem:
             with open(log_file, "a", encoding="utf-8") as log:
                 log.write("--- not started: %s ---\n" % problem)
-            return RunResult(exit_code=127, session_id=session_id, error=problem)
+            return RunResult(exit_code=127, session_id=safe_session_id(session_id), error=problem)
         # The rules go first in the one prompt ACP has (it has no system-prompt channel), as for Codex.
         session = AcpSession(cmd, cwd, log_file, SAFETY_RULES + "\n" + prompt, session_id=session_id,
                              host=control, mcp=mcp, timeout=float(self.cfg.get("timeout_seconds", 3600)),

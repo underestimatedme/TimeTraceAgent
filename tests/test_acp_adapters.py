@@ -310,5 +310,44 @@ class RunResultRedactionTest(unittest.TestCase):
                 self.assertNotIn(piece, error)
 
 
+
+# ---- review of b3237bf: fails on that commit ------------------------------------------------------------------------
+
+LONG = "ttm_" + "Ab1-Cd2_" * 8
+BAD_IDS = (LONG, "s-" + LONG, "has space", "a/b", "x" * 129)
+
+
+class SessionIdEverywhereTest(AdapterCase):
+    """One rule for every session id that enters or leaves an adapter run."""
+
+    def test_resume_with_an_invalid_id_is_refused_before_anything_is_prepared(self):
+        for adapter in (GeminiAdapter({"bin": self.bin}), CursorAdapter({"bin": self.bin})):
+            for session in BAD_IDS:
+                with self.subTest(adapter=adapter.name, session=session[:20]):
+                    self.scenario({"initialize": {"loadSession": True}, "turn": []})
+                    res = adapter.resume("p", str(self.work), session, self.log)
+                    self.assertFalse(res.ok)
+                    self.assertEqual((res.error, res.session_id), ("invalid session id", None))
+        self.assertEqual(self.records(), [], "nothing was spawned")
+
+    def test_fallbacks_never_return_an_invalid_id(self):
+        # Preparation failure (no binary): a valid id is kept, an invalid one is not (whatever reaches _run).
+        missing = GeminiAdapter({"bin": str(self.d / "missing")})
+        self.assertEqual(missing.resume("p", str(self.work), "g-7", self.log).session_id, "g-7")
+        for session in BAD_IDS:
+            with self.subTest(session=session[:20]):
+                res = missing._run("p", str(self.work), session, self.log, None, None, None)
+                self.assertIsNone(res.session_id)
+                self.assertIsNone(run_result(AcpResult(session_id=session, stop_reason="end_turn"), None).session_id)
+                self.assertIsNone(run_result(AcpResult(error="boom"), session).session_id)
+                self.assertEqual(run_result(AcpResult(error="boom"), "g-7").session_id, "g-7")
+
+    def test_normal_ids_are_unaffected(self):
+        res = self.run_agent(GeminiAdapter({"bin": self.bin}), {"initialize": {"loadSession": True},
+                                                                "turn": [{"chunk": "again"}]}, resume="g-7")
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.session_id, "g-7")
+
+
 if __name__ == "__main__":
     unittest.main()

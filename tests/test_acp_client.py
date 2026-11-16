@@ -595,5 +595,35 @@ class TokenAcrossToolCallTest(AcpCase):
         self.assertTrue(result.last_message.endswith(" done"))
 
 
+
+# ---- review of b3237bf: fails on that commit ------------------------------------------------------------------------
+
+BAD_SESSION_IDS = (LONG_TOKEN, "s-" + LONG_TOKEN, "has space", "a/b", "x" * 129)
+
+
+class ResumeSessionIdTest(AcpCase):
+    """The caller's resume id passes the same rule as the agent's: an invalid one is refused before anything is
+    spawned, and never kept."""
+
+    def test_an_invalid_resume_id_is_refused_before_spawning(self):
+        from timetrace.redact import masking
+        for session in BAD_SESSION_IDS:
+            for caps in ({"loadSession": True}, {"resume": True}):
+                with self.subTest(session=session[:20], caps=caps), masking([LONG_TOKEN]):
+                    if self.transcript.exists():
+                        self.transcript.unlink()
+                    result = self.run_session({"initialize": caps, "turn": [{"chunk": "x"}]}, session_id=session)
+                    self.assertIsNone(result.session_id)
+                    self.assertEqual(result.error, "invalid session id")
+                    self.assertEqual(self.records(), [], "nothing was spawned")
+        self.assertFalse(self.log.exists() and fragments(self.log_text()), "nothing about the id was logged")
+
+    def test_a_normal_resume_id_is_unaffected(self):
+        for session in ("g-7", "0b5e7c1e-1f2a-4c3d-9e8f-123456789abc", "a.b:c_d-1", "x" * 128):
+            with self.subTest(session=session[:20]):
+                result = self.run_session({"initialize": {"loadSession": True}, "turn": []}, session_id=session)
+                self.assertEqual((result.error, result.session_id), (None, session))
+
+
 if __name__ == "__main__":
     unittest.main()
