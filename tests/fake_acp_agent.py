@@ -12,7 +12,8 @@ Behaviour comes from the JSON file named by $TT_ACP_SCENARIO:
    "new_session": {"sessionId": "...", "error": {"code": ..., "message": ...}},
    "replay": [update, ...],        session/load sends these before it answers
    "turn": [step, ...],            what session/prompt does
-   "garbage_first": bool, "ignore_eof": bool, "env_probe": [NAME, ...], "spawn_child": bool}
+   "garbage_first": bool, "ignore_eof": bool, "env_probe": [NAME, ...], "spawn_child": bool,
+   "stop_reading_after": method}  after that request, stdin is never read again (the client's writes then block)
 Steps:
   {"chunk": text} {"thought": text} {"update": {...session update...}} {"stderr": text} {"garbage": text}
   {"permission": {"toolCall": {...}, "options": [...]}}   ask, wait for the answer, record it
@@ -73,6 +74,8 @@ def main():
                 if msg["method"] == "session/cancel":
                     cancelled.set()
                 incoming.put(msg)
+                if msg["method"] == scenario.get("stop_reading_after"):
+                    threading.Event().wait()   # never reads again: the pipe fills and the client's writes block
             else:
                 with answered:
                     answers[msg.get("id")] = msg

@@ -17,9 +17,9 @@ agent as an http MCP server when the agent says it takes one.
 """
 import os
 import shutil
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from timetrace.acp_client import AcpResult, AcpSession
+from timetrace.acp_client import AcpResult, AcpSession, safe_text
 from timetrace.adapters.base import SAFETY_RULES, ToolAdapter
 from timetrace.billing import StaticBilling, billing_env_keys
 from timetrace.mcp_access import McpAccess
@@ -49,12 +49,12 @@ def run_result(acp: AcpResult, session_id: Optional[str]) -> RunResult:
         return res
     res.exit_code = acp.exit_code if acp.exit_code not in (None, 0) else 1
     if acp.error:
-        res.error = acp.error[:500]
+        res.error = safe_text(acp.error, 500)   # agent-supplied text: masked whole, then cut
         # A limit can only be told apart once a session exists to resume; before that it is an ordinary failure.
         if acp.failed_method == "session/prompt" and any(m in acp.error.lower() for m in LIMIT_TEXT_MARKERS):
             res.blocked = True
     else:
-        res.error = "the agent ended the turn: %s" % (acp.stop_reason or "no stop reason")
+        res.error = "the agent ended the turn: %s" % (safe_text(acp.stop_reason) or "no stop reason")
     return res
 
 
@@ -100,9 +100,10 @@ class AcpAdapter(ToolAdapter):
         caps["can_enforce_zero_spend"] = self.billing.verdict().verified
         return merge_capabilities(caps)
 
-    def preflight(self, cwd: str) -> str:
-        """Why this run must not start from `cwd` (a billing path the directory itself adds); "" to go ahead."""
-        return ""
+    def prepare(self, cwd: str) -> Tuple[str, Dict[str, str]]:
+        """(why this run must not start from `cwd`, "" to go ahead; environment the child is given on top of
+        child_env). One decision: what was checked is what the child gets."""
+        return "", {}
 
     def start(self, prompt: str, cwd: str, session_id: str, log_file: str, cancel_event=None,
               control=None, mcp: Optional[McpAccess] = None) -> RunResult:
@@ -117,7 +118,7 @@ class AcpAdapter(ToolAdapter):
         return self._run(prompt, cwd, session_id, log_file, cancel_event, control, mcp)
 
     def _run(self, prompt, cwd, session_id, log_file, cancel_event, control, mcp) -> RunResult:
-        problem = self.preflight(cwd)
+        problem, env = self.prepare(cwd)
         if problem:
             with open(log_file, "a", encoding="utf-8") as log:
                 log.write("--- not started: billing_unverified (%s) ---\n" % problem)
@@ -125,6 +126,6 @@ class AcpAdapter(ToolAdapter):
         # The rules go first in the one prompt ACP has (it has no system-prompt channel), as for Codex.
         session = AcpSession(self.command(), cwd, log_file, SAFETY_RULES + "\n" + prompt, session_id=session_id,
                              host=control, mcp=mcp, timeout=float(self.cfg.get("timeout_seconds", 3600)),
-                             cancel_event=cancel_event, drop_env=billing_env_keys(self.name))
+                             cancel_event=cancel_event, drop_env=billing_env_keys(self.name), env=env or None)
         with masking([mcp.token] if mcp is not None else []):
             return run_result(session.run(), session_id)

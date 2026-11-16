@@ -2,6 +2,8 @@
 official schema describes it. No real Gemini CLI or Cursor is ever started."""
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +17,7 @@ from timetrace.acp_client import AcpSession, choose_option, host_request
 from timetrace.billing import billing_env_keys
 from timetrace.dispatch import DispatchDenied
 from timetrace.mcp_access import McpAccess
+from timetrace.redact import redact
 
 FAKE = str(Path(__file__).with_name("fake_acp_agent.py"))
 TOKEN = "ttm_" + "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2"
@@ -398,6 +401,80 @@ class SecretsTest(AcpCase):
                          drop_env=billing_env_keys("gemini"))
         env = next(r["env"] for r in self.records() if "env" in r)
         self.assertEqual({k: v for k, v in env.items() if v is not None}, {"TT_ACP_KEEP": "1"})
+
+
+
+class BlockedWriteTest(AcpCase):
+    """Review blocker 3: an agent that stops reading stdin must not hold the run. Each run is driven from a thread;
+    if it is still blocked after the bound, the test stops the agent's group itself (so it never hangs) and fails."""
+
+    def run_bounded(self, bound, **kwargs):
+        spawned, outcome = [], {}
+        real_popen = subprocess.Popen
+
+        def popen(*args, **kw):
+            proc = real_popen(*args, **kw)
+            spawned.append(proc)
+            return proc
+
+        def target():
+            outcome["result"] = self.run_session({"stop_reading_after": "session/new", "turn": [{"chunk": "x"}]},
+                                                 prompt="p" * (1024 * 1024), **kwargs)
+        with patch("timetrace.acp_client.subprocess.Popen", popen):
+            started = time.monotonic()
+            worker = threading.Thread(target=target, daemon=True)
+            worker.start()
+            worker.join(bound)
+            blocked = worker.is_alive()
+            elapsed = time.monotonic() - started
+            if blocked:
+                for proc in spawned:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                worker.join(10)
+        self.assertFalse(blocked, "the run was still blocked writing the prompt after %ss" % bound)
+        return outcome["result"], elapsed
+
+    def test_the_timeout_ends_a_run_whose_agent_stopped_reading(self):
+        result, elapsed = self.run_bounded(10, timeout=0.5)
+        self.assertLess(elapsed, 10)
+        self.assertEqual(result.error, "timed out after 0.5s")
+        self.assertTrue(result.cancelled)
+
+    def test_a_cancel_ends_a_run_whose_agent_stopped_reading(self):
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        result, _ = self.run_bounded(10, cancel_event=cancel)
+        self.assertEqual(result.error, "cancelled")
+
+
+class RedactionTest(AcpCase):
+    """Review blocker 4: agent-supplied text is masked whole before it is cut, wherever it goes."""
+
+    def leaks(self, text):
+        return [piece for piece in (TOKEN, TOKEN[:10]) if piece in text]
+
+    def test_a_token_in_an_error_message_never_reaches_the_error_or_the_log(self):
+        for message in ("upstream said " + TOKEN,                      # whole, short
+                        "e" * 280 + " " + TOKEN + " and more"):      # straddling the 300-character cut
+            with self.subTest(length=len(message)):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.run_session({"turn": [{"error": {"code": -32603, "message": message}}]})
+                self.assertTrue(result.error.startswith("session/prompt failed (-32603)"))
+                self.assertEqual(self.leaks(result.error), [])
+                self.assertEqual(self.leaks(redact(result.error)), [])
+                self.assertEqual(self.leaks(self.log_text()), [])
+
+    def test_a_token_in_a_tool_title_or_a_stray_line_is_masked_before_the_cut(self):
+        title = "t" * 280 + " " + TOKEN
+        self.run_session({"turn": [
+            {"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": title, "kind": "other"}},
+            {"garbage": "g" * 290 + " " + TOKEN},
+            {"chunk": "ok"}]})
+        self.assertEqual(self.leaks(self.log_text()), [])
 
 
 if __name__ == "__main__":

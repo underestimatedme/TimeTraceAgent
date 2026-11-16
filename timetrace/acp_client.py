@@ -32,6 +32,8 @@ Safety posture, the same as the other adapters':
 import itertools
 import json
 import os
+import queue
+import re
 import subprocess
 import threading
 import time
@@ -42,7 +44,7 @@ from timetrace import __version__, process
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.mcp_access import McpAccess, skip_note
 from timetrace.process import MAX_LOG_BYTES, StopRequest, ToolExitUnconfirmed, _shell_quote, child_env
-from timetrace.redact import mask_structure, mask_timetrace_tokens
+from timetrace.redact import mask_structure, mask_timetrace_tokens, redact
 
 PROTOCOL_VERSION = 1
 METHOD_NOT_FOUND = -32601
@@ -136,7 +138,7 @@ def host_request(tool_call: Any, root: str) -> Optional[Dict[str, Any]]:
     tool_call = tool_call if isinstance(tool_call, dict) else {}
     raw = tool_call.get("rawInput") if isinstance(tool_call.get("rawInput"), dict) else {}
     kind = str(tool_call.get("kind") or "other")[:32]
-    title = str(tool_call.get("title") or "")[:SHOWN_CHARS]
+    title = _short(tool_call.get("title") or "")
     base = {"acp_kind": kind, "title": title, "tool_use_id": str(tool_call.get("toolCallId") or "")[:128]}
     if kind == "switch_mode":
         return None
@@ -199,10 +201,26 @@ def _content_text(content: Any) -> str:
     return ""
 
 
-def _short(value: Any) -> str:
+def safe_text(value: Any, limit: int = SHOWN_CHARS) -> str:
+    """Agent-supplied text (an error message, a title, a stop reason) as it may be logged, raised, stored in a result
+    or uploaded: secrets masked in the WHOLE text first (TimeTrace tokens, then every other recognised secret), only
+    then whitespace folded and cut. Cutting first could leave a token's prefix that no pattern recognises any more."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    text = " ".join(text.split())
-    return text if len(text) <= SHOWN_CHARS else text[:SHOWN_CHARS - 1] + "…"
+    text = " ".join(redact(mask_timetrace_tokens(text)).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+_short = safe_text
+
+
+def _tail(text: str, limit: int) -> str:
+    """The last `limit` characters of streamed text, starting after a whitespace so a secret (which has none) is
+    never cut in two and left unrecognisable; text without any whitespace there is simply cut."""
+    if len(text) <= limit:
+        return text
+    start = len(text) - limit
+    space = re.search(r"\s", text[start:])
+    return text[start + space.end():] if space else text[start:]
 
 
 class AcpSession:
@@ -227,7 +245,10 @@ class AcpSession:
         self._proc: Optional[subprocess.Popen] = None
         self._log = None
         self._log_lock = threading.Lock()
-        self._write_lock = threading.Lock()     # stdin
+        # Every write to the agent's stdin happens on one writer thread, from this queue: an agent that stops reading
+        # blocks only that thread, never the run (its timeout, a cancel and the cleanup all go on without it).
+        self._outbox: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._writer: Optional[threading.Thread] = None
         self._state_lock = threading.Lock()     # pending requests, permission waits, the pause clock
         self._ids = itertools.count(1)
         self._pending: Dict[str, _Pending] = {}
@@ -236,7 +257,7 @@ class AcpSession:
         self._eof = threading.Event()           # the agent's stdout is closed: no answer can come any more
         self._ended = threading.Event()
         self._cancelling = False
-        self._stdin_open = False
+        self._writing = False                   # the writer takes messages (guarded by _state_lock)
         self._session: Optional[str] = None
         self._prompt_pending: Optional[_Pending] = None
         self._replaying = False
@@ -303,25 +324,41 @@ class AcpSession:
 
     # ---- the wire ------------------------------------------------------------------------------------------------
     def _send(self, message: Dict[str, Any]) -> bool:
-        with self._write_lock:
-            proc = self._proc
-            if not self._stdin_open or proc is None or proc.stdin is None:
+        """Queue one message for the agent; False once its input is closed. Never blocks."""
+        line = json.dumps(message, ensure_ascii=False) + "\n"
+        with self._state_lock:
+            if not self._writing:
                 return False
-            try:
-                proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-                proc.stdin.flush()
-                return True
-            except (BrokenPipeError, OSError, ValueError):
-                self._close_stdin_locked()
-                return False
+            self._outbox.put(line)
+        return True
 
-    def _close_stdin_locked(self) -> None:
-        self._stdin_open = False
+    def _close_stdin(self) -> None:
+        """No more messages: the writer sends what is queued, then closes stdin (an ACP agent leaves on that EOF)."""
+        with self._state_lock:
+            if self._writing:
+                self._writing = False
+                self._outbox.put(None)
+
+    def _write_stdin(self, stream) -> None:
+        """The writer thread: the only code that touches the agent's stdin, so a blocked write (an agent that stopped
+        reading, a prompt larger than the pipe) holds nothing anyone else needs. It ends on the close marker or when
+        the pipe breaks, which stopping the agent's process group always does."""
         try:
-            if self._proc is not None and self._proc.stdin is not None:
-                self._proc.stdin.close()
+            while True:
+                line = self._outbox.get()
+                if line is None:
+                    break
+                stream.write(line)
+                stream.flush()
         except (OSError, ValueError):
             pass
+        finally:
+            with self._state_lock:
+                self._writing = False
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
     def _read_stdout(self, stream) -> None:
         try:
@@ -494,10 +531,10 @@ class AcpSession:
         self._last.append(text)
         self._last_len += len(text)
         if self._text_len > 2 * MAX_TEXT_CHARS:
-            self._text = ["".join(self._text)[-MAX_TEXT_CHARS:]]
+            self._text = [_tail("".join(self._text), MAX_TEXT_CHARS)]
             self._text_len = len(self._text[0])
         if self._last_len > 2 * MAX_TEXT_CHARS:
-            self._last = ["".join(self._last)[-MAX_TEXT_CHARS:]]
+            self._last = [_tail("".join(self._last), MAX_TEXT_CHARS)]
             self._last_len = len(self._last[0])
 
     # ---- requests --------------------------------------------------------------------------------------------------
@@ -557,7 +594,7 @@ class AcpSession:
         http_mcp = mcp_caps.get("http") is True
         methods = [m.get("id") for m in init.get("authMethods") or [] if isinstance(m, dict)]
         self._line("<- initialize: protocol %s, loadSession=%s, resume=%s, http MCP=%s, auth methods %s" % (
-            init.get("protocolVersion"), can_load, can_resume, http_mcp, _short(methods)))
+            _short(init.get("protocolVersion")), can_load, can_resume, http_mcp, _short(methods)))
         if init.get("protocolVersion") != PROTOCOL_VERSION:
             raise AcpError("the agent speaks ACP protocol %s; this client speaks %d" % (
                 _short(init.get("protocolVersion")), PROTOCOL_VERSION), method="initialize")
@@ -673,7 +710,9 @@ class AcpSession:
                 self._log = None
                 return result
             self._proc = proc
-            self._stdin_open = True
+            self._writing = True
+            self._writer = threading.Thread(target=self._write_stdin, args=(proc.stdin,), daemon=True)
+            self._writer.start()
             self._started = time.monotonic()
             readers = [threading.Thread(target=self._read_stdout, args=(proc.stdout,), daemon=True),
                        threading.Thread(target=self._read_stderr, args=(proc.stderr,), daemon=True)]
@@ -702,8 +741,8 @@ class AcpSession:
             self._line("--- exit %s ---" % proc.returncode)
             self._log = None
         result.exit_code = proc.returncode
-        result.text = mask_timetrace_tokens("".join(self._text)[-MAX_TEXT_CHARS:])
-        result.last_message = mask_timetrace_tokens("".join(self._last)[-MAX_TEXT_CHARS:])
+        result.text = mask_timetrace_tokens(_tail("".join(self._text), MAX_TEXT_CHARS))
+        result.last_message = mask_timetrace_tokens(_tail("".join(self._last), MAX_TEXT_CHARS))
         result.tool_calls, result.plan, result.usage = len(self._tool_ids), self._plan, self._usage
         return result
 
@@ -716,8 +755,7 @@ class AcpSession:
             waits = list(self._permissions.values())
         for wait in waits:
             wait.cancelled.set()
-        with self._write_lock:
-            self._close_stdin_locked()
+        self._close_stdin()
         problem = None
         if not unconfirmed and proc.poll() is None:
             try:
@@ -730,7 +768,7 @@ class AcpSession:
                     problem = exc
         # However the agent ended, nothing it started may keep running after the runner's checks begin.
         process._kill_group(proc)
-        for thread in readers:
+        for thread in readers + ([self._writer] if self._writer is not None else []):
             thread.join(timeout=2)
         with self._state_lock:
             workers = list(self._workers)
