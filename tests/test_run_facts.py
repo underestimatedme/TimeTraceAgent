@@ -2,6 +2,7 @@
 beside the AI's own report.
 
 Contract: docs/superpowers/specs/2026-11-17-run-facts-design.md (TimeTrace repository)."""
+import io
 import json
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from timetrace import run_facts, worktree
 from timetrace.adapters import claude, codex
 from timetrace.adapters.codex_interactive import CodexTurn
 from timetrace.agent import Agent
+from timetrace.claude_stream import StreamSession
 from timetrace.models import RunResult
 from tests.test_codex_interactive import Host
 from tests.test_remote_jobs import Adapter, Base, ControlCloud
@@ -78,6 +80,17 @@ class TestToolTest(unittest.TestCase):
             "npx playwright test": "playwright",
             "git status && pytest | tail -5": "pytest",
             "dotnet test": "dotnet test",
+            "env -u FOO pytest": "pytest",
+            "env --chdir web npm test": "npm test",
+            "uv run --project web pytest": "pytest",
+            "uv run --with pytest-cov pytest": "pytest",
+            "npx -p jest jest --ci": "jest",
+            "python3 -Bm pytest": "pytest",
+            "python3 -W ignore -m pytest": "pytest",
+            "python3 .venv/bin/pytest -q": "pytest",
+            "pytest>out.txt": "pytest",
+            "pytest -q 2>&1 | tail -5": "pytest",
+            "echo 'a;b' && go test ./...": "go test",
         }
         for command, tool in cases.items():
             self.assertEqual(run_facts.test_tool(command), tool, command)
@@ -87,6 +100,9 @@ class TestToolTest(unittest.TestCase):
         for command in ("grep -rn pytest .", "cat jest.config.js", "pip install pytest", "npm install vitest",
                         "npm run build", "go vet ./...", "cargo build", "make build", "git commit -m 'pytest'",
                         "echo npm test", "python3 -c 'import pytest'", "ls tests", "", "bash -c", "'unclosed",
+                        # What follows `-c` code or a script is its arguments; a quoted or escaped `;` is a word.
+                        'python3 -B -c "print(1)" -m pytest', "python3 script.py -m pytest", "bash script.sh -c pytest",
+                        'echo ";" pytest', "echo a\\;pytest", "uv run --with pytest python script.py",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
 
@@ -116,6 +132,21 @@ class ClaudeCommandsTest(unittest.TestCase):
                   outcome("zzz"),              # an answer to nothing seen
                   bash("d", "sleep 999"), outcome("d", True, "Command timed out after 2m 0.0s")]
         self.assertEqual(counted("claude", output), {"commands": {"ran": 1, "failed": 1}, "tests": {"ran": 0, "failed": 0}})
+
+    def test_the_stream_reader_tells_of_a_line_it_could_not_read(self):
+        # Claude's stream session decodes each line before any watcher sees it; one it cannot decode must still mean
+        # "not seen whole", never zero commands.
+        commands = run_facts.Commands("claude")
+        session = StreamSession(["claude"], ".", "/dev/null", "go", on_message=commands.add, on_unreadable=commands.feed)
+        output = [bash("a", "pytest"), '{"type":"user","message":{"content":[{"type":"tool_result", broken',
+                  json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok", "session_id": "s"})]
+        session._read_stdout(io.StringIO("\n".join(output) + "\n"), io.StringIO())
+        self.assertIsNone(commands.total())
+        fine = run_facts.Commands("claude")
+        session = StreamSession(["claude"], ".", "/dev/null", "go", on_message=fine.add, on_unreadable=fine.feed)
+        session._read_stdout(io.StringIO("\n".join([bash("a", "pytest"), outcome("a"), "{not json at all"]) + "\n"),
+                             io.StringIO())
+        self.assertEqual(fine.total()["tests"], {"ran": 1, "failed": 0, "last": "passed", "tools": ["pytest"]})
 
     def test_subagent_commands_count_and_other_tools_do_not(self):
         nested = json.loads(bash("a", "pytest"))
@@ -247,9 +278,18 @@ class ChangesTest(unittest.TestCase):
             self.assertEqual(event["run_facts"], dict(commands, version=1, changes={
                 "files": 1, "non_doc_files": 1, "insertions": 1, "deletions": 0, "left_out": 1}))
 
+            # Resumed: the commands are only those after it resumed; the changes are still the whole delivery.
             event = {"input_head": base, "output_commit": head}
             Agent._attach_run_facts(event, RunResult(ok=True, commands=commands), d, [], True)
             self.assertTrue(event["run_facts"]["resumed"])
+            self.assertEqual(event["run_facts"]["changes"]["files"], 1)
+            event = {"input_head": base, "output_commit": head}
+            Agent._attach_run_facts(event, RunResult(ok=True), d, [], True)  # no commands: nothing is partial
+            self.assertNotIn("resumed", event["run_facts"])
+            # Changes from a checkpoint's commit would be only part of the delivery: none.
+            event = {"input_head": base, "output_commit": head}
+            Agent._attach_run_facts(event, RunResult(ok=True, commands=commands), d, [], True, changes_partial=True)
+            self.assertNotIn("changes", event["run_facts"])
 
             event = {}  # no commits (a folder run): commands only
             Agent._attach_run_facts(event, RunResult(ok=True, commands=commands), d, [], False)

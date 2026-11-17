@@ -413,7 +413,8 @@ class ClaudeAdapter(ToolAdapter):
                                          timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                          cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE),
                                          env=mcp.env() if mcp is not None else None, confirm_session=session_id,
-                                         on_message=usage.watchers(tokens.add, commands.add))
+                                         on_message=usage.watchers(tokens.add, commands.add),
+                                         on_unreadable=commands.feed)
                 result = self._result(code, lines, "", tokens, commands)
                 if result.session_id != session_id:
                     result.ok = False
@@ -512,7 +513,7 @@ class ClaudeAdapter(ToolAdapter):
         code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                  timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                  cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env,
-                                 on_message=usage.watchers(tokens.add, commands.add))
+                                 on_message=usage.watchers(tokens.add, commands.add), on_unreadable=commands.feed)
         return self._result(code, lines, session_id, tokens, commands)
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None,

@@ -1852,7 +1852,10 @@ class Agent:
                     others = [a for a in event.get("artifacts", []) if a.get("ref") != artifact["ref"]]
                     event["artifacts"] = [artifact] + others[:17]
         if outcome == "awaiting_review":
-            self._attach_run_facts(event, result, workspace["path"], left_out, resuming)
+            # A work session resumed without an input commit from Valley starts from the checkpoint's: its changes
+            # would be only part of the delivery, so it reports none.
+            self._attach_run_facts(event, result, workspace["path"], left_out, resuming,
+                                   changes_partial=bool(work_session and resuming and not job.get("input_head")))
         event["observed_at"] = observed_end
         self._report(claim, [usage.attach(event, result)])
         self.db.update_remote_claim(job_id, "reported")
@@ -1861,20 +1864,20 @@ class Agent:
         return "job %s → %s" % (job_id, outcome)
 
     @staticmethod
-    def _attach_run_facts(event, result, repo, left_out, resuming) -> None:
+    def _attach_run_facts(event, result, repo, left_out, resuming, changes_partial=False) -> None:
         """`event["run_facts"]`: what the computer itself saw this run do (timetrace.run_facts), beside the AI's own
-        report. Commands come from the tool's stream, changes from git between the run's input and output commits. A
-        run resumed from a checkpoint saw only what happened after it resumed (its input commit is the checkpoint's),
-        so its facts say `resumed`. Never a reason for the completion to fail."""
+        report. Commands come from the tool's stream; a run resumed from a checkpoint saw only the commands after it
+        resumed, so its facts say `resumed`. Changes come from git between the input and output commits the event
+        names, the whole delivery under review, resumed or not. Never a reason for the completion to fail."""
         try:
             changes = None
-            if event.get("input_head") and event.get("output_commit"):
+            if event.get("input_head") and event.get("output_commit") and not changes_partial:
                 changes = worktree.diff_numbers(repo, event["input_head"], event["output_commit"])
                 if changes is not None:
                     changes["left_out"] = min(len(left_out or []), run_facts.MAX_COUNT)
             facts = run_facts.build(getattr(result, "commands", None), changes)
             if facts:
-                if resuming:
+                if resuming and "commands" in facts:
                     facts["resumed"] = True
                 event["run_facts"] = facts
         except Exception:

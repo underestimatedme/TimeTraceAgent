@@ -18,7 +18,6 @@ A stream the runner did not see whole (a command event it could not read) has no
 """
 import json
 import re
-import shlex
 from typing import Any, Dict, List, Optional
 
 VERSION = 1
@@ -32,50 +31,83 @@ TEST_TOOLS = ("pytest", "unittest", "go test", "cargo test", "npm test", "pnpm t
               "deno test", "mix test")
 
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
-_PLAIN_WRAPPERS = {"time", "nohup", "command", "exec", "caffeinate", "xvfb-run", "npx", "bunx", "pnpx"}
-_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
 _STANDALONE = {"vitest": "vitest", "jest": "jest", "mocha": "mocha", "ava": "ava", "tox": "tox", "nox": "nox",
                "rspec": "rspec", "phpunit": "phpunit", "ctest": "ctest", "bats": "bats",
                "pytest": "pytest", "py.test": "pytest"}
 _SUBCOMMAND = {"go": ("test", "go test"), "swift": ("test", "swift test"), "dotnet": ("test", "dotnet test"),
                "deno": ("test", "deno test"), "mix": ("test", "mix test"), "playwright": ("test", "playwright")}
 _PACKAGE_MANAGERS = {"npm": "npm test", "pnpm": "pnpm test", "yarn": "yarn test", "bun": "bun test"}
-# Package-manager options that take a value (`npm --prefix web test`).
-_VALUE_OPTIONS = {"--prefix", "-C", "--dir", "--filter", "-F", "--workspace", "-w", "--cwd"}
+_PYTHON_MODULES = {"pytest": "pytest", "unittest": "unittest", "tox": "tox", "nox": "nox"}
+# Options that take the next word as their value, per program (`npm --prefix web test`, `uv run --project web pytest`).
+_VALUE_OPTIONS = {
+    "package": {"--prefix", "-C", "--dir", "--filter", "-F", "--workspace", "-w", "--cwd"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-P", "-S", "--split-string"},
+    "npx": {"-p", "--package", "-c", "--call"},
+    "runner": {"--project", "--directory", "--with", "--with-requirements", "--with-editable", "--python", "-p",
+               "--package", "--extra", "--group", "--env-file", "--index", "--index-url", "-C", "-P", "--env", "-e"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "nice": {"-n", "--adjustment"},
+    "python": {"-W", "-X", "-Q"},
+}
+_PLAIN_WRAPPERS = {"time": "", "nohup": "", "command": "", "exec": "", "caffeinate": "", "xvfb-run": "",
+                   "npx": "npx", "bunx": "npx", "pnpx": "npx"}
+_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-_OPERATORS = {";", "&", "&&", "|", "||", "(", ")", ";;", "|&"}
 _GRADLE_TASK = re.compile(r"(?:^|:)(?:test\w*|check|connected\w*Test)$")
 _DOC_SUFFIXES = (".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".org")
 _DOC_NAMES = ("license", "licence", "changelog", "notice", "authors", "readme")
+_OPERATOR_CHARS = ";&|()\n"
 
 
-def _words(command: str) -> Optional[List[str]]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        return list(lexer)
-    except ValueError:
-        return None
-
-
-def _segments(words: List[str]) -> List[List[str]]:
-    out, current = [], []
-    for word in words:
-        if word in _OPERATORS:
-            if current:
-                out.append(current)
-            current = []
+def _segments(command: str) -> Optional[List[List[str]]]:
+    """The command's simple commands, split on the unquoted operators `;` `&` `|` `(` `)` and newlines, each as its
+    words with quotes removed. A quoted operator is part of a word. None when a quote is never closed."""
+    segments: List[List[str]] = [[]]
+    word, has_word, quote, i = [], False, "", 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            else:
+                word.append(ch)
+        elif quote == '"':
+            if ch == '"':
+                quote = ""
+            elif ch == "\\" and i + 1 < len(command) and command[i + 1] in '"\\$`':
+                i += 1
+                word.append(command[i])
+            else:
+                word.append(ch)
+        elif ch in ("'", '"'):
+            quote, has_word = ch, True
+        elif ch == "\\" and i + 1 < len(command):
+            i += 1
+            if command[i] != "\n":
+                word.append(command[i])
+                has_word = True
+        elif (ch.isspace() and ch != "\n") or ch in "<>" or ch in _OPERATOR_CHARS:
+            if has_word or word:
+                segments[-1].append("".join(word))
+            word, has_word = [], False
+            if ch in _OPERATOR_CHARS and segments[-1]:
+                segments.append([])
         else:
-            current.append(word)
-    if current:
-        out.append(current)
-    return out
+            word.append(ch)
+            has_word = True
+        i += 1
+    if quote:
+        return None
+    if has_word or word:
+        segments[-1].append("".join(word))
+    return [segment for segment in segments if segment]
 
 
-def _skip_options(words: List[str], start: int) -> int:
+def _skip_options(words: List[str], start: int, takes_value=frozenset()) -> int:
+    """The index of the first word from `start` that is not an option (nor the value of one in `takes_value`)."""
     i = start
-    while i < len(words) and words[i].startswith("-"):
-        i += 1 + (words[i] in _VALUE_OPTIONS and i + 1 < len(words))
+    while i < len(words) and words[i].startswith("-") and words[i] != "-":
+        i += 1 + (words[i] in takes_value and i + 1 < len(words))
     return i
 
 
@@ -84,10 +116,10 @@ def test_tool(command: Any, depth: int = 0) -> Optional[str]:
     `-c`, `env`, `npx`, `uv run` and similar), or None. A guess from the command line only."""
     if not isinstance(command, str) or depth > 3:
         return None
-    words = _words(command)
-    if not words:
+    segments = _segments(command)
+    if not segments:
         return None
-    for segment in _segments(words):
+    for segment in segments:
         found = _segment_tool(segment, depth)
         if found:
             return found
@@ -103,46 +135,71 @@ def _segment_tool(words: List[str], depth: int) -> Optional[str]:
         name = words[0].rsplit("/", 1)[-1]
         if name in _SHELLS:
             for i, word in enumerate(words[1:], 1):
-                if word.startswith("-") and not word.startswith("--") and "c" in word[1:]:
+                if not word.startswith("-") or word.startswith("--"):
+                    if word.startswith("--"):
+                        continue
+                    return None  # a script file, not `-c`
+                if "c" in word[1:]:
                     return test_tool(words[i + 1], depth + 1) if i + 1 < len(words) else None
             return None
         if name == "env":
             i = 1
             while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT.match(words[i])):
-                i += 1
+                i += 1 + (words[i] in _VALUE_OPTIONS["env"] and i + 1 < len(words))
             words = words[i:]
             continue
         if name == "nice":
-            i = 1
-            while i < len(words) and words[i].startswith("-"):
-                i += 1 + (words[i] == "-n")
-            words = words[i:]
+            words = words[_skip_options(words, 1, _VALUE_OPTIONS["nice"]):]
             continue
         if name == "timeout":
-            words = words[_skip_options(words, 1) + 1:]
+            words = words[_skip_options(words, 1, _VALUE_OPTIONS["timeout"]) + 1:]  # and the duration
             continue
         if name in _PLAIN_WRAPPERS:
-            words = words[_skip_options(words, 1):]
+            words = words[_skip_options(words, 1, _VALUE_OPTIONS.get(_PLAIN_WRAPPERS[name], frozenset())):]
             continue
         if name in _RUNNERS:
-            i = _skip_options(words, 1)
+            i = _skip_options(words, 1, _VALUE_OPTIONS["runner"])
             if i < len(words) and words[i] == "run":
-                words = words[_skip_options(words, i + 1):]
+                words = words[_skip_options(words, i + 1, _VALUE_OPTIONS["runner"]):]
                 continue
             return None
-        return _tool_of(name, words)
+        return _tool_of(name, words, depth)
     return None
 
 
-def _tool_of(name: str, words: List[str]) -> Optional[str]:
+def _python_tool(words: List[str]) -> Optional[str]:
+    """`python -m pytest`, `python -Bm pytest`; never when `-c` runs code or a script comes first (what follows is its
+    arguments, not Python's options)."""
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word == "--" or not word.startswith("-") or word == "-":
+            name = word.rsplit("/", 1)[-1] if word not in ("--", "-") else ""
+            return _STANDALONE.get(name) if name in ("pytest", "py.test") else None
+        if word.startswith("--"):
+            i += 1
+            continue
+        flags = word[1:]
+        for n, flag in enumerate(flags):
+            if flag == "c":
+                return None
+            if flag == "m":
+                module = flags[n + 1:] or (words[i + 1] if i + 1 < len(words) else "")
+                return _PYTHON_MODULES.get(module)
+            if flag in "WXQ":
+                if n == len(flags) - 1:
+                    i += 1  # its value is the next word
+                break
+        i += 1
+    return None
+
+
+def _tool_of(name: str, words: List[str], depth: int) -> Optional[str]:
     rest = words[1:]
     if name in _STANDALONE:
         return _STANDALONE[name]
     if re.fullmatch(r"python[0-9.]*", name):
-        for i, word in enumerate(rest[:-1]):
-            if word == "-m":
-                return {"pytest": "pytest", "unittest": "unittest", "tox": "tox", "nox": "nox"}.get(rest[i + 1])
-        return None
+        return _python_tool(words)
     if name in _SUBCOMMAND:
         sub, tool = _SUBCOMMAND[name]
         i = _skip_options(words, 1)
@@ -153,15 +210,15 @@ def _tool_of(name: str, words: List[str]) -> Optional[str]:
             i += 1
         return "cargo test" if i < len(words) and words[i] in ("test", "nextest") else None
     if name in _PACKAGE_MANAGERS:
-        i = _skip_options(words, 1)
+        i = _skip_options(words, 1, _VALUE_OPTIONS["package"])
         sub = words[i] if i < len(words) else ""
         if sub in ("test", "t", "tst") or (name in ("yarn", "pnpm") and sub.startswith("test")):
             return _PACKAGE_MANAGERS[name]
         if sub in ("run", "run-script"):
-            j = _skip_options(words, i + 1)
+            j = _skip_options(words, i + 1, _VALUE_OPTIONS["package"])
             return _PACKAGE_MANAGERS[name] if j < len(words) and words[j].startswith("test") else None
         if sub in ("exec", "dlx", "x"):
-            return _segment_tool(words[_skip_options(words, i + 1):], 0)
+            return _segment_tool(words[_skip_options(words, i + 1, _VALUE_OPTIONS["package"]):], depth)
         return None
     if name == "xcodebuild":
         return "xcodebuild test" if any(w in ("test", "test-without-building") for w in rest) else None
