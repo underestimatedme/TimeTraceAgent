@@ -317,13 +317,29 @@ def classify(command: Any, depth: int = 0) -> Optional[Tuple[str, bool, bool]]:
     return None
 
 
-# Commands that only set up the environment of the next one and print nothing.
-_SETUP = {"cd", "pushd", "export", "set", "unset", "ulimit", "umask", "true", ":"}
-
-
 def _is_setup(words: List[str]) -> bool:
-    rest = [w for w in words if not _ASSIGNMENT.match(w)] if words else []
-    return not rest or rest[0] in _SETUP
+    """A part that only sets up the environment of the next one in a form that prints nothing: `cd dir` (not `cd -`),
+    `export NAME=value` (not `export -p`), `unset NAME`, `set -e` / `set -o pipefail` (not a bare `set` or tracing),
+    `ulimit -n 1024` and `umask 022` with a value, `true`, `:`, or plain assignments."""
+    rest = [w for w in words if not _ASSIGNMENT.match(w)]
+    if not rest:
+        return True
+    name, args = rest[0], rest[1:]
+    if name in ("true", ":"):
+        return True
+    if name == "cd":
+        return "-" not in args
+    if name == "export":
+        return all(_ASSIGNMENT.match(a) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a) for a in args)
+    if name == "unset":
+        return True
+    if name == "set":
+        options = [a for a in args if a[:1] in "-+"]
+        return bool(args) and len(options) >= 1 and not any(c in a[1:] for a in options for c in "xv") \
+            and all(a[:1] in "-+" or a in ("pipefail", "errexit", "nounset", "noclobber") for a in args)
+    if name in ("ulimit", "umask"):
+        return any(not a.startswith("-") for a in args)
+    return False
 
 
 def test_tool(command: Any) -> Optional[str]:

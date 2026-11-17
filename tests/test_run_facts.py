@@ -176,6 +176,7 @@ class OutcomeTest(unittest.TestCase):
                                  ("npx vitest run", " Test Files  2 passed (2)"),
                                  ("npx jest", "Tests:       5 passed, 5 total"),
                                  ("cd web && npm test", "Tests:       5 passed, 5 total"),
+                                 ("export CI=1; set -euo pipefail; cd web && npm test", "Tests:       5 passed, 5 total"),
                                  ("make test", "  4 passing (12ms)"),
                                  ("xcodebuild -scheme App test", "** TEST SUCCEEDED **"),
                                  ("mvn test", "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0")):
@@ -184,7 +185,9 @@ class OutcomeTest(unittest.TestCase):
         # Another runner's summary, or one something before the runner could have printed, is no evidence.
         for command, summary in (("pytest", "BUILD SUCCESSFUL"), ("go test ./...", "3 passed"),
                                  ("printf '1 passed\\n'; make -f /dev/null -o test test", "1 passed\nmake: Nothing to be done"),
-                                 ("echo '3 passed' && pytest", "3 passed\nno tests ran")):
+                                 ("echo '3 passed' && pytest", "3 passed\nno tests ran"),
+                                 ("export RF='1 passed'; export -p; make -f /dev/null -o test test", "RF=1 passed"),
+                                 ("set; pytest", "x=1 passed"), ("pushd web && npm test", "~/web\n3 passed")):
             self.assertEqual(counted("claude", [bash("a", command), outcome("a", False, summary)])["tests"]["last"],
                              "unknown", command)
         self.assertEqual(counted("codex_exec", [item("1", "/bin/zsh -lc pytest", 0, output="")])["tests"]["last"],
