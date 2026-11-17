@@ -428,6 +428,54 @@ class CodexThreadTotalsTest(unittest.TestCase):
             self.assertIsNone(res.usage)
 
 
+class CodexThreadModelTest(unittest.TestCase):
+    """`codex exec --json` names no model (Codex 0.165.0); the rollout's turn_context does."""
+
+    def test_the_latest_turn_context_names_the_model(self):
+        with tempfile.TemporaryDirectory() as home:
+            write_rollout(home, THREAD, [TURN, token_count(100, 50, 5),
+                                         {"type": "turn_context", "payload": {"model": "gpt-6.1-sol-mini"}},
+                                         token_count(200, 80, 9)])
+            self.assertEqual(codex.thread_model(THREAD, Path(home)), "gpt-6.1-sol-mini")
+
+    def test_no_model_unless_the_rollout_is_this_threads(self):
+        other = "01a167a9-1103-7440-8bd4-d7f0e0a6ba00"
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(codex.thread_model(THREAD, Path(home)), "")
+            write_rollout(home, THREAD, [TURN], meta_id=other)
+            self.assertEqual(codex.thread_model(THREAD, Path(home)), "")
+            write_rollout(home, other, [token_count(1, 0, 1)])
+            self.assertEqual(codex.thread_model(other, Path(home)), "")
+            for bad in (None, "", "../x", THREAD + "0"):
+                self.assertEqual(codex.thread_model(bad, Path(home)), "")
+            outside = Path(home) / "outside"
+            target = write_rollout(outside, THREAD, [TURN])
+            linked = Path(home) / "leaf" / "sessions" / "2026" / "11" / "16" / target.name
+            linked.parent.mkdir(parents=True)
+            linked.symlink_to(target)
+            self.assertEqual(codex.thread_model(THREAD, Path(home) / "leaf"), "")
+
+    def test_a_run_with_no_model_configured_takes_the_threads(self):
+        with tempfile.TemporaryDirectory() as home:
+            write_rollout(home, THREAD, [TURN, token_count(16419, 12160, 1110)])
+            log = str(Path(home) / "run.log")
+
+            def fake(cmd, cwd, log, on_line=None, **kwargs):
+                return printed(lines("codex_exec_cached.jsonl"), on_line)
+            with patch.dict(os.environ, {"CODEX_HOME": home}), patch.object(codex, "run_streaming", fake), \
+                    patch.object(codex.CodexAdapter, "_writable_extras", staticmethod(lambda cwd: [])):
+                plain = codex.CodexAdapter({"bin": "codex"}, billing=StaticBilling(True))
+                self.assertEqual(plain.start("go", home, "s", log).usage,
+                                 tokens("gpt-6.1-sol", 16419 - 12160, 1110, 12160, 0))
+                configured = codex.CodexAdapter({"bin": "codex", "model": "gpt-6.1-sol-mini"},
+                                                billing=StaticBilling(True))
+                self.assertEqual(configured.start("go", home, "s", log).usage["model"], "gpt-6.1-sol-mini")
+                with patch.object(codex, "thread_model", side_effect=RuntimeError("boom")):
+                    res = plain.start("go", home, "s", log)
+                self.assertTrue(res.ok)
+                self.assertEqual(res.usage, tokens("", 16419 - 12160, 1110, 12160, 0))
+
+
 LONG = 10_000 + 50  # more output lines than a run hands back (timetrace.process.MAX_CAPTURED_LINES)
 
 
@@ -470,7 +518,8 @@ class LongOutputUsageTest(unittest.TestCase):
                 # The same with a first total that fits: the last total minus the baseline.
                 adapter.cfg["bin"] = tool(Path(home) / "codex2", [started, codex_turn(2200, 1100, 95)] + ORDINARY
                                           + [codex_turn(2500, 1400, 100)])
-                self.assertEqual(adapter.resume("go", home, THREAD, log).usage, tokens("", 100, 10, 400, 0))
+                # No model configured or printed: the one the rollout's turn_context names.
+                self.assertEqual(adapter.resume("go", home, THREAD, log).usage, tokens("gpt-6.1-sol", 100, 10, 400, 0))
 
     def test_codex_total_going_down_more_than_the_kept_lines_apart(self):
         with tempfile.TemporaryDirectory() as home:

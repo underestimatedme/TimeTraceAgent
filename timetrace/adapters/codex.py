@@ -390,6 +390,38 @@ def thread_totals(thread_id: Any, home: Optional[Path] = None) -> Optional[usage
     complete JSON object, every line after the latest token_count is readable, and that token_count's total is whole
     and agrees with any token_usage_record written after it. ZERO only for a file read whole that holds nothing but
     its session_meta (no turn yet)."""
+    read = _read_rollout(thread_id, home)
+    return None if read is None else _rollout_totals(thread_id, *read)
+
+
+def thread_model(thread_id: Any, home: Optional[Path] = None) -> str:
+    """The model of a Codex thread's latest turn: the `turn_context` written last in its rollout file (read as
+    thread_totals reads it). `codex exec --json` names no model, so a run with none configured would otherwise be
+    counted as an unknown model and never priced. "" when the file or a turn_context in its last part is not found."""
+    read = _read_rollout(thread_id, home)
+    if read is None:
+        return ""
+    head, tail, whole = read
+    first, newline, _ = head.partition(b"\n")
+    meta = _json_object(first) if newline else None
+    payload = meta.get("payload") if meta is not None and meta.get("type") == "session_meta" else None
+    if not isinstance(payload, dict) or payload.get("id") != thread_id:
+        return ""
+    lines = tail.split(b"\n")
+    if not whole:
+        lines = lines[1:]  # read from the middle of a line
+    for raw in reversed(lines):
+        line = _json_object(raw)
+        if line is not None and line.get("type") == "turn_context" and isinstance(line.get("payload"), dict):
+            name = usage.model_name(line["payload"].get("model"))
+            if name:
+                return name
+    return ""
+
+
+def _read_rollout(thread_id: Any, home: Optional[Path] = None) -> Optional[Tuple[bytes, bytes, bool]]:
+    """(first part, last part, whether the last part is the whole file) of the thread's one rollout file; None unless
+    it is a regular file reached without a symbolic link anywhere below `sessions`."""
     if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
         return None
     try:
@@ -418,7 +450,7 @@ def thread_totals(thread_id: Any, home: Optional[Path] = None) -> Optional[usage
             tail = fh.read(ROLLOUT_TAIL_BYTES)
     except (OSError, ValueError):
         return None
-    return _rollout_totals(thread_id, head, tail, whole=size <= ROLLOUT_TAIL_BYTES)
+    return head, tail, size <= ROLLOUT_TAIL_BYTES
 
 
 def _json_object(raw: bytes) -> Optional[Dict[str, Any]]:
@@ -679,6 +711,11 @@ class CodexAdapter(ToolAdapter):
         res.usage = tokens.total()
         # Every Codex exec run (task, resume, folder, chat, review, plan, import) passes here.
         res.session_id = watch.thread_id or res.session_id
+        if res.usage is not None and not res.usage.get("model"):
+            try:
+                res.usage["model"] = thread_model(watch.thread_id or resume)
+            except Exception:
+                pass  # never a reason for a run to fail: its usage stays unpriced
         res.exit_code = code
         if code != 0 and not res.blocked:
             res.ok = False
