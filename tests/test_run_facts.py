@@ -93,6 +93,10 @@ class TestToolTest(unittest.TestCase):
             "pytest>out.txt": "pytest",
             "pytest -q 2>&1 | tail -5": "pytest",
             "echo 'a;b' && go test ./...": "go test",
+            "2>/dev/null pytest": "pytest",
+            "pytest <<< x": "pytest",
+            "pytest -n auto": "pytest",
+            "exec -a runner pytest": "pytest",
         }
         for command, tool in cases.items():
             self.assertEqual(run_facts.test_tool(command), tool, command)
@@ -107,7 +111,13 @@ class TestToolTest(unittest.TestCase):
                         'echo ";" pytest', "echo a\\;pytest", "uv run --with pytest python script.py",
                         # A comment, a heredoc's body and a lookup run nothing.
                         "printf ok # ; pytest", "cat <<EOF\npytest\nEOF", "cat <<-'END'\n\tpytest\n\tEND",
-                        "command -v pytest", "type pytest",
+                        "command -v pytest", "type pytest", "command -pv pytest",
+                        # A redirection's target is a file, not a command.
+                        ">pytest", "< /usr/bin/make test", 'echo hi > "pytest"',
+                        # Modes that read, list or dry-run instead of running tests.
+                        "bash -n -c 'python3 -m unittest x'", "bash -o noexec -c pytest", "pytest --collect-only",
+                        "python3 -m pytest --co", "make -n test", "go test -list .", "cargo test -- --list",
+                        "jest --listTests", "vitest list", "npm test --help",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
 

@@ -48,12 +48,58 @@ _VALUE_OPTIONS = {
     "runner": {"--project", "--directory", "--with", "--with-requirements", "--with-editable", "--python", "-p",
                "--package", "--extra", "--group", "--env-file", "--index", "--index-url", "-C", "-P", "--env", "-e"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "exec": {"-a"},
+    "caffeinate": {"-t", "-w"},
+    "xvfb-run": {"-s", "--server-args", "-n", "--server-num", "-e", "--error-file", "-f", "--auth-file", "-p",
+                 "--xauth-protocol"},
     "nice": {"-n", "--adjustment"},
 }
 # Wrappers that run the rest of the line and pass its exit status on.
-_PLAIN_WRAPPERS = {"time": "", "nohup": "", "exec": "", "caffeinate": "", "xvfb-run": "",
+_PLAIN_WRAPPERS = {"time": "", "nohup": "", "exec": "exec", "caffeinate": "caffeinate", "xvfb-run": "xvfb-run",
                    "npx": "npx", "bunx": "npx", "pnpx": "npx"}
 _RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
+# Arguments with which a test runner lists, collects, dry-runs or prints help or its version instead of running tests.
+_NOT_RUNNING = {
+    "pytest": {"--collect-only", "--co", "--version", "-V", "--help", "-h", "--fixtures", "--markers", "--setup-plan"},
+    "unittest": {"--help", "-h"},
+    "jest": {"--listTests", "--version", "-v", "--help", "-h", "--showConfig"},
+    "vitest": {"--version", "-v", "--help", "-h", "list"},
+    "mocha": {"--version", "-V", "--help", "-h", "--dry-run", "--list-files"},
+    "ava": {"--version", "--help"},
+    "go test": {"-list", "-c", "-n", "-h", "-help"},
+    "cargo test": {"--no-run", "--list", "--help", "-h"},
+    "npm test": {"--help", "-h"}, "pnpm test": {"--help", "-h"}, "yarn test": {"--help", "-h"}, "bun test": {"--help"},
+    "playwright": {"--list", "--help", "-h"},
+    "xcodebuild test": {"-showBuildSettings", "-showTestPlans", "-list", "-help", "-version", "-showdestinations",
+                        "-showsdks", "-dry-run"},
+    "swift test": {"--list-tests", "-l", "--help", "-h", "--version"},
+    "gradle test": {"--dry-run", "-m", "--help", "-h", "--version", "-v"},
+    "mvn test": {"--help", "-h", "--version", "-v"},
+    "make test": {"-n", "--dry-run", "--just-print", "--recon", "-q", "--question", "--help", "-h"},
+    "tox": {"--help", "-h", "--version", "-l", "--listenvs", "--listenvs-all", "-a", "--showconfig", "--notest"},
+    "nox": {"--help", "-h", "--version", "-l", "--list", "--list-sessions"},
+    "rspec": {"--dry-run", "--help", "-h", "--version", "-v"},
+    "phpunit": {"--list-tests", "--list-suites", "--list-groups", "--help", "-h", "--version"},
+    "ctest": {"-N", "--show-only", "--help", "--version"},
+    "bats": {"--count", "-c", "--help", "-h", "--version", "-v"},
+    "dotnet test": {"--list-tests", "-t", "--help", "-h"},
+    "deno test": {"--no-run", "--help", "-h"},
+    "mix test": {"--help"},
+}
+
+
+def _runs_tests(tool: str, words: List[str]) -> bool:
+    """False when an argument makes the runner list, collect, dry-run or print help instead of running tests (make's
+    combined short flags such as -nk count too)."""
+    blocked = _NOT_RUNNING.get(tool, set())
+    for word in words[1:]:  # past `--` too: `cargo test -- --list` lists
+        if word.split("=", 1)[0] in blocked:
+            return False
+        if tool == "make" and word.startswith("-") and not word.startswith("--") and ("n" in word[1:] or "q" in word[1:]):
+            return False
+    return True
+
+
 # Words after which a command's exit status is not the test's own.
 _CONTROL = {"!", "if", "then", "elif", "else", "while", "until", "do", "{"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
@@ -73,18 +119,23 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
     segments: List[List[str]] = [[]]
     seen: Set[str] = set()
     word: List[str] = []
-    state = {"has_word": False}
+    # drop_next: the next word is a redirection's target (`> out`, `< in`, `<<< text`), not part of the command.
+    state = {"has_word": False, "drop_next": False, "has_word_quoted": False}
     heredocs: List[Tuple[str, bool]] = []
     quote, i, n = "", 0, len(command)
 
     def end_word():
         if state["has_word"] or word:
-            segments[-1].append("".join(word))
+            if state["drop_next"]:
+                state["drop_next"] = False
+            else:
+                segments[-1].append("".join(word))
         del word[:]
-        state["has_word"] = False
+        state["has_word"] = state["has_word_quoted"] = False
 
     def operator(op):
         end_word()
+        state["drop_next"] = False
         seen.add(op)
         if segments[-1]:
             segments.append([])
@@ -105,7 +156,7 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
             else:
                 word.append(ch)
         elif ch in ("'", '"'):
-            quote, state["has_word"] = ch, True
+            quote, state["has_word"], state["has_word_quoted"] = ch, True, True
         elif ch == "\\":
             if i + 1 < n and command[i + 1] != "\n":
                 word.append(command[i + 1])
@@ -138,6 +189,9 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
                 heredocs.append((delimiter, strip))
             continue
         elif ch in "<>" or command.startswith("&>", i):
+            if word and not state["has_word_quoted"] and "".join(word).isdigit():
+                del word[:]  # the file descriptor of `2>/dev/null`
+                state["has_word"] = False
             end_word()
             i += 2 if ch == "&" else 1
             while i < n and command[i] in "<>":
@@ -146,6 +200,8 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
                 i += 1
                 while i < n and (command[i].isdigit() or command[i] == "-"):
                     i += 1
+            else:
+                state["drop_next"] = True
             continue
         elif ch in ";&|()":
             op = command[i:i + 2] if command[i:i + 2] in ("&&", "||", ";;", "|&") else ch
@@ -222,18 +278,22 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             continue
         if name in _SHELLS:
             for i, word in enumerate(words[1:], 1):
-                if word.startswith("--"):
+                if word in ("--noexec",) or (word in ("-o", "+o") and words[i + 1:i + 2] == ["noexec"]):
+                    return None
+                if word.startswith("--") or word.startswith("+"):
                     continue
                 if not word.startswith("-"):
                     return None  # a script file, not `-c`
+                if "n" in word[1:]:
+                    return None  # -n reads the script without running it
                 if "c" in word[1:]:
                     found = classify(words[i + 1], depth + 1) if i + 1 < len(words) else None
                     return (found[0], found[1] and own) if found else None
             return None
         if name == "command":
             i = _skip_options(words, 1)
-            if any(w in ("-v", "-V") for w in words[1:i]):
-                return None  # asks where a command is; runs nothing
+            if any("v" in w[1:] or "V" in w[1:] for w in words[1:i]):
+                return None  # asks where a command is (-v, -V, -pv); runs nothing
             words = words[i:]
             continue
         if name == "env":
@@ -260,7 +320,7 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
         tool = _tool_of(name, words, depth)
         if isinstance(tool, tuple):
             return tool[0], tool[1] and own
-        return (tool, own) if tool else None
+        return (tool, own) if tool and _runs_tests(tool, words) else None
     return None
 
 
