@@ -64,3 +64,6 @@ class RunResult:
     # Tokens this run used (timetrace.usage): {"model", "input_tokens" (cache reads not included), "output_tokens",
     # "cache_read_tokens", "cache_write_tokens"}; None when the tool reported none.
     usage: Optional[Dict[str, Any]] = None
+    # The commands this run made as its tool's stream showed them (timetrace.run_facts): {"commands": {ran, failed},
+    # "tests": {ran, failed, last?, tools?}}; None when this kind of run is not watched or its stream was not read whole.
+    commands: Optional[Dict[str, Any]] = None
