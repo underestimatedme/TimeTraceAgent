@@ -100,6 +100,8 @@ class TestToolTest(unittest.TestCase):
             "make -k test": "make test",
             "cargo nextest run": "cargo test",
             "./gradlew test -x lint": "gradle test",
+            "mvn test -DskipTests=false": "mvn test",
+            "bash -euo pipefail -c 'pytest -q'": "pytest",
         }
         for command, tool in cases.items():
             self.assertEqual(run_facts.test_tool(command), tool, command)
@@ -135,8 +137,9 @@ class OutcomeTest(unittest.TestCase):
         masked = ["pytest || true", "true || pytest", "pytest | tail -5", "pytest &", "! pytest",
                   "if pytest; then echo ok; fi", "(cd web && npm test)", "pytest; echo done",
                   "/bin/zsh -lc \"pytest | tail\"", "{ pytest; }",
-                  # A last part that is only a redirection still sets the exit status.
-                  "python3 -B -m unittest missing_module; < /dev/null"]
+                  # A last part that is only a redirection or a heredoc still sets the exit status.
+                  "python3 -B -m unittest missing_module; < /dev/null",
+                  "python3 -B -m unittest x; <<END\n${UNSET:?no}\nEND", "pytest; <<'END'\nEND"]
         for command in own:
             self.assertEqual(run_facts.classify(command)[1], True, command)
         for command in masked:

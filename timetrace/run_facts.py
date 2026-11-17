@@ -99,7 +99,8 @@ def _runs_tests(tool: str, words: List[str]) -> bool:
     (make's combined short flags such as -nk count too)."""
     blocked = _NOT_RUNNING.get(tool, set()) | _NEVER_RUNNING
     for word in words[1:]:  # past `--` too: `cargo test -- --list` lists
-        if word.split("=", 1)[0] in blocked:
+        name, _, value = word.partition("=")
+        if name in blocked and not (name.startswith("-D") and value.lower() == "false"):
             return False
         if tool == "make test" and word.startswith("-") and not word.startswith("--") and ("n" in word[1:] or "q" in word[1:]):
             return False
@@ -185,6 +186,7 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
             continue
         elif command.startswith("<<", i) and not command.startswith("<<<", i):
             end_word()
+            redirected[-1] = True  # a part that is only a heredoc is still a command with its own exit status
             i += 2
             strip = command.startswith("-", i)
             i += strip
@@ -287,10 +289,17 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             words, own = words[1:], False
             continue
         if name in _SHELLS:
-            for i, word in enumerate(words[1:], 1):
-                if word in ("--noexec",) or (word in ("-o", "+o") and words[i + 1:i + 2] == ["noexec"]):
+            i = 1
+            while i < len(words):
+                word = words[i]
+                takes_name = word[:1] in "-+" and not word.startswith("--") and word[1:].endswith("o")
+                if word == "--noexec" or (takes_name and words[i + 1:i + 2] == ["noexec"]):
                     return None
+                if takes_name:
+                    i += 2  # -o pipefail, -euo pipefail, +o posix: the option's name
+                    continue
                 if word.startswith("--") or word.startswith("+"):
+                    i += 1
                     continue
                 if not word.startswith("-"):
                     return None  # a script file, not `-c`
@@ -299,6 +308,7 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
                 if "c" in word[1:]:
                     found = classify(words[i + 1], depth + 1) if i + 1 < len(words) else None
                     return (found[0], found[1] and own) if found else None
+                i += 1
             return None
         if name == "command":
             i = _skip_options(words, 1)
