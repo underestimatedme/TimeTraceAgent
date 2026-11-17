@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -22,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from timetrace import __version__
 from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
-from timetrace import tiers, worktree
+from timetrace import tiers, usage, worktree
 from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.redact import mask_file, masking
 from timetrace.models import CODEX, RunResult, Sample
@@ -305,10 +306,16 @@ def build_folder_cmd(cfg: Dict[str, Any], prompt: str, cwd: str, resume: Optiona
     return cmd
 
 
-def parse_exec(lines: List[str]) -> RunResult:
+def parse_exec(lines: List[str], model: str = "", start: Optional[usage.Totals] = usage.ZERO) -> RunResult:
+    """`codex exec --json` lines → RunResult. `turn.completed.usage` is the thread's running total (Codex sets it from
+    the last token-usage update, whose `total` includes what a resumed thread had saved), so the run used the last one
+    minus `start`: the thread's totals before the run (ZERO for a new thread, None when they are not known for certain,
+    which reports no usage). The model is one an event names, else `model` (the configured one). Its usage covers
+    these lines only: a run's comes from every line it printed (CodexAdapter._run)."""
     res = RunResult()
     saw_turn_completed = False
     saw_failure = False
+    tokens = usage.CodexTokens(start, model)
     for raw in lines:
         raw = raw.strip()
         if not raw.startswith("{"):
@@ -317,7 +324,10 @@ def parse_exec(lines: List[str]) -> RunResult:
             msg = json.loads(raw)
         except ValueError:
             continue
+        if not isinstance(msg, dict):
+            continue
         t = msg.get("type", "")
+        tokens.add(msg)
         if t == "thread.started":
             res.session_id = msg.get("thread_id") or res.session_id
         elif t == "turn.completed":
@@ -336,6 +346,7 @@ def parse_exec(lines: List[str]) -> RunResult:
     res.ok = saw_turn_completed and not saw_failure and not res.blocked
     if res.blocked:
         res.ok = False
+    res.usage = tokens.total()
     return res
 
 
@@ -359,6 +370,99 @@ class ThreadWatch:
             thread_id = msg.get("thread_id")
             if isinstance(thread_id, str) and thread_id.strip():
                 self.thread_id = thread_id.strip()
+
+
+_THREAD_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+ROLLOUT_HEAD_BYTES = 1024 * 1024
+ROLLOUT_TAIL_BYTES = 4 * 1024 * 1024
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def thread_totals(thread_id: Any, home: Optional[Path] = None) -> Optional[usage.Totals]:
+    """The running token totals a Codex thread had at its last recorded model call - what a resumed run continues
+    from - read from its rollout file `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`.
+
+    Never a guess: None (and the run reports no usage) unless the file is a regular file reached without a symbolic
+    link anywhere below `sessions`, its first record is the session_meta of this very thread, its last line is a
+    complete JSON object, every line after the latest token_count is readable, and that token_count's total is whole
+    and agrees with any token_usage_record written after it. ZERO only for a file read whole that holds nothing but
+    its session_meta (no turn yet)."""
+    if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
+        return None
+    try:
+        root = (home or codex_home()) / "sessions"
+        found = sorted(root.glob("*/*/*/rollout-*-%s.jsonl" % thread_id))
+        if len(found) != 1:
+            return None
+        path, step = found[0], root
+        if os.path.islink(root):
+            return None
+        for part in path.relative_to(root).parts:
+            step = step / part
+            if os.path.islink(step):
+                return None
+        real_root = os.path.realpath(root)
+        if os.path.commonpath([os.path.realpath(path), real_root]) != real_root:
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as fh:
+            info = os.fstat(fh.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            size = info.st_size
+            head = fh.read(min(size, ROLLOUT_HEAD_BYTES))
+            fh.seek(max(0, size - ROLLOUT_TAIL_BYTES))
+            tail = fh.read(ROLLOUT_TAIL_BYTES)
+    except (OSError, ValueError):
+        return None
+    return _rollout_totals(thread_id, head, tail, whole=size <= ROLLOUT_TAIL_BYTES)
+
+
+def _json_object(raw: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(raw)
+    except ValueError:  # UnicodeDecodeError included
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _rollout_totals(thread_id: str, head: bytes, tail: bytes, whole: bool) -> Optional[usage.Totals]:
+    first, newline, _ = head.partition(b"\n")
+    meta = _json_object(first) if newline else None
+    if meta is None or meta.get("type") != "session_meta":
+        return None
+    payload = meta.get("payload")
+    if not isinstance(payload, dict) or payload.get("id") != thread_id:
+        return None
+    if not tail.endswith(b"\n"):
+        return None  # the last line is still being written, or was cut
+    lines = tail[:-1].split(b"\n")
+    if not whole:
+        lines = lines[1:]  # read from the middle of a line
+    later_records = []
+    only_meta = True
+    for raw in reversed(lines):
+        line = _json_object(raw)
+        if line is None:
+            return None
+        payload = line.get("payload") if isinstance(line.get("payload"), dict) else {}
+        kind = line.get("type")
+        if kind != "session_meta":
+            only_meta = False
+        if kind == "token_usage_record":
+            later_records.append(payload.get("thread_token_usage"))
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if info is None:
+                continue  # a rate-limit update: no totals in it
+            latest = usage.codex_totals(info.get("total_token_usage") if isinstance(info, dict) else None)
+            if latest is None or any(usage.codex_totals(record) != latest for record in later_records):
+                return None
+            return latest
+    return usage.ZERO if whole and only_meta and not later_records else None
 
 
 def _int_or_none(v: Any) -> Optional[int]:
@@ -435,13 +539,15 @@ class CodexAdapter(ToolAdapter):
         except Exception:
             return []
 
-    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess]) -> RunResult:
+    def _masked_run(self, cmd: List[str], cwd: str, log_file: str, cancel_event, mcp: Optional[McpAccess],
+                    resume: Optional[str] = None) -> RunResult:
         """One execution run. Codex writes its final answer to the `-o` file itself, outside the streams that are masked
         as they are read, so that file is masked once the run is over however it ended (finished, failed, cancelled, an
         exception): a token the model repeated is never left in it."""
         with masking([mcp.token] if mcp is not None else []):
             try:
-                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None)
+                return self._run(cmd, cwd, log_file, cancel_event, env=mcp.env() if mcp is not None else None,
+                                 resume=resume)
             finally:
                 mask_file(log_file + ".last.md")
 
@@ -481,6 +587,11 @@ class CodexAdapter(ToolAdapter):
             })
         env = mcp.env() if mcp is not None and not read_only else None
         turn = CodexTurn(cmd, cwd, control, cancel_event, float(self.cfg.get("timeout_seconds", 3600)), read_only, env)
+        if resuming:
+            try:
+                turn.saved_totals = thread_totals(session_id)
+            except Exception:
+                turn.saved_totals = None
         with masking([mcp.token] if env else []):
             return turn.run(prompt, session_id if resuming else None, params, log_file)
 
@@ -494,7 +605,7 @@ class CodexAdapter(ToolAdapter):
                mcp: Optional[McpAccess] = None) -> RunResult:
         cmd = build_cmd(self.cfg, prompt, cwd, resume=session_id,
                         last_msg_file=log_file + ".last.md", add_dirs=self._writable_extras(cwd), mcp=mcp)
-        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp)
+        res = self._masked_run(cmd, cwd, log_file, cancel_event, mcp, resume=session_id)
         res.session_id = res.session_id or session_id
         return res
 
@@ -506,7 +617,7 @@ class CodexAdapter(ToolAdapter):
     def resume_folder(self, prompt: str, cwd: str, workspace: str, session_id: str, log_file: str,
                       cancel_event=None) -> RunResult:
         cmd = build_folder_cmd(self.cfg, prompt, cwd, resume=session_id, last_msg_file=log_file + ".last.md")
-        res = self._run(cmd, cwd, log_file, cancel_event)
+        res = self._run(cmd, cwd, log_file, cancel_event, resume=session_id)
         res.session_id = res.session_id or session_id
         return res
 
@@ -539,7 +650,7 @@ class CodexAdapter(ToolAdapter):
         except FileNotFoundError:
             pass
         cmd = build_chat_cmd(self.cfg, prompt, cwd, resume=session_id or None, last_msg_file=str(last), rules=rules)
-        res = self._run(cmd, cwd, log_file, cancel_event)
+        res = self._run(cmd, cwd, log_file, cancel_event, resume=session_id or None)
         try:
             if last.is_file() and not last.is_symlink():
                 text = last.read_text(encoding="utf-8", errors="replace").strip()
@@ -551,12 +662,21 @@ class CodexAdapter(ToolAdapter):
         return res
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, cancel_event=None,
-             env: Optional[Dict[str, str]] = None) -> RunResult:
+             env: Optional[Dict[str, str]] = None, resume: Optional[str] = None) -> RunResult:
+        """`resume`: the thread a resumed run continues; its saved token totals are read first, so the run reports
+        only what it used itself."""
+        try:
+            start = thread_totals(resume) if resume else usage.ZERO
+        except Exception:
+            start = None  # never a reason for a run to fail: it only reports no usage
         watch = ThreadWatch()
+        # The lines handed back are only the last ones: what the run used is kept from every line as it is read.
+        tokens = usage.CodexTokens(start, str(self.cfg.get("model") or ""))
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                     cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env,
-                                    on_line=watch)
-        res = parse_exec(lines)
+                                    on_line=usage.watchers(watch, tokens.feed))
+        res = parse_exec(lines, model=str(self.cfg.get("model") or ""), start=start)
+        res.usage = tokens.total()
         # Every Codex exec run (task, resume, folder, chat, review, plan, import) passes here.
         res.session_id = watch.thread_id or res.session_id
         res.exit_code = code

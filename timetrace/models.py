@@ -1,6 +1,6 @@
 """Shared constants and small data classes. No I/O here."""
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # Task states (spec §4)
 PENDING = "pending"
@@ -61,3 +61,6 @@ class RunResult:
     samples: List[Sample] = field(default_factory=list)
     error: Optional[str] = None
     output: str = ""
+    # Tokens this run used (timetrace.usage): {"model", "input_tokens" (cache reads not included), "output_tokens",
+    # "cache_read_tokens", "cache_write_tokens"}; None when the tool reported none.
+    usage: Optional[Dict[str, Any]] = None

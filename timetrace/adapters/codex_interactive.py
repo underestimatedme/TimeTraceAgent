@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict
 
-from timetrace import approvals
+from timetrace import approvals, usage
 from timetrace.billing import billing_env_keys
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.models import CODEX, RunResult
@@ -55,6 +55,14 @@ class CodexTurn:
         self.initial_sent = False
         self.initial_confirmed = False
         self.ended = False
+        # Token usage (timetrace.usage totals): the thread's running totals before this turn as its rollout recorded
+        # them (set by the adapter for a resumed thread; None when not known for certain), those the App Server
+        # replayed for an earlier turn, and this turn's. Anything that does not fit together means no usage.
+        self.saved_totals = usage.ZERO
+        self.replayed = []
+        self.turn_totals = []
+        self.usage_conflict = False
+        self.model = ""
 
     def _write_locked(self, msg):
         try:
@@ -133,6 +141,9 @@ class CodexTurn:
     def _notification(self, method, params):
         if params.get("threadId") != self.thread_id:
             return
+        if method == "thread/tokenUsage/updated":
+            self._token_usage(params)
+            return
         if method in ("turn/started", "turn/completed"):
             turn = params.get("turn")
             if method == "turn/started" and not self.turn_id and self.initial_sent and isinstance(turn, dict):
@@ -154,6 +165,36 @@ class CodexTurn:
             self.file_changes[item.get("id")] = paths
         if method == "item/completed":
             self._reply(item)
+
+    def _token_usage(self, params):
+        """Each update carries the thread's running totals. One for an earlier turn, before this turn reported any, is
+        the App Server replaying what a resumed thread had saved (the starting point); this turn's last is where it
+        ended. A total that is not whole or an earlier turn's after this one's is a conflict (one that goes down is
+        caught by turn_usage, against the starting totals too)."""
+        token_usage = params.get("tokenUsage")
+        totals = usage.codex_totals(token_usage.get("total") if isinstance(token_usage, dict) else None,
+                                    usage.CODEX_CAMEL)
+        if totals is None:
+            self.usage_conflict = True
+        elif self.turn_id and params.get("turnId") == self.turn_id:
+            self.turn_totals.append(totals)
+        elif self.turn_totals:
+            self.usage_conflict = True
+        elif totals not in self.replayed:
+            self.replayed.append(totals)
+
+    def turn_usage(self):
+        """What this turn used; None when it reported nothing, when where it began is not certain (no saved or replayed
+        totals for a resumed thread, two different replays, a replay that disagrees with the rollout), on a conflict,
+        or when any of its totals is below the one before it, the starting totals included."""
+        if self.usage_conflict or not self.turn_totals or len(self.replayed) > 1:
+            return None
+        start = self.saved_totals
+        if self.replayed:
+            if start is not None and start != self.replayed[0]:
+                return None
+            start = self.replayed[0]
+        return usage.codex_run_used(start, self.turn_totals, self.model)
 
     def _reply(self, item):
         if (not isinstance(item, dict) or item.get("type") != "agentMessage"
@@ -254,8 +295,10 @@ class CodexTurn:
             return
         self._write({"method": "initialized"})
         method = "thread/resume" if session_id else "thread/start"
-        thread = self._request(method, dict(params, threadId=session_id, excludeTurns=True) if session_id else params)
-        thread = (thread or {}).get("thread")
+        response = self._request(method, dict(params, threadId=session_id, excludeTurns=True) if session_id else params)
+        thread = (response or {}).get("thread")
+        model = (response or {}).get("model")
+        self.model = model if isinstance(model, str) and model.strip() else str(params.get("model") or "")
         actual = thread.get("id") if isinstance(thread, dict) else None
         if not isinstance(actual, str) or not actual or (session_id and actual != session_id):
             self.result.error = "Codex session unavailable" if session_id else "Codex could not start a session"
@@ -315,6 +358,10 @@ class CodexTurn:
                     pass
             if not self.result.ok and not self.result.error:
                 self.result.error = "Codex App Server disconnected"
+            try:
+                self.result.usage = self.turn_usage()
+            except Exception:
+                self.result.usage = None
         finally:
             self.ended = True
             self.host.detach()

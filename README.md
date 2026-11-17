@@ -239,7 +239,8 @@ iPhone ──任务──▶ TimeTrace 云（Valley）◀──出站 HTTPS 轮�
 ```
 
 - **离开本机的**：电脑名、登记仓库的文件夹名和默认分支名（不含绝对路径）、工具名/套餐等级/零付费核验结论、额度百分比与重置时间；
-  任务事件的状态、错误信息、模型最后一条回复的前 1000 字，以及（`upload_output_tail` 为 true 时）运行日志末尾最多 8000 字节。
+  任务事件的状态、错误信息、模型最后一条回复的前 1000 字，以及（`upload_output_tail` 为 true 时）运行日志末尾最多 8000 字节；
+  一次运行结束（完成、失败、被中断、等额度、取消或停止）时，本次运行用掉的 token 数（输入、输出、缓存读取、缓存写入四个数）与模型名，用于「AI 用量」统计。
   所有文本在写入本地待发队列之前先做密钥脱敏（`timetrace/redact.py`：AWS/阿里云 AccessKey、GitHub/OpenAI/Anthropic/Slack/Google token、JWT、PEM 私钥、`xxx_TOKEN=…` 之类的赋值、Bearer 头、URL 里的密码）。
 - **额度读取**：Claude Code 的 OAuth access token 只发给 `https://api.anthropic.com/api/oauth/usage`（与 Claude Code 自己的 `/usage` 相同的调用）。
 - **从不离开本机的**：Claude/Codex 的登录凭据与 API key、仓库文件与 diff、任务分支（从不推送）、完整运行日志。

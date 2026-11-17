@@ -404,7 +404,7 @@ sys.exit(int(os.environ.get("TT_FAKE_EXIT", "0")))
                 self.assertNoTokens(kept[0])
                 self.assertIn("REDACTED", kept[0])
 
-    def _raise_after_the_tool_wrote_its_answer(self, cmd, cwd, log_file, cancel_event=None, env=None):
+    def _raise_after_the_tool_wrote_its_answer(self, cmd, cwd, log_file, cancel_event=None, env=None, resume=None):
         # the real tool ran and wrote its answer (with the token), then the adapter failed
         import subprocess
         Path(log_file).touch()
