@@ -108,6 +108,23 @@ def _runs_tests(tool: str, words: List[str]) -> bool:
     return True
 
 
+# A successful test command counts as passed only when its own output carries a test runner's summary: a command read
+# as a test that ran none (`python --version -m unittest`, a syntax check) can then never show as a pass. Only the
+# output's end is searched, and nothing of it leaves the computer.
+OUTPUT_SCAN_CHARS = 64 * 1024
+_PASSED = re.compile("|".join([
+    r"\b\d+ passed\b",                                   # pytest, vitest, jest, playwright, deno
+    r"^Ran \d+ tests? in [\d.]+s\s*\n+\s*OK\b",              # unittest
+    r"^ok\s+\S+\s+(?:[\d.]+s|\(cached\))", r"^PASS$",         # go test
+    r"test result: ok\.", r"\d+ tests? run: \d+ passed",    # cargo test, nextest
+    r"\d+ passing\b", r"\b\d+ pass\b",                       # mocha, bun, node --test
+    r"\*\* TEST SUCCEEDED \*\*", r"Executed \d+ tests?, with 0 failures", r"Test run with \d+ tests? passed",
+    r"Tests run: \d+, Failures: 0, Errors: 0",              # maven surefire
+    r"BUILD SUCCESSFUL",                                     # gradle
+    r"\d+ examples?, 0 failures", r"\d+ tests?, 0 failures", # rspec, mix, bats
+    r"^OK \(\d+ tests?", r"\d+% tests passed", r"Passed!\s", r"congratulations :\)", r"Session \S+ was successful",
+]), re.M)
+
 # Words after which a command's exit status is not the test's own.
 _CONTROL = {"!", "if", "then", "elif", "else", "while", "until", "do", "{"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
@@ -364,12 +381,14 @@ def _python_tool(words: List[str]) -> Optional[str]:
             name = word.rsplit("/", 1)[-1] if word not in ("--", "-") else ""
             return _STANDALONE.get(name) if name in ("pytest", "py.test") else None
         if word.startswith("--"):
+            if word in ("--version", "--help", "--help-env", "--help-xoptions", "--help-all"):
+                return None  # prints and exits before any module runs
             i += 1
             continue
         flags = word[1:]
         for n, flag in enumerate(flags):
-            if flag == "c":
-                return None
+            if flag in "cVh?":
+                return None  # -c runs code; -V / -h print and exit
             if flag == "m":
                 module = flags[n + 1:] or (words[i + 1] if i + 1 < len(words) else "")
                 return _PYTHON_MODULES.get(module)
@@ -506,7 +525,7 @@ class Commands:
                     continue
                 command = self.pending.pop(use_id)
                 if not block.get("is_error"):
-                    self._record(command, False)
+                    self._record(command, False, _text_of(block.get("content")))
                 elif _claude_exit(block.get("content")):
                     self._record(command, True)
                 # Any other error is a call that did not run (denied, invalid input): not a command.
@@ -524,19 +543,24 @@ class Commands:
             return
         code = item.get(exit_key)
         failed = status == "failed" or (isinstance(code, int) and not isinstance(code, bool) and code != 0)
-        self._record(item.get("command"), failed)
+        output = item.get("aggregated_output" if kind == "command_execution" else "aggregatedOutput")
+        self._record(item.get("command"), failed, output if isinstance(output, str) else "")
 
-    def _record(self, command: Any, failed: bool) -> None:
+    def _record(self, command: Any, failed: bool, output: str = "") -> None:
         self.ran += 1
         self.failed += bool(failed)
         found = classify(command)
         if found:
             tool, own = found
             self.tests_ran += 1
-            if own:
-                self.tests_failed += bool(failed)
-                self.last_test = "failed" if failed else "passed"
+            if own and failed:
+                self.tests_failed += 1
+                self.last_test = "failed"
+            elif own and _PASSED.search(output[-OUTPUT_SCAN_CHARS:]):
+                self.last_test = "passed"
             else:
+                # Something else in the command could have set its exit status, or its output shows no test runner's
+                # summary (a command read as a test that ran none): never a pass.
                 self.last_test = "unknown"
             if tool not in self.tools and len(self.tools) < TOOLS_MAX:
                 self.tools.append(tool)
@@ -556,14 +580,17 @@ class Commands:
         return {"commands": {"ran": min(self.ran, MAX_COUNT), "failed": min(self.failed, MAX_COUNT)}, "tests": tests}
 
 
+def _text_of(content: Any) -> str:
+    """A tool_result's text, whether a string or a list of text parts."""
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content if isinstance(part, dict)
+                         and isinstance(part.get("text"), str))
+    return content if isinstance(content, str) else ""
+
+
 def _claude_exit(content: Any) -> bool:
     """A Bash tool_result error that is the command's own failure: a non-zero exit or a timeout."""
-    if isinstance(content, list):
-        content = " ".join(part.get("text", "") for part in content if isinstance(part, dict)
-                           and isinstance(part.get("text"), str))
-    if not isinstance(content, str):
-        return False
-    text = content.lstrip()
+    text = _text_of(content).lstrip()
     return bool(re.match(r"(?:Error: )?Exit code \d+", text)) or "timed out" in text[:200].lower()
 
 

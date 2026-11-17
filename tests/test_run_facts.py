@@ -32,15 +32,15 @@ def bash(use_id, command, **extra):
         {"type": "tool_use", "id": use_id, "name": "Bash", "input": dict({"command": command}, **extra)}]}})
 
 
-def outcome(use_id, is_error=False, content="ok"):
+def outcome(use_id, is_error=False, content="===== 1 passed in 0.01s ====="):
     return json.dumps({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": use_id, "is_error": is_error, "content": content}]}})
 
 
-def item(item_id, command, exit_code, status="completed"):
+def item(item_id, command, exit_code, status="completed", output="===== 1 passed in 0.01s ====="):
     return json.dumps({"type": "item.completed", "item": {"id": item_id, "type": "command_execution",
                                                           "command": command, "exit_code": exit_code,
-                                                          "status": status}})
+                                                          "status": status, "aggregated_output": output}})
 
 
 def counted(tool, output):
@@ -157,6 +157,23 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(counted("claude", output),
                          {"commands": {"ran": 2, "failed": 1},
                           "tests": {"ran": 1, "failed": 1, "last": "failed", "tools": ["unittest"]}})
+
+    def test_a_pass_needs_a_test_runners_summary_in_the_output(self):
+        # Round seven: `python3 --version -m unittest` only prints the version. A command read as a test whose output
+        # shows no runner's summary is never a pass, so it cannot hide the failure before it.
+        self.assertIsNone(run_facts.classify("python3 -B --version -m unittest missing"))
+        self.assertIsNone(run_facts.classify("python3 -V -m unittest missing"))
+        failed_then_quiet = [bash("a", "python3 -B -m unittest missing"), outcome("a", True, "Exit code 1"),
+                             bash("b", "make test"), outcome("b", False, "make: Nothing to be done for 'test'.")]
+        self.assertEqual(counted("claude", failed_then_quiet)["tests"],
+                         {"ran": 2, "failed": 1, "last": "unknown", "tools": ["unittest", "make test"]})
+        for summary in ("===== 3 passed in 0.12s =====", "Ran 4 tests in 0.002s\n\nOK", "ok  \tgithub.com/x/y\t0.1s",
+                        "test result: ok. 3 passed; 0 failed", " Test Files  2 passed (2)", "Tests:       5 passed, 5 total",
+                        "  4 passing (12ms)", "** TEST SUCCEEDED **", "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0"):
+            self.assertEqual(counted("claude", [bash("a", "pytest"), outcome("a", False, summary)])["tests"]["last"],
+                             "passed", summary)
+        self.assertEqual(counted("codex_exec", [item("1", "/bin/zsh -lc pytest", 0, output="")])["tests"]["last"],
+                         "unknown")
 
     def test_a_masked_outcome_is_unknown_never_passed(self):
         output = [bash("a", "python3 -B -m unittest missing_module || true"), outcome("a"),
@@ -294,7 +311,8 @@ class CodexCommandsTest(unittest.TestCase):
 
         def done(item_id, command, code, status="completed", turn_id="tu", thread="th"):
             turn._notification("item/completed", {"threadId": thread, "turnId": turn_id, "item": {
-                "id": item_id, "type": "commandExecution", "command": command, "exitCode": code, "status": status}})
+                "id": item_id, "type": "commandExecution", "command": command, "exitCode": code, "status": status,
+                "aggregatedOutput": "Tests:       4 passed, 4 total"}})
         done("1", "/bin/zsh -lc 'npm test'", 1, "failed")
         done("2", "/bin/zsh -lc 'npm test'", 0)
         done("3", "/bin/zsh -lc 'npm test'", 0, turn_id="other")   # another turn's
