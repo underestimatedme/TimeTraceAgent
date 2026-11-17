@@ -19,6 +19,10 @@ COMMAND_APPROVAL = "item/commandExecution/requestApproval"
 FILE_APPROVAL = "item/fileChange/requestApproval"
 
 
+# Put on the queue for a line that looked like JSON and did not decode: whatever it was, this turn was not read whole.
+UNREADABLE = object()
+
+
 def _read_messages(stream, incoming):
     try:
         for line in stream:
@@ -27,7 +31,8 @@ def _read_messages(stream, incoming):
                 if isinstance(data, dict):
                     incoming.put(data)
             except ValueError:
-                pass
+                if line.lstrip().startswith("{"):
+                    incoming.put(UNREADABLE)
     finally:
         incoming.put(None)
 
@@ -108,6 +113,9 @@ class CodexTurn:
             return True
         if msg is None:
             return False
+        if msg is UNREADABLE:
+            self.commands.unreadable()
+            return True
         method, id_ = msg.get("method"), msg.get("id")
         params = msg.get("params")
         if method and isinstance(params, dict):

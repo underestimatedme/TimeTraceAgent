@@ -14,7 +14,9 @@ from unittest.mock import patch
 
 from timetrace import run_facts, worktree
 from timetrace.adapters import claude, codex
-from timetrace.adapters.codex_interactive import CodexTurn
+import queue
+
+from timetrace.adapters.codex_interactive import UNREADABLE, CodexTurn, _read_messages
 from timetrace.agent import Agent
 from timetrace.claude_stream import StreamSession
 from timetrace.models import RunResult
@@ -103,8 +105,34 @@ class TestToolTest(unittest.TestCase):
                         # What follows `-c` code or a script is its arguments; a quoted or escaped `;` is a word.
                         'python3 -B -c "print(1)" -m pytest', "python3 script.py -m pytest", "bash script.sh -c pytest",
                         'echo ";" pytest', "echo a\\;pytest", "uv run --with pytest python script.py",
+                        # A comment, a heredoc's body and a lookup run nothing.
+                        "printf ok # ; pytest", "cat <<EOF\npytest\nEOF", "cat <<-'END'\n\tpytest\n\tEND",
+                        "command -v pytest", "type pytest",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
+
+
+class OutcomeTest(unittest.TestCase):
+    def test_the_exit_status_is_the_tests_own_only_at_the_end_of_a_plain_chain(self):
+        own = ["pytest -q", "pytest -q 2>&1", "pytest &>log.txt", "cd web && npm test", "echo start; pytest",
+               "# run them\npytest -q", "cat <<EOF > a.txt\nhi\nEOF\npytest -q", "/bin/zsh -lc \"cd web && npm test\"",
+               "timeout 600 go test ./...", "uv run pytest"]
+        masked = ["pytest || true", "true || pytest", "pytest | tail -5", "pytest &", "! pytest",
+                  "if pytest; then echo ok; fi", "(cd web && npm test)", "pytest; echo done",
+                  "/bin/zsh -lc \"pytest | tail\"", "{ pytest; }"]
+        for command in own:
+            self.assertEqual(run_facts.classify(command)[1], True, command)
+        for command in masked:
+            self.assertEqual(run_facts.classify(command)[1], False, command)
+
+    def test_a_masked_outcome_is_unknown_never_passed(self):
+        output = [bash("a", "python3 -B -m unittest missing_module || true"), outcome("a"),
+                  bash("b", "pytest | tail -5"), outcome("b")]
+        self.assertEqual(counted("claude", output)["tests"],
+                         {"ran": 2, "failed": 0, "last": "unknown", "tools": ["unittest", "pytest"]})
+        output += [bash("c", "pytest -q"), outcome("c", True, "Exit code 1")]
+        self.assertEqual(counted("claude", output)["tests"],
+                         {"ran": 3, "failed": 1, "last": "failed", "tools": ["unittest", "pytest"]})
 
 
 class ClaudeCommandsTest(unittest.TestCase):
@@ -144,7 +172,7 @@ class ClaudeCommandsTest(unittest.TestCase):
         self.assertIsNone(commands.total())
         fine = run_facts.Commands("claude")
         session = StreamSession(["claude"], ".", "/dev/null", "go", on_message=fine.add, on_unreadable=fine.feed)
-        session._read_stdout(io.StringIO("\n".join([bash("a", "pytest"), outcome("a"), "{not json at all"]) + "\n"),
+        session._read_stdout(io.StringIO("\n".join([bash("a", "pytest"), outcome("a"), "a plain-text warning"]) + "\n"),
                              io.StringIO())
         self.assertEqual(fine.total()["tests"], {"ran": 1, "failed": 0, "last": "passed", "tools": ["pytest"]})
 
@@ -158,6 +186,10 @@ class ClaudeCommandsTest(unittest.TestCase):
     def test_a_command_line_it_could_not_read_means_no_facts_rather_than_zeros(self):
         output = [bash("a", "pytest"), '{"type":"user","message":{"content":[{"type":"tool_result", broken']
         self.assertIsNone(counted("claude", output))
+        # Cut before any marker of what it was: still not read whole.
+        self.assertIsNone(counted("claude", [bash("a", "pytest"), '{"type":"user","message":']))
+        self.assertIsNone(counted("codex_exec", [item("1", "pytest", 0), '{"type":"item.comp']))
+        self.assertIsNotNone(counted("claude", [bash("a", "pytest"), outcome("a"), "warning: not json"]))
         commands = run_facts.Commands("claude")
         commands.add({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "a", "name": "Bash",
                                                                     "input": []}]}})
@@ -209,6 +241,19 @@ class CodexCommandsTest(unittest.TestCase):
                 patch.object(codex, "thread_model", lambda *a, **k: ""):
             res = codex.CodexAdapter({"bin": "codex"}).start("go", d, "", str(Path(d) / "run.log"))
         self.assertEqual(res.commands, {"commands": {"ran": 2, "failed": 1}, "tests": {"ran": 0, "failed": 0}})
+
+    def test_app_server_line_it_could_not_read_means_no_facts(self):
+        incoming = queue.SimpleQueue()
+        _read_messages(io.StringIO('{"method":"item/completed","params":{"item":{"type":"commandExecution"\nnot json\n'),
+                       incoming)
+        self.assertIs(incoming.get_nowait(), UNREADABLE)
+        self.assertIsNone(incoming.get_nowait())  # the plain-text line is skipped; then the end
+        turn = CodexTurn(["codex"], ".", Host(), threading.Event(), 30, False)
+        turn.thread_id, turn.turn_id = "th", "tu"
+        turn.incoming.put(UNREADABLE)
+        self.assertTrue(turn._receive())
+        turn._complete({"status": "completed", "items": []})
+        self.assertIsNone(turn.commands.total())
 
     def test_app_server_turn_counts_its_own_command_items(self):
         turn = CodexTurn(["codex"], ".", Host(), threading.Event(), 30, False)

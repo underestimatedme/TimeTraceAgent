@@ -1,5 +1,5 @@
 """运行事实: what the computer itself saw one run do, sent beside the AI's own report so a person can see where the two
-disagree ("says it is done, but the last test failed").
+disagree ("says it is done, but its last test command failed").
 
 Contract: docs/superpowers/specs/2026-11-17-run-facts-design.md (TimeTrace repository).
 
@@ -9,16 +9,18 @@ Commands come from the tool's own event stream, never from anything the run wrot
 - `codex exec --json`: `command_execution` items, with `exit_code` and `status` (`declined` did not run).
 - The Codex App Server: `commandExecution` items, with `exitCode` and `status`.
 
-Which commands were tests is recognized from the command line against a fixed list of test runners, so it is shown as
-"recognized as tests", never as every check the run made. Only counts and names from that fixed list leave the
-computer: no command text, output or path.
+Which commands ran tests is recognized from the command line against a fixed list of test runners, so it is shown as
+"recognized as tests", never as every check the run made. A command's exit status is its test's outcome only when the
+test runner is the last part of a plain `&&` / `;` chain; behind `|`, `||`, `&`, a group, `!` or a control keyword the
+outcome is `unknown`, never a guess. Only counts and names from the fixed list leave the computer: no command text,
+output or path.
 
-A stream the runner did not see whole (a command event it could not read) has no command facts at all, never zeros:
-"no tests ran" is only ever said about a run whose every command the runner watched.
+A stream the runner did not see whole (a line that looked like JSON and did not decode) has no command facts at all,
+never zeros: "no tests ran" is only ever said about a run whose every command the runner watched.
 """
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 VERSION = 1
 MAX_COUNT = 1000000
@@ -47,24 +49,47 @@ _VALUE_OPTIONS = {
                "--package", "--extra", "--group", "--env-file", "--index", "--index-url", "-C", "-P", "--env", "-e"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"},
     "nice": {"-n", "--adjustment"},
-    "python": {"-W", "-X", "-Q"},
 }
-_PLAIN_WRAPPERS = {"time": "", "nohup": "", "command": "", "exec": "", "caffeinate": "", "xvfb-run": "",
+# Wrappers that run the rest of the line and pass its exit status on.
+_PLAIN_WRAPPERS = {"time": "", "nohup": "", "exec": "", "caffeinate": "", "xvfb-run": "",
                    "npx": "npx", "bunx": "npx", "pnpx": "npx"}
 _RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
+# Words after which a command's exit status is not the test's own.
+_CONTROL = {"!", "if", "then", "elif", "else", "while", "until", "do", "{"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _GRADLE_TASK = re.compile(r"(?:^|:)(?:test\w*|check|connected\w*Test)$")
 _DOC_SUFFIXES = (".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".org")
 _DOC_NAMES = ("license", "licence", "changelog", "notice", "authors", "readme")
-_OPERATOR_CHARS = ";&|()\n"
+# Operators after which the last part's exit status is the whole command's.
+_PLAIN_OPERATORS = {"&&", ";", "\n"}
 
 
-def _segments(command: str) -> Optional[List[List[str]]]:
-    """The command's simple commands, split on the unquoted operators `;` `&` `|` `(` `)` and newlines, each as its
-    words with quotes removed. A quoted operator is part of a word. None when a quote is never closed."""
+# ---- reading a command line -------------------------------------------------------------------------------------------
+
+def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
+    """The command's simple commands, each as its words with quotes removed, and every operator it uses (`&&`, `||`,
+    `;`, `|`, `&`, `(`, `)`, newline). Comments, heredoc bodies and redirections (`>out`, `2>&1`, `&>log`) are not
+    words. None when a quote is never closed."""
     segments: List[List[str]] = [[]]
-    word, has_word, quote, i = [], False, "", 0
-    while i < len(command):
+    seen: Set[str] = set()
+    word: List[str] = []
+    state = {"has_word": False}
+    heredocs: List[Tuple[str, bool]] = []
+    quote, i, n = "", 0, len(command)
+
+    def end_word():
+        if state["has_word"] or word:
+            segments[-1].append("".join(word))
+        del word[:]
+        state["has_word"] = False
+
+    def operator(op):
+        end_word()
+        seen.add(op)
+        if segments[-1]:
+            segments.append([])
+
+    while i < n:
         ch = command[i]
         if quote == "'":
             if ch == "'":
@@ -74,33 +99,81 @@ def _segments(command: str) -> Optional[List[List[str]]]:
         elif quote == '"':
             if ch == '"':
                 quote = ""
-            elif ch == "\\" and i + 1 < len(command) and command[i + 1] in '"\\$`':
+            elif ch == "\\" and i + 1 < n and command[i + 1] in '"\\$`':
                 i += 1
                 word.append(command[i])
             else:
                 word.append(ch)
         elif ch in ("'", '"'):
-            quote, has_word = ch, True
-        elif ch == "\\" and i + 1 < len(command):
+            quote, state["has_word"] = ch, True
+        elif ch == "\\":
+            if i + 1 < n and command[i + 1] != "\n":
+                word.append(command[i + 1])
+                state["has_word"] = True
+            i += 2
+            continue
+        elif ch == "#" and not word and not state["has_word"]:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+        elif ch == "\n":
+            operator("\n")
             i += 1
-            if command[i] != "\n":
-                word.append(command[i])
-                has_word = True
-        elif (ch.isspace() and ch != "\n") or ch in "<>" or ch in _OPERATOR_CHARS:
-            if has_word or word:
-                segments[-1].append("".join(word))
-            word, has_word = [], False
-            if ch in _OPERATOR_CHARS and segments[-1]:
-                segments.append([])
+            if heredocs:
+                i = _skip_heredocs(command, i, heredocs)
+                heredocs = []
+            continue
+        elif command.startswith("<<", i) and not command.startswith("<<<", i):
+            end_word()
+            i += 2
+            strip = command.startswith("-", i)
+            i += strip
+            while i < n and command[i] in " \t":
+                i += 1
+            start = i
+            while i < n and not command[i].isspace() and command[i] not in ";&|()<>":
+                i += 1
+            delimiter = command[start:i].replace("'", "").replace('"', "").replace("\\", "")
+            if delimiter:
+                heredocs.append((delimiter, strip))
+            continue
+        elif ch in "<>" or command.startswith("&>", i):
+            end_word()
+            i += 2 if ch == "&" else 1
+            while i < n and command[i] in "<>":
+                i += 1
+            if i < n and command[i] == "&":  # 2>&1, <&3, >&-
+                i += 1
+                while i < n and (command[i].isdigit() or command[i] == "-"):
+                    i += 1
+            continue
+        elif ch in ";&|()":
+            op = command[i:i + 2] if command[i:i + 2] in ("&&", "||", ";;", "|&") else ch
+            operator(op)
+            i += len(op)
+            continue
+        elif ch.isspace():
+            end_word()
         else:
             word.append(ch)
-            has_word = True
+            state["has_word"] = True
         i += 1
     if quote:
         return None
-    if has_word or word:
-        segments[-1].append("".join(word))
-    return [segment for segment in segments if segment]
+    end_word()
+    return [segment for segment in segments if segment], seen
+
+
+def _skip_heredocs(command: str, i: int, heredocs: List[Tuple[str, bool]]) -> int:
+    """Past the bodies of the heredocs started on the line that just ended (each up to its delimiter line)."""
+    for delimiter, strip in heredocs:
+        while i < len(command):
+            end = command.find("\n", i)
+            line = command[i:] if end < 0 else command[i:end]
+            i = len(command) if end < 0 else end + 1
+            if (line.lstrip("\t") if strip else line) == delimiter:
+                break
+    return i
 
 
 def _skip_options(words: List[str], start: int, takes_value=frozenset()) -> int:
@@ -111,37 +184,58 @@ def _skip_options(words: List[str], start: int, takes_value=frozenset()) -> int:
     return i
 
 
-def test_tool(command: Any, depth: int = 0) -> Optional[str]:
-    """The TEST_TOOLS name of the test runner `command` starts (in any of its `&&` / `;` / `|` parts, behind a shell's
-    `-c`, `env`, `npx`, `uv run` and similar), or None. A guess from the command line only."""
+def classify(command: Any, depth: int = 0) -> Optional[Tuple[str, bool]]:
+    """(TEST_TOOLS name, whether the command's exit status is that test's own) for a command that starts a test runner
+    (in any of its parts, behind a shell's `-c`, `env`, `npx`, `uv run` and similar), or None. A guess from the command
+    line only. The exit status is the test's own only when the runner is the last part of a plain `&&` / `;` chain."""
     if not isinstance(command, str) or depth > 3:
         return None
-    segments = _segments(command)
-    if not segments:
+    lexed = _lex(command)
+    if not lexed:
         return None
-    for segment in segments:
+    segments, seen = lexed
+    plain = seen <= _PLAIN_OPERATORS
+    for k, segment in enumerate(segments):
         found = _segment_tool(segment, depth)
         if found:
-            return found
+            tool, own = found
+            return tool, own and plain and k == len(segments) - 1
     return None
 
 
-def _segment_tool(words: List[str], depth: int) -> Optional[str]:
+def test_tool(command: Any) -> Optional[str]:
+    """The TEST_TOOLS name of the test runner `command` starts, or None (see classify)."""
+    found = classify(command)
+    return found[0] if found else None
+
+
+def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
+    own = True
     while words:
         while words and _ASSIGNMENT.match(words[0]):
             words = words[1:]
         if not words:
             return None
         name = words[0].rsplit("/", 1)[-1]
+        if words[0] in _CONTROL:
+            words, own = words[1:], False
+            continue
         if name in _SHELLS:
             for i, word in enumerate(words[1:], 1):
-                if not word.startswith("-") or word.startswith("--"):
-                    if word.startswith("--"):
-                        continue
+                if word.startswith("--"):
+                    continue
+                if not word.startswith("-"):
                     return None  # a script file, not `-c`
                 if "c" in word[1:]:
-                    return test_tool(words[i + 1], depth + 1) if i + 1 < len(words) else None
+                    found = classify(words[i + 1], depth + 1) if i + 1 < len(words) else None
+                    return (found[0], found[1] and own) if found else None
             return None
+        if name == "command":
+            i = _skip_options(words, 1)
+            if any(w in ("-v", "-V") for w in words[1:i]):
+                return None  # asks where a command is; runs nothing
+            words = words[i:]
+            continue
         if name == "env":
             i = 1
             while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT.match(words[i])):
@@ -163,7 +257,10 @@ def _segment_tool(words: List[str], depth: int) -> Optional[str]:
                 words = words[_skip_options(words, i + 1, _VALUE_OPTIONS["runner"]):]
                 continue
             return None
-        return _tool_of(name, words, depth)
+        tool = _tool_of(name, words, depth)
+        if isinstance(tool, tuple):
+            return tool[0], tool[1] and own
+        return (tool, own) if tool else None
     return None
 
 
@@ -194,7 +291,7 @@ def _python_tool(words: List[str]) -> Optional[str]:
     return None
 
 
-def _tool_of(name: str, words: List[str], depth: int) -> Optional[str]:
+def _tool_of(name: str, words: List[str], depth: int):
     rest = words[1:]
     if name in _STANDALONE:
         return _STANDALONE[name]
@@ -231,14 +328,12 @@ def _tool_of(name: str, words: List[str], depth: int) -> Optional[str]:
     return None
 
 
-def _json_line(line: Any) -> Optional[Dict[str, Any]]:
-    value = json.loads(line.strip())
-    return value if isinstance(value, dict) else None
-
+# ---- counting a run's commands ----------------------------------------------------------------------------------------
 
 class Commands:
-    """One run's commands, counted as its stream is read. Feed it every line (`feed`, run_streaming's `on_line`) or
-    every decoded message (`add`, the stream host's `on_message`) of one tool, then read `total()`."""
+    """One run's commands, counted as its stream is read. Feed it every line (`feed`, run_streaming's `on_line`, or a
+    stream reader's `on_unreadable`), every decoded message (`add`, the stream host's `on_message`) or every App Server
+    item (`app_server_item`) of one tool, then read `total()`."""
 
     def __init__(self, tool: str):
         self.tool = tool  # claude | codex_exec | codex_app_server
@@ -255,16 +350,19 @@ class Commands:
     # ---- input ------------------------------------------------------------------------------------------------------
 
     def feed(self, line: str) -> None:
-        markers = {"claude": ('"tool_use"', '"tool_result"'), "codex_exec": ('"command_execution"',)}.get(self.tool, ())
-        if not isinstance(line, str) or not any(m in line for m in markers):
+        """One raw stdout line. A line that looks like JSON and does not decode means the stream was not read whole."""
+        if not isinstance(line, str) or not line.lstrip().startswith("{"):
             return
         try:
-            msg = _json_line(line)
+            msg = json.loads(line.strip())
         except ValueError:
             self.broken = True
             return
-        if msg is not None:
-            self.add(msg)
+        self.add(msg)
+
+    def unreadable(self, *_: Any) -> None:
+        """A line of this run's stream could not be read: its commands are not known whole."""
+        self.broken = True
 
     def add(self, msg: Any) -> None:
         try:
@@ -328,11 +426,15 @@ class Commands:
     def _record(self, command: Any, failed: bool) -> None:
         self.ran += 1
         self.failed += bool(failed)
-        tool = test_tool(command)
-        if tool:
+        found = classify(command)
+        if found:
+            tool, own = found
             self.tests_ran += 1
-            self.tests_failed += bool(failed)
-            self.last_test = "failed" if failed else "passed"
+            if own:
+                self.tests_failed += bool(failed)
+                self.last_test = "failed" if failed else "passed"
+            else:
+                self.last_test = "unknown"
             if tool not in self.tools and len(self.tools) < TOOLS_MAX:
                 self.tools.append(tool)
 
@@ -340,7 +442,8 @@ class Commands:
 
     def total(self) -> Optional[Dict[str, Any]]:
         """{"commands": {ran, failed}, "tests": {ran, failed, last?, tools?}}, or None when the stream was not read
-        whole."""
+        whole. tests.failed counts only test commands whose exit status was their own; last is passed, failed or
+        unknown."""
         if self.broken:
             return None
         tests: Dict[str, Any] = {"ran": min(self.tests_ran, MAX_COUNT), "failed": min(self.tests_failed, MAX_COUNT)}

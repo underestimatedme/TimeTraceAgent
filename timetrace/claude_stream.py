@@ -221,7 +221,7 @@ class StreamSession:
                     msg = None
             masked = mask_structure(msg) if isinstance(msg, dict) else None
             shown = json.dumps(masked, ensure_ascii=False) if masked is not None else mask_timetrace_tokens(raw)
-            if raw.startswith("{") and msg is None and self.on_unreadable is not None:
+            if raw.lstrip().startswith("{") and not isinstance(msg, dict) and self.on_unreadable is not None:
                 try:
                     self.on_unreadable(raw)
                 except Exception:
