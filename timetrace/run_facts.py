@@ -60,10 +60,11 @@ _PLAIN_WRAPPERS = {"time": "", "nohup": "", "exec": "exec", "caffeinate": "caffe
 _RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
 # Arguments with which a test runner lists, collects, dry-runs or prints help or its version instead of running tests.
 _NOT_RUNNING = {
-    "pytest": {"--collect-only", "--co", "--version", "-V", "--help", "-h", "--fixtures", "--markers", "--setup-plan"},
+    "pytest": {"--collect-only", "--co", "--version", "-V", "--help", "-h", "--fixtures", "--markers", "--setup-plan",
+               "--setup-only", "--cache-show"},
     "unittest": {"--help", "-h"},
-    "jest": {"--listTests", "--version", "-v", "--help", "-h", "--showConfig"},
-    "vitest": {"--version", "-v", "--help", "-h", "list"},
+    "jest": {"--listTests", "--version", "-v", "--help", "-h", "--showConfig", "--clearCache", "--init"},
+    "vitest": {"--version", "-v", "--help", "-h", "list", "bench"},
     "mocha": {"--version", "-V", "--help", "-h", "--dry-run", "--list-files"},
     "ava": {"--version", "--help"},
     "go test": {"-list", "-c", "-n", "-h", "-help"},
@@ -111,6 +112,8 @@ def _runs_tests(tool: str, words: List[str]) -> bool:
 _CONTROL = {"!", "if", "then", "elif", "else", "while", "until", "do", "{"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _GRADLE_TASK = re.compile(r"(?:^|:)(?:test\w*|check|connected\w*Test)$")
+_GRADLE_VALUE_OPTIONS = {"-x", "--exclude-task", "--task", "-p", "--project-dir", "-b", "--build-file", "-c",
+                         "--settings-file", "-g", "--gradle-user-home", "-I", "--init-script"}
 _DOC_SUFFIXES = (".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".org")
 _DOC_NAMES = ("license", "licence", "changelog", "notice", "authors", "readme")
 # Operators after which the last part's exit status is the whole command's.
@@ -289,27 +292,34 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             words, own = words[1:], False
             continue
         if name in _SHELLS:
-            i = 1
+            run_string, i = False, 1
             while i < len(words):
                 word = words[i]
-                takes_name = word[:1] in "-+" and not word.startswith("--") and word[1:].endswith("o")
-                if word == "--noexec" or (takes_name and words[i + 1:i + 2] == ["noexec"]):
+                if word == "--noexec":
                     return None
-                if takes_name:
-                    i += 2  # -o pipefail, -euo pipefail, +o posix: the option's name
-                    continue
-                if word.startswith("--") or word.startswith("+"):
+                if word == "--":
+                    i += 1
+                    break
+                if word.startswith("--"):
                     i += 1
                     continue
-                if not word.startswith("-"):
-                    return None  # a script file, not `-c`
-                if "n" in word[1:]:
-                    return None  # -n reads the script without running it
-                if "c" in word[1:]:
-                    found = classify(words[i + 1], depth + 1) if i + 1 < len(words) else None
-                    return (found[0], found[1] and own) if found else None
-                i += 1
-            return None
+                if len(word) > 1 and word[0] in "-+":
+                    flags, on = word[1:], word[0] == "-"
+                    if on and "n" in flags:
+                        return None  # -n reads the script without running it (also inside -nuo, -en, ...)
+                    run_string = run_string or (on and "c" in flags)
+                    if flags[-1] in "oO":  # -o pipefail, -euo pipefail, +o posix, -O extglob: the option's name
+                        if on and flags[-1] == "o" and words[i + 1:i + 2] == ["noexec"]:
+                            return None
+                        i += 2
+                        continue
+                    i += 1
+                    continue
+                break
+            if not run_string or i >= len(words):
+                return None  # a script file or stdin, not `-c`
+            found = classify(words[i], depth + 1)
+            return (found[0], found[1] and own) if found else None
         if name == "command":
             i = _skip_options(words, 1)
             if any("v" in w[1:] or "V" in w[1:] for w in words[1:i]):
@@ -407,10 +417,12 @@ def _tool_of(name: str, words: List[str], depth: int):
         for w in rest:
             if skip:
                 skip = False
-            elif w in ("-x", "--exclude-task"):
-                skip = True  # its value is a task left out, not run
+            elif w in _GRADLE_VALUE_OPTIONS:
+                skip = True  # its value is a task left out (-x test), a path or a name, not a task that runs
             elif not w.startswith("-"):
                 tasks.append(w)
+        if "help" in tasks or "tasks" in tasks:
+            return None
         return "gradle test" if any(_GRADLE_TASK.search(w) for w in tasks) else None
     if name in ("mvn", "mvnw"):
         return "mvn test" if any(w in ("test", "verify") for w in rest) else None

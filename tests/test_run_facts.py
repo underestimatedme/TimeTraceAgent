@@ -102,6 +102,8 @@ class TestToolTest(unittest.TestCase):
             "./gradlew test -x lint": "gradle test",
             "mvn test -DskipTests=false": "mvn test",
             "bash -euo pipefail -c 'pytest -q'": "pytest",
+            "bash -c -e 'pytest -q'": "pytest",
+            "bash -O extglob -c 'pytest'": "pytest",
         }
         for command, tool in cases.items():
             self.assertEqual(run_facts.test_tool(command), tool, command)
@@ -121,10 +123,13 @@ class TestToolTest(unittest.TestCase):
                         ">pytest", "< /usr/bin/make test", 'echo hi > "pytest"',
                         # Modes that read, list or dry-run instead of running tests.
                         "bash -n -c 'python3 -m unittest x'", "bash -o noexec -c pytest", "pytest --collect-only",
+                        "bash -nuo pipefail -c 'python3 -m unittest x'", "bash -c -n 'pytest'", "bash -euno pipefail -c pytest",
+                        "bash -eo noexec -c pytest", "sh -c", "bash script.sh -c pytest",
                         "python3 -m pytest --co", "make -n test", "go test -list .", "cargo test -- --list",
                         "jest --listTests", "vitest list", "npm test --help", "make -nk test", "cargo nextest list",
                         "./gradlew build -x test", "mvn test -DskipTests", "mvn verify -Dmaven.test.skip=true",
-                        "npm test -- --listTests",
+                        "npm test -- --listTests", "pytest --setup-only", "jest --clearCache", "vitest bench",
+                        "./gradlew help --task test", "./gradlew tasks --all",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
 
@@ -144,6 +149,14 @@ class OutcomeTest(unittest.TestCase):
             self.assertEqual(run_facts.classify(command)[1], True, command)
         for command in masked:
             self.assertEqual(run_facts.classify(command)[1], False, command)
+
+    def test_a_syntax_check_neither_passes_nor_hides_a_failed_test(self):
+        # Round six: `bash -nuo pipefail -c ...` only checks syntax; the failure before it stays the last test.
+        output = [bash("a", "python3 -B -m unittest missing_module"), outcome("a", True, "Exit code 1"),
+                  bash("b", "bash -nuo pipefail -c 'python3 -B -m unittest missing_module'"), outcome("b")]
+        self.assertEqual(counted("claude", output),
+                         {"commands": {"ran": 2, "failed": 1},
+                          "tests": {"ran": 1, "failed": 1, "last": "failed", "tools": ["unittest"]}})
 
     def test_a_masked_outcome_is_unknown_never_passed(self):
         output = [bash("a", "python3 -B -m unittest missing_module || true"), outcome("a"),
