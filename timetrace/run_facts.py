@@ -108,27 +108,49 @@ def _runs_tests(tool: str, words: List[str]) -> bool:
     return True
 
 
-# A successful test command counts as passed only when its own output carries a test runner's summary: a command read
-# as a test that ran none (`python --version -m unittest`, a syntax check) can then never show as a pass. Only the
-# output's end is searched, and nothing of it leaves the computer.
+# A successful test command counts as passed only when its output carries that runner's summary and nothing before the
+# runner in the command could have printed it (classify's `clean`): a command read as a test that ran none
+# (`python --version -m unittest`, a syntax check, `printf '1 passed'; make ...`) is then unknown, never a pass. Only
+# the output's end is searched, and nothing of it leaves the computer.
 OUTPUT_SCAN_CHARS = 64 * 1024
-_PASSED = re.compile("|".join([
-    r"\b\d+ passed\b",                                   # pytest, vitest, jest, playwright, deno
-    r"^Ran \d+ tests? in [\d.]+s\s*\n+\s*OK\b",              # unittest
-    r"^ok\s+\S+\s+(?:[\d.]+s|\(cached\))", r"^PASS$",         # go test
-    r"test result: ok\.", r"\d+ tests? run: \d+ passed",    # cargo test, nextest
-    r"\d+ passing\b", r"\b\d+ pass\b",                       # mocha, bun, node --test
-    r"\*\* TEST SUCCEEDED \*\*", r"Executed \d+ tests?, with 0 failures", r"Test run with \d+ tests? passed",
-    r"Tests run: \d+, Failures: 0, Errors: 0",              # maven surefire
-    r"BUILD SUCCESSFUL",                                     # gradle
-    r"\d+ examples?, 0 failures", r"\d+ tests?, 0 failures", # rspec, mix, bats
-    r"^OK \(\d+ tests?", r"\d+% tests passed", r"Passed!\s", r"congratulations :\)", r"Session \S+ was successful",
-]), re.M)
+_PASS_PATTERNS = {
+    "pytest": r"\b\d+ passed\b",
+    "unittest": r"^Ran \d+ tests? in [\d.]+s\s*\n+\s*OK\b",
+    "go test": r"^ok\s+\S+\s+(?:[\d.]+s|\(cached\))|^PASS$",
+    "cargo test": r"test result: ok\.|\d+ tests? run: \d+ passed",
+    "vitest": r"Test(?:s| Files)\s+\d+ passed",
+    "jest": r"Tests:\s+.*\b\d+ passed",
+    "mocha": r"\d+ passing\b",
+    "ava": r"\d+ tests? passed",
+    "playwright": r"\b\d+ passed\b",
+    "bun test": r"\b\d+ pass\b",
+    "deno test": r"ok \| \d+ passed",
+    "xcodebuild test": r"\*\* TEST SUCCEEDED \*\*",
+    "swift test": r"Executed \d+ tests?, with 0 failures|Test run with \d+ tests? passed",
+    "gradle test": r"BUILD SUCCESSFUL",
+    "mvn test": r"Tests run: \d+, Failures: 0, Errors: 0",
+    "tox": r"congratulations :\)",
+    "nox": r"Session \S+ was successful",
+    "rspec": r"\d+ examples?, 0 failures",
+    "phpunit": r"^OK \(\d+ tests?",
+    "ctest": r"100% tests passed",
+    "bats": r"\d+ tests?, 0 failures",
+    "dotnet test": r"Passed!\s",
+    "mix test": r"\d+ tests?, 0 failures",
+}
+# Runners that start whatever the project configured: any runner's summary.
+_ANY_PASS = re.compile("|".join(sorted(set(_PASS_PATTERNS.values()))), re.M)
+_PASSED = {tool: re.compile(pattern, re.M) for tool, pattern in _PASS_PATTERNS.items()}
+for _delegating in ("npm test", "pnpm test", "yarn test", "make test"):
+    _PASSED[_delegating] = _ANY_PASS
+
 
 # Words after which a command's exit status is not the test's own.
 _CONTROL = {"!", "if", "then", "elif", "else", "while", "until", "do", "{"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _GRADLE_TASK = re.compile(r"(?:^|:)(?:test\w*|check|connected\w*Test)$")
+_MAKE_VALUE_OPTIONS = {"-f", "--file", "--makefile", "-C", "--directory", "-o", "--old-file", "--assume-old", "-W",
+                       "--what-if", "--new-file", "--assume-new", "-I", "--include-dir", "-E", "--eval"}
 _GRADLE_VALUE_OPTIONS = {"-x", "--exclude-task", "--task", "-p", "--project-dir", "-b", "--build-file", "-c",
                          "--settings-file", "-g", "--gradle-user-home", "-I", "--init-script"}
 _DOC_SUFFIXES = (".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".org")
@@ -272,10 +294,13 @@ def _skip_options(words: List[str], start: int, takes_value=frozenset()) -> int:
     return i
 
 
-def classify(command: Any, depth: int = 0) -> Optional[Tuple[str, bool]]:
-    """(TEST_TOOLS name, whether the command's exit status is that test's own) for a command that starts a test runner
-    (in any of its parts, behind a shell's `-c`, `env`, `npx`, `uv run` and similar), or None. A guess from the command
-    line only. The exit status is the test's own only when the runner is the last part of a plain `&&` / `;` chain."""
+def classify(command: Any, depth: int = 0) -> Optional[Tuple[str, bool, bool]]:
+    """(TEST_TOOLS name, own, clean) for a command that starts a test runner (in any of its parts, behind a shell's
+    `-c`, `env`, `npx`, `uv run` and similar), or None. A guess from the command line only.
+
+    own: the command's exit status is the test's own: the runner is the last part of a plain `&&` / `;` chain.
+    clean: also nothing before it could print (only setup such as `cd` or `export`), so a test summary in the command's
+    output can only be the runner's own."""
     if not isinstance(command, str) or depth > 3:
         return None
     lexed = _lex(command)
@@ -286,9 +311,19 @@ def classify(command: Any, depth: int = 0) -> Optional[Tuple[str, bool]]:
     for k, segment in enumerate(segments):
         found = _segment_tool(segment, depth)
         if found:
-            tool, own = found
-            return tool, own and plain and k == len(segments) - 1
+            tool, seg_own, seg_clean = found
+            own = seg_own and plain and k == len(segments) - 1
+            return tool, own, own and seg_clean and all(_is_setup(prior) for prior in segments[:k])
     return None
+
+
+# Commands that only set up the environment of the next one and print nothing.
+_SETUP = {"cd", "pushd", "export", "set", "unset", "ulimit", "umask", "true", ":"}
+
+
+def _is_setup(words: List[str]) -> bool:
+    rest = [w for w in words if not _ASSIGNMENT.match(w)] if words else []
+    return not rest or rest[0] in _SETUP
 
 
 def test_tool(command: Any) -> Optional[str]:
@@ -336,7 +371,7 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             if not run_string or i >= len(words):
                 return None  # a script file or stdin, not `-c`
             found = classify(words[i], depth + 1)
-            return (found[0], found[1] and own) if found else None
+            return (found[0], found[1] and own, found[2] and own) if found else None
         if name == "command":
             i = _skip_options(words, 1)
             if any("v" in w[1:] or "V" in w[1:] for w in words[1:i]):
@@ -344,6 +379,8 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             words = words[i:]
             continue
         if name == "env":
+            if any(w in ("-S", "--split-string") or w.startswith(("-S", "--split-string=")) for w in words[1:]):
+                return None  # the split string is the command; not read here
             i = 1
             while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT.match(words[i])):
                 i += 1 + (words[i] in _VALUE_OPTIONS["env"] and i + 1 < len(words))
@@ -366,8 +403,8 @@ def _segment_tool(words: List[str], depth: int) -> Optional[Tuple[str, bool]]:
             return None
         tool = _tool_of(name, words, depth)
         if isinstance(tool, tuple):
-            return tool[0], tool[1] and own
-        return (tool, own) if tool and _runs_tests(tool, words) else None
+            return tool[0], tool[1] and own, tool[2] and own
+        return (tool, own, own) if tool and _runs_tests(tool, words) else None
     return None
 
 
@@ -432,21 +469,34 @@ def _tool_of(name: str, words: List[str], depth: int):
     if name == "xcodebuild":
         return "xcodebuild test" if any(w in ("test", "test-without-building") for w in rest) else None
     if name in ("gradle", "gradlew"):
-        tasks, skip = [], False
+        tasks, excluded, skip = [], set(), ""
         for w in rest:
             if skip:
-                skip = False
+                if skip in ("-x", "--exclude-task"):
+                    excluded.add(w.rsplit(":", 1)[-1])
+                skip = ""
             elif w in _GRADLE_VALUE_OPTIONS:
-                skip = True  # its value is a task left out (-x test), a path or a name, not a task that runs
+                skip = w  # its value is a task left out (-x test), a path or a name, not a task that runs
+            elif w.startswith("--exclude-task="):
+                excluded.add(w.split("=", 1)[1].rsplit(":", 1)[-1])
             elif not w.startswith("-"):
                 tasks.append(w)
         if "help" in tasks or "tasks" in tasks:
             return None
+        tasks = [t for t in tasks if t.rsplit(":", 1)[-1] not in excluded]
         return "gradle test" if any(_GRADLE_TASK.search(w) for w in tasks) else None
     if name in ("mvn", "mvnw"):
         return "mvn test" if any(w in ("test", "verify") for w in rest) else None
     if name == "make":
-        return "make test" if any(w in ("test", "tests", "check") for w in rest if not w.startswith("-")) else None
+        targets, skip = [], False
+        for w in rest:
+            if skip:
+                skip = False
+            elif w in _MAKE_VALUE_OPTIONS:
+                skip = True  # a makefile, directory or file name, not a target (make -f x -o test test)
+            elif not w.startswith("-") and "=" not in w:
+                targets.append(w)
+        return "make test" if any(w in ("test", "tests", "check") for w in targets) else None
     return None
 
 
@@ -551,12 +601,12 @@ class Commands:
         self.failed += bool(failed)
         found = classify(command)
         if found:
-            tool, own = found
+            tool, own, clean = found
             self.tests_ran += 1
             if own and failed:
                 self.tests_failed += 1
                 self.last_test = "failed"
-            elif own and _PASSED.search(output[-OUTPUT_SCAN_CHARS:]):
+            elif clean and _PASSED[tool].search(output[-OUTPUT_SCAN_CHARS:]):
                 self.last_test = "passed"
             else:
                 # Something else in the command could have set its exit status, or its output shows no test runner's

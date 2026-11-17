@@ -129,7 +129,8 @@ class TestToolTest(unittest.TestCase):
                         "jest --listTests", "vitest list", "npm test --help", "make -nk test", "cargo nextest list",
                         "./gradlew build -x test", "mvn test -DskipTests", "mvn verify -Dmaven.test.skip=true",
                         "npm test -- --listTests", "pytest --setup-only", "jest --clearCache", "vitest bench",
-                        "./gradlew help --task test", "./gradlew tasks --all",
+                        "./gradlew help --task test", "./gradlew tasks --all", "gradle test -x test",
+                        "./gradlew test --exclude-task test", "env -S 'echo 1 passed' pytest",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
 
@@ -167,11 +168,25 @@ class OutcomeTest(unittest.TestCase):
                              bash("b", "make test"), outcome("b", False, "make: Nothing to be done for 'test'.")]
         self.assertEqual(counted("claude", failed_then_quiet)["tests"],
                          {"ran": 2, "failed": 1, "last": "unknown", "tools": ["unittest", "make test"]})
-        for summary in ("===== 3 passed in 0.12s =====", "Ran 4 tests in 0.002s\n\nOK", "ok  \tgithub.com/x/y\t0.1s",
-                        "test result: ok. 3 passed; 0 failed", " Test Files  2 passed (2)", "Tests:       5 passed, 5 total",
-                        "  4 passing (12ms)", "** TEST SUCCEEDED **", "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0"):
-            self.assertEqual(counted("claude", [bash("a", "pytest"), outcome("a", False, summary)])["tests"]["last"],
-                             "passed", summary)
+        # Each runner's own summary; the package managers and make start whatever was configured, so any runner's.
+        for command, summary in (("pytest", "===== 3 passed in 0.12s ====="),
+                                 ("python3 -m unittest", "Ran 4 tests in 0.002s\n\nOK"),
+                                 ("go test ./...", "ok  \tgithub.com/x/y\t0.1s"),
+                                 ("cargo test", "test result: ok. 3 passed; 0 failed"),
+                                 ("npx vitest run", " Test Files  2 passed (2)"),
+                                 ("npx jest", "Tests:       5 passed, 5 total"),
+                                 ("cd web && npm test", "Tests:       5 passed, 5 total"),
+                                 ("make test", "  4 passing (12ms)"),
+                                 ("xcodebuild -scheme App test", "** TEST SUCCEEDED **"),
+                                 ("mvn test", "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0")):
+            self.assertEqual(counted("claude", [bash("a", command), outcome("a", False, summary)])["tests"]["last"],
+                             "passed", command)
+        # Another runner's summary, or one something before the runner could have printed, is no evidence.
+        for command, summary in (("pytest", "BUILD SUCCESSFUL"), ("go test ./...", "3 passed"),
+                                 ("printf '1 passed\\n'; make -f /dev/null -o test test", "1 passed\nmake: Nothing to be done"),
+                                 ("echo '3 passed' && pytest", "3 passed\nno tests ran")):
+            self.assertEqual(counted("claude", [bash("a", command), outcome("a", False, summary)])["tests"]["last"],
+                             "unknown", command)
         self.assertEqual(counted("codex_exec", [item("1", "/bin/zsh -lc pytest", 0, output="")])["tests"]["last"],
                          "unknown")
 
