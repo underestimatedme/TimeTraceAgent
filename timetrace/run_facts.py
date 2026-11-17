@@ -88,14 +88,20 @@ _NOT_RUNNING = {
 }
 
 
+# Arguments that list, collect, dry-run or skip tests for whichever runner they reach (also through `npm test -- ...`).
+_NEVER_RUNNING = {"--collect-only", "--co", "--listTests", "--list-tests", "--list", "-list", "--no-run", "--dry-run",
+                  "--just-print", "--showConfig", "--setup-plan", "--list-files", "--list-suites", "--list-groups",
+                  "--show-only", "--notest", "-DskipTests", "-Dmaven.test.skip", "-DskipITs"}
+
+
 def _runs_tests(tool: str, words: List[str]) -> bool:
-    """False when an argument makes the runner list, collect, dry-run or print help instead of running tests (make's
-    combined short flags such as -nk count too)."""
-    blocked = _NOT_RUNNING.get(tool, set())
+    """False when an argument makes the runner list, collect, dry-run, skip or print help instead of running tests
+    (make's combined short flags such as -nk count too)."""
+    blocked = _NOT_RUNNING.get(tool, set()) | _NEVER_RUNNING
     for word in words[1:]:  # past `--` too: `cargo test -- --list` lists
         if word.split("=", 1)[0] in blocked:
             return False
-        if tool == "make" and word.startswith("-") and not word.startswith("--") and ("n" in word[1:] or "q" in word[1:]):
+        if tool == "make test" and word.startswith("-") and not word.startswith("--") and ("n" in word[1:] or "q" in word[1:]):
             return False
     return True
 
@@ -117,6 +123,8 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
     `;`, `|`, `&`, `(`, `)`, newline). Comments, heredoc bodies and redirections (`>out`, `2>&1`, `&>log`) are not
     words. None when a quote is never closed."""
     segments: List[List[str]] = [[]]
+    # A part that is only a redirection (`; < /dev/null`) is still a command: its exit status can be the last one.
+    redirected: List[bool] = [False]
     seen: Set[str] = set()
     word: List[str] = []
     # drop_next: the next word is a redirection's target (`> out`, `< in`, `<<< text`), not part of the command.
@@ -137,8 +145,9 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
         end_word()
         state["drop_next"] = False
         seen.add(op)
-        if segments[-1]:
+        if segments[-1] or redirected[-1]:
             segments.append([])
+            redirected.append(False)
 
     while i < n:
         ch = command[i]
@@ -193,6 +202,7 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
                 del word[:]  # the file descriptor of `2>/dev/null`
                 state["has_word"] = False
             end_word()
+            redirected[-1] = True
             i += 2 if ch == "&" else 1
             while i < n and command[i] in "<>":
                 i += 1
@@ -217,7 +227,7 @@ def _lex(command: str) -> Optional[Tuple[List[List[str]], Set[str]]]:
     if quote:
         return None
     end_word()
-    return [segment for segment in segments if segment], seen
+    return [segment for segment, r in zip(segments, redirected) if segment or r], seen
 
 
 def _skip_heredocs(command: str, i: int, heredocs: List[Tuple[str, bool]]) -> int:
@@ -365,7 +375,10 @@ def _tool_of(name: str, words: List[str], depth: int):
         i = 1
         while i < len(words) and (words[i].startswith("+") or words[i].startswith("-")):
             i += 1
-        return "cargo test" if i < len(words) and words[i] in ("test", "nextest") else None
+        if i < len(words) and words[i] == "nextest":
+            j = _skip_options(words, i + 1)
+            return "cargo test" if j < len(words) and words[j] == "run" else None  # `nextest list` lists
+        return "cargo test" if i < len(words) and words[i] == "test" else None
     if name in _PACKAGE_MANAGERS:
         i = _skip_options(words, 1, _VALUE_OPTIONS["package"])
         sub = words[i] if i < len(words) else ""
@@ -380,7 +393,15 @@ def _tool_of(name: str, words: List[str], depth: int):
     if name == "xcodebuild":
         return "xcodebuild test" if any(w in ("test", "test-without-building") for w in rest) else None
     if name in ("gradle", "gradlew"):
-        return "gradle test" if any(_GRADLE_TASK.search(w) for w in rest if not w.startswith("-")) else None
+        tasks, skip = [], False
+        for w in rest:
+            if skip:
+                skip = False
+            elif w in ("-x", "--exclude-task"):
+                skip = True  # its value is a task left out, not run
+            elif not w.startswith("-"):
+                tasks.append(w)
+        return "gradle test" if any(_GRADLE_TASK.search(w) for w in tasks) else None
     if name in ("mvn", "mvnw"):
         return "mvn test" if any(w in ("test", "verify") for w in rest) else None
     if name == "make":

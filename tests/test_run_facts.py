@@ -97,6 +97,9 @@ class TestToolTest(unittest.TestCase):
             "pytest <<< x": "pytest",
             "pytest -n auto": "pytest",
             "exec -a runner pytest": "pytest",
+            "make -k test": "make test",
+            "cargo nextest run": "cargo test",
+            "./gradlew test -x lint": "gradle test",
         }
         for command, tool in cases.items():
             self.assertEqual(run_facts.test_tool(command), tool, command)
@@ -117,19 +120,23 @@ class TestToolTest(unittest.TestCase):
                         # Modes that read, list or dry-run instead of running tests.
                         "bash -n -c 'python3 -m unittest x'", "bash -o noexec -c pytest", "pytest --collect-only",
                         "python3 -m pytest --co", "make -n test", "go test -list .", "cargo test -- --list",
-                        "jest --listTests", "vitest list", "npm test --help",
+                        "jest --listTests", "vitest list", "npm test --help", "make -nk test", "cargo nextest list",
+                        "./gradlew build -x test", "mvn test -DskipTests", "mvn verify -Dmaven.test.skip=true",
+                        "npm test -- --listTests",
                         None, 42):
             self.assertIsNone(run_facts.test_tool(command), command)
 
 
 class OutcomeTest(unittest.TestCase):
     def test_the_exit_status_is_the_tests_own_only_at_the_end_of_a_plain_chain(self):
-        own = ["pytest -q", "pytest -q 2>&1", "pytest &>log.txt", "cd web && npm test", "echo start; pytest",
+        own = ["pytest -q", "pytest -q 2>&1", "pytest;", "pytest > out.txt; ", "pytest &>log.txt", "cd web && npm test", "echo start; pytest",
                "# run them\npytest -q", "cat <<EOF > a.txt\nhi\nEOF\npytest -q", "/bin/zsh -lc \"cd web && npm test\"",
                "timeout 600 go test ./...", "uv run pytest"]
         masked = ["pytest || true", "true || pytest", "pytest | tail -5", "pytest &", "! pytest",
                   "if pytest; then echo ok; fi", "(cd web && npm test)", "pytest; echo done",
-                  "/bin/zsh -lc \"pytest | tail\"", "{ pytest; }"]
+                  "/bin/zsh -lc \"pytest | tail\"", "{ pytest; }",
+                  # A last part that is only a redirection still sets the exit status.
+                  "python3 -B -m unittest missing_module; < /dev/null"]
         for command in own:
             self.assertEqual(run_facts.classify(command)[1], True, command)
         for command in masked:
