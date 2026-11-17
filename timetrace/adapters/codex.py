@@ -397,7 +397,8 @@ def thread_totals(thread_id: Any, home: Optional[Path] = None) -> Optional[usage
 def thread_model(thread_id: Any, home: Optional[Path] = None) -> str:
     """The model of a Codex thread's latest turn: the `turn_context` written last in its rollout file (read as
     thread_totals reads it). `codex exec --json` names no model, so a run with none configured would otherwise be
-    counted as an unknown model and never priced. "" when the file or a turn_context in its last part is not found."""
+    counted as an unknown model and never priced. "" when the file or a turn_context in its last part is not found, and
+    when the latest one names no usable model (never an older turn's model)."""
     read = _read_rollout(thread_id, home)
     if read is None:
         return ""
@@ -412,10 +413,9 @@ def thread_model(thread_id: Any, home: Optional[Path] = None) -> str:
         lines = lines[1:]  # read from the middle of a line
     for raw in reversed(lines):
         line = _json_object(raw)
-        if line is not None and line.get("type") == "turn_context" and isinstance(line.get("payload"), dict):
-            name = usage.model_name(line["payload"].get("model"))
-            if name:
-                return name
+        if line is not None and line.get("type") == "turn_context":
+            payload = line.get("payload")
+            return usage.model_name(payload.get("model")) if isinstance(payload, dict) else ""
     return ""
 
 

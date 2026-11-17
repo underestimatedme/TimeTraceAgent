@@ -438,6 +438,14 @@ class CodexThreadModelTest(unittest.TestCase):
                                          token_count(200, 80, 9)])
             self.assertEqual(codex.thread_model(THREAD, Path(home)), "gpt-6.1-sol-mini")
 
+    def test_a_latest_turn_context_without_a_model_never_falls_back_to_an_older_one(self):
+        for latest in ({"type": "turn_context", "payload": {"model": ""}},
+                       {"type": "turn_context", "payload": {"model": 7}},
+                       {"type": "turn_context", "payload": "gpt-6.1-sol"}):
+            with tempfile.TemporaryDirectory() as home:
+                write_rollout(home, THREAD, [TURN, token_count(100, 50, 5), latest, token_count(200, 80, 9)])
+                self.assertEqual(codex.thread_model(THREAD, Path(home)), "", latest)
+
     def test_no_model_unless_the_rollout_is_this_threads(self):
         other = "01a167a9-1103-7440-8bd4-d7f0e0a6ba00"
         with tempfile.TemporaryDirectory() as home:
