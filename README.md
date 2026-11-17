@@ -6,7 +6,7 @@
 
 ## 0.6.11：AI 完成说明、本机会话记入与 AI 用量
 
-执行步骤可在 `result.json` 里写 `report`，向控制台说明这一步的结论、没做完的事和建议复核的地方。在「设备」页打开开关后，你在电脑上直接用 Claude Code / Codex 做的事会记入「按日回顾」，只传元数据，不传对话文字（默认关闭）。每次运行结束时还会上报用掉的 token，控制台的「AI 用量」页按公开标价估算费用。Gemini CLI 和 Cursor 可通过新的 ACP 客户端登记，但不会被派发任务。这些功能需要配套更新的 TimeTrace 用户控制台和 Valley。详见 [0.6.11 发布说明](docs/releases/0.6.11.md)。
+执行步骤可在 `result.json` 里写 `report`，向控制台说明这一步的结论、没做完的事和建议复核的地方。在「设备」页打开开关后，你在已登记工作区里直接用 Claude Code / Codex 做的事（包括已有的历史会话）会记入「按日回顾」。这里只传元数据，不传对话文字，开关默认关闭。TimeTrace 派发的运行结束时，如果取得了可靠的数据，还会上报本次用掉的 token。控制台的「AI 用量」页按公开标价估算费用。Gemini CLI 和 Cursor 可通过新的 ACP 客户端登记，但不会被派发任务。这些功能需要配套更新的 TimeTrace 用户控制台和 Valley。详见 [0.6.11 发布说明](docs/releases/0.6.11.md)。
 
 ## 0.6.10 工作项 Agent 会话
 
@@ -105,7 +105,7 @@ timetrace agent doctor
 
 AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里声明 `{"kind": "file", "ref": "dist/xxx.zip"}`，电脑端只读取工作区内的普通文件（不跟随符号链接、不读 `.git`），单个不超过 20MB、每次最多 5 个，上传后手机上可以下载核对；读不到或上传失败的文件会被跳过并在完成说明里注明。
 
-同一个 `result.json` 还可以写 `report`，交代这一步做得怎样：`{"verdict": "success|needs_review|blocked", "summary": "…", "unfinished": ["…"], "review_focus": ["…"]}`。电脑端先脱敏再截断（摘要最多 1000 字，其余每项最多 300 字、最多 10 项），随结果交给 Valley；结论不在这三个值之内或字段类型不对时忽略整个 `report`（结果其余部分照常），并在完成说明里注明。控制台把它作为 AI 的自述显示，不改变验收结论。
+同一个 `result.json` 还可以写 `report`，交代这一步做得怎样：`{"verdict": "success|needs_review|blocked", "summary": "…", "unfinished": ["…"], "review_focus": ["…"]}`。电脑端先脱敏再截断（摘要最多 1000 字，`unfinished` 和 `review_focus` 各最多 10 项、每项最多 300 字，空项和非文字项单独略过），随结果交给 Valley；结论不在这三个值之内或字段类型不对时忽略整个 `report`（结果其余部分照常），并在完成说明里注明。控制台把它作为 AI 的自述显示，不改变验收结论。
 
 `cloud logout` 用 Keychain 里的 refresh 凭据在服务端撤销，可以重复执行或在丢回执后重试；没确认成功时返回失败并保留凭据，收到明确的撤销回执才删本机 Keychain。手机端解绑会让这台电脑的凭据随之失效。
 
