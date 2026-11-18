@@ -4,7 +4,7 @@ import hashlib
 import os
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 NO_PUSH_URL = "no_push://blocked"
 
@@ -366,6 +366,31 @@ def diff_stat(repo: str, base: str, head_commit: str, limit: int = DIFF_STAT_BYT
     note = "\n…（差异摘要过长，已截断）"
     cut = data[:limit - len(note.encode("utf-8"))].decode("utf-8", errors="ignore")
     return cut[:cut.rfind("\n")] + note if "\n" in cut else cut + note
+
+
+def diff_numbers(repo: str, base: str, head_commit: str) -> Optional[Dict[str, int]]:
+    """How much `<base>...<head>` changed: {files, non_doc_files, insertions, deletions} (a binary file adds no lines);
+    None when git cannot say. Counts only: no path leaves this function."""
+    from timetrace.run_facts import MAX_COUNT, is_doc
+    if not (_HEX.fullmatch(base or "") and _HEX.fullmatch(head_commit or "")):
+        return None
+    try:
+        out = subprocess.run(["git", *SAFE_GIT, "-C", repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                              "--numstat", "-z", "%s...%s" % (base, head_commit), "--"],
+                             check=True, capture_output=True).stdout.decode("utf-8", errors="replace")
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    files = non_doc = added = removed = 0
+    for record in out.split("\0"):
+        parts = record.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        files += 1
+        non_doc += not is_doc(parts[2].strip())
+        added += int(parts[0]) if parts[0].isdigit() else 0
+        removed += int(parts[1]) if parts[1].isdigit() else 0
+    return {"files": min(files, MAX_COUNT), "non_doc_files": min(non_doc, MAX_COUNT),
+            "insertions": min(added, MAX_COUNT), "deletions": min(removed, MAX_COUNT)}
 
 
 def remove_tree(path) -> None:

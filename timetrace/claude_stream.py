@@ -89,10 +89,14 @@ class StreamSession:
                  timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
                  drop_env: Optional[Sequence[str]] = None, env: Optional[dict] = None,
                  idle_grace: float = DEFAULT_IDLE_GRACE, confirm_session: str = "",
-                 on_message: Optional[Callable[[Dict[str, Any]], None]] = None):
+                 on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 on_unreadable: Optional[Callable[[str], None]] = None):
         self.cmd, self.cwd, self.log_file, self.prompt = list(cmd), cwd, log_file, prompt
         # Sees every decoded stdout message (masked) before `lines` keeps only the last MAX_CAPTURED_LINES: token usage.
         self.on_message = on_message
+        # Sees every stdout line that looked like JSON but did not decode: a watcher that counts messages must know it
+        # missed one (timetrace.run_facts).
+        self.on_unreadable = on_unreadable
         self.host, self.timeout, self.cancel_event = host, timeout, cancel_event
         self.drop_env, self.env, self.idle_grace = drop_env, env, idle_grace
         self.confirm_session = confirm_session
@@ -217,6 +221,11 @@ class StreamSession:
                     msg = None
             masked = mask_structure(msg) if isinstance(msg, dict) else None
             shown = json.dumps(masked, ensure_ascii=False) if masked is not None else mask_timetrace_tokens(raw)
+            if raw.lstrip().startswith("{") and not isinstance(msg, dict) and self.on_unreadable is not None:
+                try:
+                    self.on_unreadable(raw)
+                except Exception:
+                    pass
             if masked is not None and self.on_message is not None:
                 try:
                     self.on_message(masked)
@@ -405,7 +414,8 @@ def run_stream(cmd: Sequence[str], cwd: str, log_file: str, prompt: str, host: A
                timeout: Optional[float] = None, cancel_event: Optional[threading.Event] = None,
                drop_env: Optional[Sequence[str]] = None, idle_grace: float = DEFAULT_IDLE_GRACE,
                env: Optional[dict] = None, confirm_session: str = "",
-               on_message: Optional[Callable[[Dict[str, Any]], None]] = None) -> Tuple[int, List[str]]:
+               on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
+               on_unreadable: Optional[Callable[[str], None]] = None) -> Tuple[int, List[str]]:
     return StreamSession(cmd, cwd, log_file, prompt, host=host, timeout=timeout, cancel_event=cancel_event,
                          drop_env=drop_env, idle_grace=idle_grace, env=env, confirm_session=confirm_session,
-                         on_message=on_message).run()
+                         on_message=on_message, on_unreadable=on_unreadable).run()

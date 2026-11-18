@@ -19,7 +19,7 @@ from timetrace import __version__
 from timetrace.cloud import CloudError
 from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
 from timetrace import (approvals, audit, checks, dev_status, folder, local_sessions, pause, quota, results,
-                       runner_state, sync, usage, worktree)
+                       run_facts, runner_state, sync, usage, worktree)
 from timetrace.remote_control import RunControl
 from timetrace import approval_delivery
 from timetrace.approval_delivery import ApprovalPump
@@ -1725,6 +1725,7 @@ class Agent:
             self.db.update_remote_claim(job_id, "reported")
             self.maintain(force=True)
             return "job %s → replied" % job_id
+        left_out = []
         if result.ok and not in_folder and (job.get("stage_iteration") or work_session):
             try:
                 from .pipeline_inputs import committed_pipeline_output
@@ -1850,12 +1851,37 @@ class Agent:
                                 "content": changed}
                     others = [a for a in event.get("artifacts", []) if a.get("ref") != artifact["ref"]]
                     event["artifacts"] = [artifact] + others[:17]
+        if outcome == "awaiting_review":
+            # A work session resumed without an input commit from Valley starts from the checkpoint's: its changes
+            # would be only part of the delivery, so it reports none.
+            self._attach_run_facts(event, result, workspace["path"], left_out, resuming,
+                                   changes_partial=bool(work_session and resuming and not job.get("input_head")))
         event["observed_at"] = observed_end
         self._report(claim, [usage.attach(event, result)])
         self.db.update_remote_claim(job_id, "reported")
         # A finished run changed the quota picture: refresh it right away.
         self.maintain(force=True)
         return "job %s → %s" % (job_id, outcome)
+
+    @staticmethod
+    def _attach_run_facts(event, result, repo, left_out, resuming, changes_partial=False) -> None:
+        """`event["run_facts"]`: what the computer itself saw this run do (timetrace.run_facts), beside the AI's own
+        report. Commands come from the tool's stream; a run resumed from a checkpoint saw only the commands after it
+        resumed, so its facts say `resumed`. Changes come from git between the input and output commits the event
+        names, the whole delivery under review, resumed or not. Never a reason for the completion to fail."""
+        try:
+            changes = None
+            if event.get("input_head") and event.get("output_commit") and not changes_partial:
+                changes = worktree.diff_numbers(repo, event["input_head"], event["output_commit"])
+                if changes is not None:
+                    changes["left_out"] = min(len(left_out or []), run_facts.MAX_COUNT)
+            facts = run_facts.build(getattr(result, "commands", None), changes)
+            if facts:
+                if resuming and "commands" in facts:
+                    facts["resumed"] = True
+                event["run_facts"] = facts
+        except Exception:
+            event.pop("run_facts", None)
 
     @staticmethod
     def _folder_problem(workspace_path, out_name, before):

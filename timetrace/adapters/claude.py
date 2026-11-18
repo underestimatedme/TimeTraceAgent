@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
 from timetrace.billing import billing_env_keys, claude_verifier
-from timetrace import tiers, usage
+from timetrace import run_facts, tiers, usage
 from timetrace.adapters import claude_usage
 from timetrace.config import claude_quota_probe_enabled
 from timetrace.claude_stream import run_stream
@@ -408,13 +408,14 @@ class ClaudeAdapter(ToolAdapter):
                 if mcp is not None:
                     config = write_mcp_config(os.path.dirname(os.path.abspath(log_file)), mcp)
                     cmd += ["--mcp-config", config, "--allowedTools", MCP_ALLOWED_TOOLS]
-                tokens = usage.ClaudeTokens()
+                tokens, commands = usage.ClaudeTokens(), run_facts.Commands("claude")
                 code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                          timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                          cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE),
                                          env=mcp.env() if mcp is not None else None, confirm_session=session_id,
-                                         on_message=tokens.add)
-                result = self._result(code, lines, "", tokens)
+                                         on_message=usage.watchers(tokens.add, commands.add),
+                                         on_unreadable=commands.feed)
+                result = self._result(code, lines, "", tokens, commands)
                 if result.session_id != session_id:
                     result.ok = False
                     result.session_id = None
@@ -508,26 +509,29 @@ class ClaudeAdapter(ToolAdapter):
                     cancel_event, control, env: Optional[Dict[str, str]] = None) -> RunResult:
         # Time spent waiting for a permission decision does not count
         # toward timeout_seconds (the session pauses its clock).
-        tokens = usage.ClaudeTokens()
+        tokens, commands = usage.ClaudeTokens(), run_facts.Commands("claude")
         code, lines = run_stream(cmd, cwd, log_file, prompt, host=control,
                                  timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                  cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env,
-                                 on_message=tokens.add)
-        return self._result(code, lines, session_id, tokens)
+                                 on_message=usage.watchers(tokens.add, commands.add), on_unreadable=commands.feed)
+        return self._result(code, lines, session_id, tokens, commands)
 
     def _run(self, cmd: List[str], cwd: str, log_file: str, session_id: str, cancel_event=None,
              env: Optional[Dict[str, str]] = None) -> RunResult:
-        tokens = usage.ClaudeTokens()
+        tokens, commands = usage.ClaudeTokens(), run_facts.Commands("claude")
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                     cancel_event=cancel_event, drop_env=billing_env_keys(CLAUDE), env=env,
-                                    on_line=tokens.feed)
-        return self._result(code, lines, session_id, tokens)
+                                    on_line=usage.watchers(tokens.feed, commands.feed))
+        return self._result(code, lines, session_id, tokens, commands)
 
     @staticmethod
-    def _result(code: int, lines: List[str], session_id: str, tokens: usage.ClaudeTokens) -> RunResult:
-        """`lines` are only the last ones the run printed; what it used comes from `tokens`, which saw them all."""
+    def _result(code: int, lines: List[str], session_id: str, tokens: usage.ClaudeTokens,
+                commands: Optional[run_facts.Commands] = None) -> RunResult:
+        """`lines` are only the last ones the run printed; what it used and the commands it made come from `tokens`
+        and `commands`, which saw them all."""
         res = parse_stream(lines)
         res.usage = tokens.total()
+        res.commands = commands.total() if commands is not None else None
         res.exit_code = code
         res.session_id = res.session_id or session_id
         if code != 0 and not res.blocked and res.ok:

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict
 
-from timetrace import approvals, usage
+from timetrace import approvals, run_facts, usage
 from timetrace.billing import billing_env_keys
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.models import CODEX, RunResult
@@ -19,6 +19,10 @@ COMMAND_APPROVAL = "item/commandExecution/requestApproval"
 FILE_APPROVAL = "item/fileChange/requestApproval"
 
 
+# Put on the queue for a line that looked like JSON and did not decode: whatever it was, this turn was not read whole.
+UNREADABLE = object()
+
+
 def _read_messages(stream, incoming):
     try:
         for line in stream:
@@ -27,7 +31,8 @@ def _read_messages(stream, incoming):
                 if isinstance(data, dict):
                     incoming.put(data)
             except ValueError:
-                pass
+                if line.lstrip().startswith("{"):
+                    incoming.put(UNREADABLE)
     finally:
         incoming.put(None)
 
@@ -63,6 +68,8 @@ class CodexTurn:
         self.turn_totals = []
         self.usage_conflict = False
         self.model = ""
+        # The commands this turn made (timetrace.run_facts), from its own commandExecution items.
+        self.commands = run_facts.Commands("codex_app_server")
 
     def _write_locked(self, msg):
         try:
@@ -106,6 +113,9 @@ class CodexTurn:
             return True
         if msg is None:
             return False
+        if msg is UNREADABLE:
+            self.commands.unreadable()
+            return True
         method, id_ = msg.get("method"), msg.get("id")
         params = msg.get("params")
         if method and isinstance(params, dict):
@@ -165,6 +175,7 @@ class CodexTurn:
             self.file_changes[item.get("id")] = paths
         if method == "item/completed":
             self._reply(item)
+            self.commands.app_server_item(item)
 
     def _token_usage(self, params):
         """Each update carries the thread's running totals. One for an earlier turn, before this turn reported any, is
@@ -210,6 +221,7 @@ class CodexTurn:
         self.ended = True
         for item in turn.get("items") or []:
             self._reply(item)
+            self.commands.app_server_item(item)  # counted once per item id, however often it is sent
         self.result.ok = turn.get("status") == "completed"
         self.result.exit_code = 0 if self.result.ok else 1
         if not self.result.ok:
@@ -362,6 +374,7 @@ class CodexTurn:
                 self.result.usage = self.turn_usage()
             except Exception:
                 self.result.usage = None
+            self.result.commands = self.commands.total()
         finally:
             self.ended = True
             self.host.detach()

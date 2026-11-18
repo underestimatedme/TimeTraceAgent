@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from timetrace import __version__
 from timetrace.adapters.base import WORK_SESSION_RULES, PLANNING_RULES, CHAT_RULES, FOLDER_RULES, IMPORT_RULES, REVIEW_RULES, SAFETY_RULES, ToolAdapter, run_streaming
-from timetrace import tiers, usage, worktree
+from timetrace import run_facts, tiers, usage, worktree
 from timetrace.mcp_access import ENV_NAME, McpAccess
 from timetrace.redact import mask_file, masking
 from timetrace.models import CODEX, RunResult, Sample
@@ -704,11 +704,13 @@ class CodexAdapter(ToolAdapter):
         watch = ThreadWatch()
         # The lines handed back are only the last ones: what the run used is kept from every line as it is read.
         tokens = usage.CodexTokens(start, str(self.cfg.get("model") or ""))
+        commands = run_facts.Commands("codex_exec")
         code, lines = run_streaming(cmd, cwd, log_file, timeout=float(self.cfg.get("timeout_seconds", 3600)),
                                     cancel_event=cancel_event, drop_env=billing_env_keys(CODEX), env=env,
-                                    on_line=usage.watchers(watch, tokens.feed))
+                                    on_line=usage.watchers(watch, tokens.feed, commands.feed))
         res = parse_exec(lines, model=str(self.cfg.get("model") or ""), start=start)
         res.usage = tokens.total()
+        res.commands = commands.total()
         # Every Codex exec run (task, resume, folder, chat, review, plan, import) passes here.
         res.session_id = watch.thread_id or res.session_id
         if res.usage is not None and not res.usage.get("model"):
