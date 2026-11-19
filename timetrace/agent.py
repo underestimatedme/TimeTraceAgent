@@ -855,8 +855,10 @@ class Agent:
             except LockBusy as exc:
                 raise ToolBusy(tool, exc) from exc
         try:
-            held.append(self._first_free([coding_slot_lock(self.home) if i == 0 else coding_slot_lock(self.home, i)
-                                          for i in range(self.max_parallel)]))
+            # The local queue can share only overall slot zero across Runner versions and config changes.
+            # Prefer the other slots for cloud work, but use zero too if it is the only free one.
+            indices = (*range(1, self.max_parallel), 0)
+            held.append(self._first_free([coding_slot_lock(self.home, i) for i in indices]))
         except BaseException:
             for lock in held:
                 lock.release()

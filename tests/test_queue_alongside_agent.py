@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from timetrace import cli, scheduler
+from timetrace.agent import Agent
 from timetrace.db import Database
 from timetrace.dispatch import (LockBusy, SlotLimits, UnclearedOwner, coding_slot_lock, tool_slot_lock)
 from timetrace.models import DONE, RunResult
@@ -170,11 +171,16 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         db.add_task("other", db.get_task(1)["repo"], tool="codex")
         claude, codex = FakeAdapter("claude"), FakeAdapter("codex")
         with patch("timetrace.cli._adapters", return_value={"claude": claude, "codex": codex}):
-            with tool_slot_lock(self.home, "claude", 0):
+            cloud_agent = Agent(db, None, {}, self.home, lambda: "", max_parallel=2,
+                                max_parallel_per_tool={"claude": 1, "codex": 1})
+            occupied = cloud_agent._acquire_slot("claude")
+            try:
                 self.assertEqual(self.run_cli("run", "--once")[0], 0)
                 self.assertEqual(codex.calls, ["other"])
                 self.assertEqual(db.get_task(1)["session_id"], "existing-claude")
                 self.assertEqual(claude.calls, [])
+            finally:
+                occupied.release()
             self.assertEqual(self.run_cli("run", "--once")[0], 0)
             self.assertEqual(len(claude.calls), 1)
             self.assertEqual(db.get_task(1)["session_id"], "existing-claude")
