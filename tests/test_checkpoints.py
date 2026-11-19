@@ -123,6 +123,25 @@ class CheckpointPersistenceTest(unittest.TestCase):
             self.assertEqual(db.get_checkpoint("p"), plan)
             self.assertEqual(db.get_checkpoint("work-session:w"), work)
 
+    def test_local_task_history_retains_fingerprint_and_run_order(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, TIMETRACE_HOME=d):
+            db = Database(Path(d) / "timetrace.db")
+            try:
+                task = db.add_task("private prompt", "/private/repo", tool="claude")
+                for stamp, sid in ((1, "private-session"), (3, "private-session"), (5, "new-session")):
+                    run = db.add_run(task, "claude", sid, "/private/log", now=stamp)
+                    db.finish_run(run, 0, False, "private output", sid, now=stamp + 1)
+            finally:
+                db.close()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(cli.main(["agent", "sessions", "--task", str(task), "--json"]), 0)
+            self.assertNotIn("private", out.getvalue())
+            runs = json.loads(out.getvalue())["runs"]
+            self.assertEqual([r["started_at"] for r in runs], [1, 3, 5])
+            self.assertEqual(runs[0]["session_fingerprint"], runs[1]["session_fingerprint"])
+            self.assertNotEqual(runs[0]["session_fingerprint"], runs[2]["session_fingerprint"])
+
     def test_checkpoint_row_carries_no_secrets(self):
         cp = Checkpoint(plan_id="p", job_id="j", attempt_id="a", tool_profile_id="claude-personal",
                         provider_session_id="s", canonical_workspace="/r", git_head="h",

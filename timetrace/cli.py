@@ -1111,9 +1111,38 @@ def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
     return lines
 
 
+def _show_task_sessions(db: Database, task_id: int, as_json: bool) -> int:
+    with db.transaction():
+        task = db.get_task(task_id)
+        if task is None:
+            print("本地队列中没有任务 #%d" % task_id, file=sys.stderr)
+            return 1
+        runs = db.runs_for_task(task_id)
+    history = []
+    for run in runs:
+        session_id = run["session_id"]
+        history.append({
+            "run_id": run["id"], "tool": run["tool"], "started_at": run["started_at"],
+            "ended_at": run["ended_at"], "exit_code": run["exit_code"],
+            "session_fingerprint": hashlib.sha256(session_id.encode()).hexdigest()[:16] if session_id else None,
+        })
+    if as_json:
+        print(json.dumps({"task_id": task_id, "state": task["state"], "runs": history}, indent=2))
+    else:
+        print("本地任务 #%d（%s）" % (task_id, task["state"]))
+        if not history:
+            print("还没有运行记录。")
+        for run in history:
+            print("运行 #%d  ·  %s  ·  %s  ·  会话指纹 %s" % (
+                run["run_id"], _iso_local(run["started_at"]), run["tool"], run["session_fingerprint"] or "未记录"))
+    return 0
+
+
 def cmd_agent_sessions(args: argparse.Namespace) -> int:
     _, _, db = _open(args)
     try:
+        if args.task is not None:
+            return _show_task_sessions(db, args.task, args.json)
         checkpoints = db.list_checkpoints()
     finally:
         db.close()
@@ -2013,6 +2042,7 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--interval", type=int, default=5)
     ar.set_defaults(fn=cmd_agent_run)
     sessions = agent_sub.add_parser("sessions", help="list work sessions and plan checkpoints saved on this computer")
+    sessions.add_argument("--task", type=int, metavar="ID", help="show the session and run history of a local queue task")
     sessions.add_argument("--json", action="store_true", help="print the list as JSON")
     sessions.set_defaults(fn=cmd_agent_sessions)
     agent_sub.add_parser("doctor", help="check pairing, tools and workspaces").set_defaults(fn=cmd_agent_doctor)
