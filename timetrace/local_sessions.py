@@ -606,7 +606,10 @@ class Importer:
             db.forget_local_session_files(gone)
         todo.sort(reverse=True)
         settled, pending = [], []
-        for _, path, provider, info in todo[:self.max_files]:
+        attempts = 0
+        for _, path, provider, info in todo:
+            if attempts >= self.max_files:
+                break
             if not enabled():
                 stats["off"] = True
                 return stats
@@ -618,6 +621,7 @@ class Importer:
                 continue
             row = {"path": path, "provider": provider, "mtime_ns": info.st_mtime_ns, "size": info.st_size,
                    "scope": scope, "session_key": "", "fingerprint": ""}
+            attempts += 1
             try:
                 summary = PARSERS[provider](path)
             except OSError:

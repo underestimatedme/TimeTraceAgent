@@ -1,3 +1,4 @@
+import threading
 import tempfile
 import time
 import unittest
@@ -170,6 +171,45 @@ class ExistingHeartbeatContractTest(unittest.TestCase):
             self.agent.run_forever(interval=0)
         self.assertEqual(calls[0], True, "the first upkeep after a worker asked for one is forced")
         self.assertFalse(self.agent._maintain_due, "the request is consumed")
+
+    def test_finished_worker_wakes_partial_pool_after_empty_claim(self):
+        idle_poll, finish, second = threading.Event(), threading.Event(), threading.Event()
+        handled = []
+        def handle(item):
+            job = item["job"]["id"]
+            handled.append(job)
+            if job == "first":
+                finish.wait(5)
+            else:
+                second.set()
+                self.agent.stop()
+            return "completed"
+
+        claims = iter(("first", "idle", "next"))
+
+        def next_claim():
+            job = next(claims, "idle")
+            if job == "idle":
+                idle_poll.set()
+                return "idle"
+            return {"job": {"id": job}}
+
+        self.agent._next_claim = next_claim
+        self.agent.handle = handle
+        self.agent.max_parallel = 2
+        self.agent.maintain = lambda **kwargs: None
+        with patch("timetrace.runtime_preview.RuntimePreviews.start"):
+            runner = threading.Thread(target=lambda: self.agent.run_forever(interval=30))
+            runner.start()
+            try:
+                self.assertTrue(idle_poll.wait(3))
+                finish.set()
+                self.assertTrue(second.wait(2), "a completed job must wake the idle claim loop")
+            finally:
+                self.agent.stop()
+                finish.set()
+                runner.join(5)
+        self.assertEqual(handled, ["first", "next"])
 
     def _run_parallel(self):
         self.agent.remote_config = None
