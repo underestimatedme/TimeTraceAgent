@@ -10,7 +10,7 @@ import shutil
 import signal
 import threading
 from datetime import datetime, timezone
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError, wait
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, wait
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -354,6 +354,7 @@ class Agent:
         # Shutdown: once set, nothing new is claimed or spawned, and the
         # cancel event of every running job is set (its process group killed).
         self._stop = threading.Event()
+        self._claim_wake = threading.Event()
         self._jobs_lock = threading.Lock()
         self._running = {}  # id(cancel event) → cancel event
         self._running_since = {}  # id(cancel event) → when the job started (time.time())
@@ -368,6 +369,7 @@ class Agent:
         """Stop claiming and cancel every running job. Safe from a signal
         handler: it only sets events."""
         self._stop.set()
+        self._claim_wake.set()
         with self._jobs_lock:
             events = list(self._running.values())
         for event in events:
@@ -672,7 +674,8 @@ class Agent:
         """Counts only (never a path, id or title) to the log and to runner_state.json for `agent doctor`."""
         now = int(time.time())
         failed = stats.get("failed") or ""
-        fields = {"local_sessions_round_at": now, "local_sessions_failed": failed or None}
+        fields = {"local_sessions_round_at": now, "local_sessions_failed": failed or None,
+                  "local_sessions_deferred": stats.get("deferred", 0)}
         if stats.get("uploaded"):
             fields.update(local_sessions_uploaded_at=now, local_sessions_uploaded=stats["uploaded"])
         runner_state.record(self.home, **fields)
@@ -2549,7 +2552,11 @@ class Agent:
                     log("job %s worker crashed: %s: %s" % (job_id, exc.__class__.__name__, exc))
 
         try:
-            while not self._stop.is_set():
+            while True:
+                # Clear before sampling futures so a completion during this round wakes the next claim.
+                self._claim_wake.clear()
+                if self._stop.is_set():
+                    break
                 reap({f for f in active if f.done()})
                 # Upkeep first, every round: before the remote-config hold (so `agent sync` answers even while a configuration
                 # change waits for idle) and before waiting for a free slot (a full agent is still present).
@@ -2557,10 +2564,10 @@ class Agent:
                 self._maintain_due = False
                 self.maintain(force=upkeep_due)
                 if self.remote_config is not None and self.remote_config(self, bool(active)):
-                    self._stop.wait(interval)
+                    self._claim_wake.wait(interval)
                     continue
                 if len(active) >= self.max_parallel:
-                    wait(list(active), timeout=max(interval, .05), return_when=FIRST_COMPLETED)
+                    self._claim_wake.wait(max(interval, .05))
                     continue
                 try:
                     claim = self._next_claim()
@@ -2576,9 +2583,14 @@ class Agent:
                     continue
                 if claim in HOLD_OUTCOMES:
                     self.maintain()
-                    self._stop.wait(interval)
+                    if claim == "idle":
+                        self._claim_wake.wait(interval)
+                    else:
+                        self._stop.wait(interval)
                     continue
-                active[pool.submit(self.handle, claim)] = (claim.get("job") or {}).get("id", "?")
+                future = pool.submit(self.handle, claim)
+                active[future] = (claim.get("job") or {}).get("id", "?")
+                future.add_done_callback(lambda _: self._claim_wake.set())
         finally:
             self.stop()
             pending = list(active)

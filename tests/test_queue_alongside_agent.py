@@ -161,6 +161,39 @@ class QueueAlongsideAgentTest(unittest.TestCase):
         self.assertEqual(self.task_state(), DONE)
         self.assertEqual(set(self.slot_states().values()), {"free"})          # and everything is given back
 
+    def test_busy_native_session_allows_next_codex_task_to_start(self):
+        self.queue_one_task()
+        self.agent_online()
+        db = Database(self.home / "timetrace.db")
+        self.addCleanup(db.close)
+        db.update_task(1, session_id="existing-claude", priority=10)
+        db.add_task("other", db.get_task(1)["repo"], tool="codex")
+        claude, codex = FakeAdapter("claude"), FakeAdapter("codex")
+        with patch("timetrace.cli._adapters", return_value={"claude": claude, "codex": codex}):
+            with tool_slot_lock(self.home, "claude", 0):
+                self.assertEqual(self.run_cli("run", "--once")[0], 0)
+                self.assertEqual(codex.calls, ["other"])
+                self.assertEqual(db.get_task(1)["session_id"], "existing-claude")
+                self.assertEqual(claude.calls, [])
+            self.assertEqual(self.run_cli("run", "--once")[0], 0)
+            self.assertEqual(len(claude.calls), 1)
+            self.assertEqual(db.get_task(1)["session_id"], "existing-claude")
+            self.assertEqual(codex.calls, ["other"])
+
+    def test_unassigned_task_uses_free_tool_in_the_same_round(self):
+        self.queue_one_task()
+        self.agent_online()
+        db = Database(self.home / "timetrace.db")
+        self.addCleanup(db.close)
+        db.update_task(1, tool=None)
+        claude, codex = FakeAdapter("claude"), FakeAdapter("codex")
+        with patch("timetrace.cli._adapters", return_value={"claude": claude, "codex": codex}):
+            with tool_slot_lock(self.home, "claude", 0):
+                self.assertEqual(self.run_cli("run", "--once")[0], 0)
+        self.assertEqual(codex.calls, ["do it"])
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(db.get_task(1)["tool"], "codex")
+
     def test_the_queue_waits_while_an_agent_job_holds_overall_slot_0_or_the_tools_slot_0(self):
         for held in ("all0", "tool0"):
             with self.subTest(agent_holds=held):

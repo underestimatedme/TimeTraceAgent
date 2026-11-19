@@ -130,6 +130,8 @@ Claude/Codex 的登录凭据不会上传：iPhone 只把任务发给 Valley，�
 timetrace cloud login                    # 终端显示二维码，在刻迹「我的电脑 → 绑定新电脑」扫描后确认
 timetrace workspace add ~/code/TimeTrace # 只显式开放这个仓库
 timetrace agent doctor                   # 检查配对、CLI 和工作区
+timetrace agent sessions                 # 按最近更新时间列出本机保存的会话、任务、工具和保存原因
+timetrace agent sessions --json          # 同一份清单的 JSON 输出
 timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
@@ -265,7 +267,7 @@ iPhone ──任务──▶ TimeTrace 云（Valley）◀──出站 HTTPS 轮�
 - **读取范围**：只读 `$CLAUDE_CONFIG_DIR`（缺省 `~/.claude`）下的 `projects/*/*.jsonl` 和 `$CODEX_HOME`（缺省 `~/.codex`）下的 `sessions/**/rollout-*.jsonl`；这两个目录本身或其中的 `projects` / `sessions` 是符号链接时不读，目录内的符号链接也不跟随；不读凭据文件（`.claude/.credentials.json`、`.codex/auth.json`）。超过 64 MB 的文件跳过；每 5 分钟（与额度上报同一个定时）最多处理 200 个有变化的文件，未变化的文件不重读。
 - **上传什么**：每段会话一条元数据——来源工具、会话 id 的 SHA-256 摘要（id 本身不上传）、所属工作区、用得最多的模型名、git 分支、起止时间、提问次数、四项 token 合计、改动过的文件**数量**。
 - **不上传什么**：任何对话文字，连标题也不上传（记录里的标题始终为空；提问内容只在本机用来区分你的提问和工具自动插入的消息，不保存）；命令输出、文件路径与文件内容；工作目录不在 `timetrace workspace add` 登记的工作区之内的会话；TimeTrace 自己派发的运行（避免和执行记录重复计算）；Codex 的子 Agent 线程。
-- `timetrace agent doctor` 会显示一行「本机 AI 会话记入」的状态和上次上传时间。
+- Runner 会暂缓读取可能属于当前任务的会话文件，并继续处理较早的文件。`timetrace agent doctor` 显示上次上传时间及本轮暂缓的文件数。
 
 ## 用法
 
@@ -287,6 +289,8 @@ timetrace events [--type task_blocked]
 `timetrace run` 收到 SIGINT（Ctrl-C）或 SIGTERM 时：不再认领新任务；正在执行的工具所在的进程组先收到 SIGTERM，2 秒后仍未退出就 SIGKILL，并在有限时间内确认它（及它启动的子进程）已退出，调度器才退出。确认之后，这一轮 run 写上结束信息，任务变成 `failed`、说明为 `interrupted (SIGTERM): tool stopped`（保留会话，不计入熔断的失败次数），槽位锁正常释放。**重启不会自动重跑它**：其他独立任务照常运行，`--after` 它的任务继续等待；你确认后 `timetrace retry <id>` 才会在原会话里续跑，且只启动一个工具进程。信号到来时工具恰好已经正常完成的，仍是 `done`，不会改成中断。重复发信号等同一次停止。“确认”只认内核明确回答进程组不存在（ESRCH）；进程组仍在，或回答 EPERM（组存在但无权对它发信号）及其他任何错误，都按未确认处理。若超时仍无法确认工具已退出，不会写“已停止”：任务说明含 `待核对`，槽位锁保持封住（沿用既有的人工清除规则），`timetrace run` 以退出码 1 结束。`kill -9` 之类的硬杀没有任何机会写记录：任务会留在 `running`。下次启动时它的原记录收尾为 `待核对`（没有退出码；工具是否还在运行无法证实，所以也不宣称它已停止），任务变成 `failed`，会话和工作树保留，**不会自动续跑**：槽位上有没有崩溃标记都一样——没有标记不等于已授权（标记只是某些崩溃碰巧留下的，换机器、被人清掉或来自旧数据库的情况都可能没有）。其他独立任务照常运行，`--after` 它的任务继续等待；你确认没有进程仍在写它的工作树后，`timetrace retry <id>` 才会在原会话、原工作树里续跑。槽位上若留有崩溃标记，它原样保留，retry 之后锁仍会拒绝第二个工具（`manual recovery required`），须按提示人工核对并清除后才会运行；槽位正被某个进程持有时则是 `deferred (runner busy)`。
 
 `--after` 的任务在父任务 `done` 之前一直是 `pending`（`ls` 显示 `等待前置工作 #N（…）`）：父任务失败时它不会被标成失败，`timetrace retry <父任务>`（同一工作树和会话）通过后才按顺序启动；直接 `retry` 子任务也不会越过父任务。规则和新旧版本混用见 [docs/queue-dependencies.md](docs/queue-dependencies.md)。
+
+本地队列每轮按优先级寻找可执行的任务。已绑定 Claude 或 Codex 会话的任务等原工具空闲，后面可用另一工具的任务可以先执行。未指定工具的新任务遇到工具繁忙时，会在同一轮尝试有剩余额度或额度未知的另一工具。并行 Runner 收到云端空队列答复后，正在运行的任务一结束，就会再向 Valley 领取一次。
 
 ## 守护进程
 

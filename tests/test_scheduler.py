@@ -80,6 +80,24 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(out, "task 1 → deferred (runner busy)")
         self.assertEqual(ad.calls, [])  # adapter never invoked
 
+    def test_native_session_assigned_during_preparation_is_kept_for_the_next_pass(self):
+        task_id = self.db.add_task("do", "/repo")
+        claude, codex = FakeAdapter("claude"), FakeAdapter("codex")
+        adapters = {"claude": claude, "codex": codex}
+
+        def prepare(*args):
+            self.db.update_task(task_id, tool="codex", session_id="existing")
+            return fake_worktree(*args)
+
+        outcome = scheduler.run_once(self.db, adapters, self.cfg, self.home, now=100,
+                                     ensure_worktree=prepare, log=lambda _: None)
+        self.assertIn("tool or session changed", outcome)
+        self.assertEqual(claude.calls, [])
+        self.assertEqual(codex.calls, [])
+        self.assertEqual(self.db.get_task(task_id)["session_id"], "existing")
+        self.run_once(adapters, now=101)
+        self.assertEqual([(call[0], call[3]) for call in codex.calls], [("resume", "existing")])
+
     def test_preparation_revoking_billing_capability_blocks_spawn(self):
         task_id = self.db.add_task("do", "/repo", tool="claude")
         adapter = FakeAdapter("claude")
@@ -377,6 +395,7 @@ class SchedulerTest(unittest.TestCase):
             Sample("claude:five_hour", "claude", 100), Sample("codex:codex:primary", "codex", 100),
         ], at=1)
         self.db.add_task("do", "/repo", tool="claude", any_tool=True)
+        self.db.add_task("automatic", "/repo")
         out = self.run_once({"claude": FakeAdapter("claude"), "codex": FakeAdapter("codex")}, now=5)
         self.assertEqual(out, "idle")
 

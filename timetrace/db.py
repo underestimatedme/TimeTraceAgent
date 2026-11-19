@@ -730,7 +730,7 @@ class Database:
 
     def list_checkpoints(self) -> List[Any]:
         from timetrace.checkpoints import Checkpoint
-        rows = self.conn.execute("SELECT data FROM checkpoint ORDER BY plan_id").fetchall()
+        rows = self.conn.execute("SELECT data FROM checkpoint ORDER BY updated_at DESC, plan_id").fetchall()
         return [Checkpoint.from_row(json.loads(row["data"])) for row in rows]
 
     def delete_checkpoint(self, plan_id: str) -> None:

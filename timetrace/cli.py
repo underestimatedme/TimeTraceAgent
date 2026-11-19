@@ -23,6 +23,7 @@ from timetrace import (__version__, audit, checks, config, folder, health, limit
                        process, qr, quota, render, runner_state, scheduler, statusline_hook, sync, toolpath, worktree)
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
+from timetrace.checkpoints import WORK_SESSION_PREFIX
 from timetrace.cloud import CloudClient, CloudError
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
@@ -1078,7 +1079,11 @@ def _local_sessions_line(home: Path) -> str:
     elif st.get("local_sessions_uploaded_at"):
         last = "上次上传 %s，%s 段" % (_iso_local(st["local_sessions_uploaded_at"]), st.get("local_sessions_uploaded", "?"))
     else:
-        last = "还没有需要上传的会话"
+        last = ""
+    deferred = st.get("local_sessions_deferred")
+    if deferred:
+        last = (last + "；" if last else "") + "本轮有 %s 个会话文件等待任务结束后再检查" % deferred
+    last = last or "还没有需要上传的会话"
     return "本机 AI 会话记入: 已开启（只含登记工作区内的会话）；%s" % last
 
 
@@ -1104,6 +1109,37 @@ def _runner_lines(home: Path, user_home: Path, launchctl=None) -> List[str]:
     if st.get("quota_reported_at"):
         lines.append("上次上报额度: %s" % _iso_local(st["quota_reported_at"]))
     return lines
+
+
+def cmd_agent_sessions(args: argparse.Namespace) -> int:
+    _, _, db = _open(args)
+    try:
+        checkpoints = db.list_checkpoints()
+    finally:
+        db.close()
+    sessions = []
+    for cp in checkpoints:
+        is_work = cp.plan_id.startswith(WORK_SESSION_PREFIX)
+        sessions.append({
+            "kind": "work_session" if is_work else "plan",
+            "id": cp.plan_id[len(WORK_SESSION_PREFIX):] if is_work else cp.plan_id,
+            "job_id": cp.job_id, "provider": cp.provider, "tool_profile_id": cp.tool_profile_id,
+            "reason": cp.reason,
+        })
+    if args.json:
+        print(json.dumps(sessions, ensure_ascii=False, indent=2))
+    elif not sessions:
+        print("这台电脑还没有保存工作会话或计划检查点。")
+    else:
+        reasons = {"work_session": "已保存会话", "waiting_quota": "等待额度恢复",
+                   "interrupted_by_user": "用户已中断"}
+        print("本机已保存的会话和计划检查点（最近更新在前）")
+        for item in sessions:
+            print("%s %s  ·  任务 %s  ·  %s / %s  ·  %s" % (
+                "会话" if item["kind"] == "work_session" else "计划", item["id"], item["job_id"],
+                item["provider"] or "工具未记录", item["tool_profile_id"] or "配置未记录",
+                reasons.get(item["reason"], item["reason"])))
+    return 0
 
 
 def cmd_agent_doctor(args: argparse.Namespace) -> int:
@@ -1976,6 +2012,9 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--once", action="store_true")
     ar.add_argument("--interval", type=int, default=5)
     ar.set_defaults(fn=cmd_agent_run)
+    sessions = agent_sub.add_parser("sessions", help="list work sessions and plan checkpoints saved on this computer")
+    sessions.add_argument("--json", action="store_true", help="print the list as JSON")
+    sessions.set_defaults(fn=cmd_agent_sessions)
     agent_sub.add_parser("doctor", help="check pairing, tools and workspaces").set_defaults(fn=cmd_agent_doctor)
     agent_sub.add_parser("pause", help="stop taking new work on this computer (running jobs continue)"
                          ).set_defaults(fn=cmd_agent_pause)

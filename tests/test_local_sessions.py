@@ -491,6 +491,18 @@ class ImporterTest(Fixture):
         stats, sent = self.run_once(self.importer(max_file_bytes=10))
         self.assertEqual((stats["too_large"], sent), (1, []))
 
+    def test_busy_files_do_not_use_up_the_read_budget_for_older_sessions(self):
+        old = self.claude_session("finished")
+        os.utime(old, (100, 100))
+        self.claude_session("active")
+        importer = self.importer(max_files=1)
+        stats, batches = self.run_once(importer, busy_since=lambda: 200)
+        self.assertEqual((stats["read"], stats["deferred"]), (1, 1))
+        self.assertEqual(batches[0][0]["session_key"], ls.session_key("claude", "finished"))
+        stats, batches = self.run_once(importer)
+        self.assertEqual(stats["uploaded"], 1)
+        self.assertEqual(batches[0][0]["session_key"], ls.session_key("claude", "active"))
+
     def test_files_written_while_a_run_is_going_wait_for_it(self):
         self.claude_session("maybe-a-run")
         stats, sent = self.run_once(busy_since=lambda: time.time() - 60)
@@ -1140,6 +1152,9 @@ class DoctorLineTest(unittest.TestCase):
             self.assertIn("未开启", _local_sessions_line(home))
             runner_state.record(home, local_sessions="on")
             self.assertIn("已开启", _local_sessions_line(home))
+            runner_state.record(home, local_sessions_deferred=2)
+            self.assertIn("2 个会话文件", _local_sessions_line(home))
+            self.assertNotIn("还没有需要上传", _local_sessions_line(home))
             runner_state.record(home, local_sessions_uploaded_at=1793290701, local_sessions_uploaded=3)
             self.assertIn("3 段", _local_sessions_line(home))
             runner_state.record(home, local_sessions_failed="CloudError")

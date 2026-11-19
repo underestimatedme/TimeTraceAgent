@@ -1,7 +1,14 @@
+import io
+import json
+import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+from timetrace import cli
 from timetrace.checkpoints import (
     Checkpoint,
     ResumeInputs,
@@ -85,6 +92,36 @@ class CheckpointPersistenceTest(unittest.TestCase):
             self.assertEqual(len(db.list_checkpoints()), 1)
             db.delete_checkpoint("plan-1")
             self.assertIsNone(db.get_checkpoint("plan-1"))
+
+    def test_agent_sessions_lists_recent_checkpoints_without_transcript_or_paths(self):
+        def listing(*args):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(cli.main(["agent", "sessions", *args]), 0)
+            return out.getvalue()
+
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, TIMETRACE_HOME=d):
+            self.assertEqual(json.loads(listing("--json")), [])
+            self.assertIn("还没有保存", listing())
+            db = Database(Path(d) / "timetrace.db")
+            self.addCleanup(db.close)
+            plan = Checkpoint(plan_id="p", job_id="j", attempt_id="a", tool_profile_id="profile",
+                              provider_session_id="private-native-id", canonical_workspace="/private/work",
+                              git_head="h", dirty_paths_digest="d", last_output_offset=0, completed_criteria=[],
+                              side_effect_summary="private transcript", reason="waiting_quota", schema_version=1)
+            db.save_checkpoint(plan, now=1)
+            work = replace(plan, plan_id="work-session:w", job_id="j2", reason="work_session", provider="codex")
+            db.save_checkpoint(work, now=2)
+            result = listing("--json")
+            rows = json.loads(result)
+            self.assertEqual([r["id"] for r in rows], ["w", "p"])
+            self.assertEqual(rows[0], dict(kind="work_session", id="w", provider="codex", job_id="j2",
+                                           tool_profile_id="profile", reason="work_session"))
+            self.assertEqual(rows[1]["kind"], "plan")
+            self.assertNotIn("private", result)
+            self.assertIn("等待额度恢复", listing())
+            self.assertEqual(db.get_checkpoint("p"), plan)
+            self.assertEqual(db.get_checkpoint("work-session:w"), work)
 
     def test_checkpoint_row_carries_no_secrets(self):
         cp = Checkpoint(plan_id="p", job_id="j", attempt_id="a", tool_profile_id="claude-personal",

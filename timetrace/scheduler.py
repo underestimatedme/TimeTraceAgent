@@ -11,7 +11,7 @@ from timetrace import hooks, limits, prerequisites, worktree
 from timetrace.db import Database
 from timetrace.dispatch import (DispatchDenied, LockBusy, SlotLimits, ToolSlotBusy, acquire_job_slots, UnclearedOwner, adapter_dispatch_problem,
                            enforce_spawn_authority, spawn_authority)
-from timetrace.models import (BLOCKED, CLAUDE, DONE, EV_CIRCUIT_OPEN, EV_HOOK_REJECTED, EV_SAMPLE_FAILURE,
+from timetrace.models import (BLOCKED, DONE, EV_CIRCUIT_OPEN, EV_HOOK_REJECTED, EV_SAMPLE_FAILURE,
                          EV_TASK_BLOCKED, EV_TASK_DONE, EV_TASK_FAILED, EV_TASK_INTERRUPTED, EV_TASK_RESUMED,
                          EV_TASK_WAITING, EV_TOOL_SWITCHED, EV_WINDOW_RESET, FAILED, PENDING, RUNNABLE,
                          RUNNING, TOOLS, RunResult, Sample)
@@ -55,6 +55,7 @@ def run_once(
         return "circuit open"
     # 5/6. pick task and tool
     rows = limits.snapshot(db)
+    candidates = adapters.copy()
     withheld: List[str] = []
     for task in db.tasks_in_state(RUNNABLE):
         if stop is not None and stop.is_set():
@@ -66,20 +67,29 @@ def run_once(
         if held_back is not None:
             withheld.append(held_back)
             continue
-        tool = pick_tool(task, rows, adapters, db, now)
-        if tool is None:
-            continue
-        out = _dispatch(db, adapters[tool], tool, task, cfg, home, now, log,
-                        ensure_worktree, hook_runner, rng, clock, slots, stop)
-        if isinstance(out, _Withheld):  # the start-time check said no: nothing ran, go on with the queue
-            withheld.append(str(out))
-            continue
-        return out
+        while candidates:
+            tool = pick_tool(task, rows, candidates, db, now)
+            if tool is None:
+                break
+            out = _dispatch(db, candidates[tool], tool, task, cfg, home, now, log,
+                            ensure_worktree, hook_runner, rng, clock, slots, stop)
+            if isinstance(out, _Withheld):
+                withheld.append(str(out))
+                if isinstance(out, _BusyTool):
+                    # Try each busy provider only once per pass. pick_tool still enforces session affinity.
+                    del candidates[tool]
+                    continue
+                break
+            return out
     return "; ".join(withheld) if withheld else "idle"
 
 
 class _Withheld(str):
-    """A task was NOT started because the work before it has not passed (or can never pass). The text says why."""
+    """The task did not start. The queue can consider another runnable task."""
+
+
+class _BusyTool(_Withheld):
+    """The tool has no free slot in this pass."""
 
 
 def _advance_dependencies(db: Database, now: int) -> None:
@@ -199,10 +209,7 @@ def pick_tool(task: Dict[str, Any], rows: List[Dict[str, Any]], adapters: Dict[s
         return tool if tool in available and not limits.tool_exhausted(rows, tool, now) else None
     preferred = task.get("tool")
     if preferred is None:
-        preferred = _most_remaining(rows, available, now) or CLAUDE
-        if preferred not in available:
-            return None
-        return preferred
+        return _most_remaining(rows, available, now)
     if preferred not in available:
         return None
     if not limits.tool_exhausted(rows, preferred, now):
@@ -244,8 +251,11 @@ def _dispatch(db: Database, adapter: Any, tool: str, task: Dict[str, Any], cfg: 
     try:
         held = acquire_job_slots(home, tool, slots)
     except ToolSlotBusy as exc:
-        return ("task %d → deferred (tool busy: %s)" % (task["id"], exc.tool)
-                + ("; " + str(exc.cause) if isinstance(exc.cause, UnclearedOwner) else ""))
+        detail = "task %d → deferred (tool busy: %s)" % (task["id"], exc.tool)
+        if isinstance(exc.cause, UnclearedOwner):
+            detail += "; " + str(exc.cause)
+            log(str(exc.cause))
+        return _BusyTool(detail)
     except LockBusy as exc:
         return "task %d → deferred (runner busy)" % task["id"] + ("; " + str(exc) if isinstance(exc, UnclearedOwner) else "")
     try:
@@ -253,6 +263,8 @@ def _dispatch(db: Database, adapter: Any, tool: str, task: Dict[str, Any], cfg: 
         current = db.get_task(task["id"])
         if current is None or current["state"] != RUNNABLE:
             return "task %d → skipped (no longer runnable: %s)" % (task["id"], current["state"] if current else "deleted")
+        if _binding_changed(task, current):
+            return _Withheld("task %d → deferred (tool or session changed)" % task["id"])
         task = current
         # ...and only one whose explicit parent is DONE right now. This is the check that counts: it reads the rows
         # under the slot, so no candidate list, retry or runnable row written earlier can get past it.
@@ -422,6 +434,10 @@ def _stop_kwargs(stop: Optional[threading.Event], fn: Callable) -> Dict[str, Any
 _PREREQUISITE_DENIALS = ("dependency_missing", "dependencies_pending", "dependency_cycle", "task_removed")
 
 
+def _binding_changed(planned: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    return any(planned.get(key) != current.get(key) for key in ("tool", "session_id", "any_tool"))
+
+
 def _claim_start(db: Database, task: Dict[str, Any], tool: str, session_id: str, wt: str, branch: str,
                  now: int, logs_dir: Path) -> Any:
     """Turn a RUNNABLE `task` into a RUNNING one with its run row — or, when its explicit parent is not DONE any
@@ -440,6 +456,8 @@ def _claim_start(db: Database, task: Dict[str, Any], tool: str, session_id: str,
         if current is None or current["state"] != RUNNABLE:
             return _Withheld("task %d → skipped (no longer runnable: %s)" % (
                 task_id, current["state"] if current else "deleted"))
+        if _binding_changed(task, current):
+            return _Withheld("task %d → deferred (tool or session changed)" % task_id)
         held_back = _withhold_until_prerequisite(db, current, now, kept=(wt, branch))
         if held_back is not None:
             return _Withheld(held_back)
