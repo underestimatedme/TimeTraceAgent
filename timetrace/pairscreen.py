@@ -6,8 +6,13 @@
     │  2 分钟内有效（剩余 1:45）                    │
     ╰───────────────────────────────────────────────╯
     <QR code, half blocks, 4-module quiet zone>
-    配对链接（扫不了码时复制到 iPhone 打开）：
-    timetrace://pair?...
+    配对链接（刻迹 App 内扫码，或粘贴到网页的配对框）：
+    timetrace://pair?...&v=2
+    配对码（在 App 或网页中手动输入）：ABCD1234
+    手机：打开 刻迹 → AI → 绑定电脑
+    网页：打开 TimeTrace → 设置 → 电脑与 Agent → 连接电脑
+
+(A link without v=2 keeps the older phone-only wording.)
 
 On a colour terminal the code is drawn black-on-white whatever the theme; the
 countdown line is rewritten in place (cursor up / down) without reprinting
@@ -25,6 +30,9 @@ RESET = "\x1b[0m"
 MAX_WIDTH = 78  # fits an 80-column terminal
 TITLE = "扫码绑定这台电脑"
 HINT = "打开 刻迹 → 我的电脑 → 绑定新电脑"
+# A v2 code is confirmed from the phone app or from the web workspace; the screen names both ways in.
+PHONE_ENTRY = "手机：打开 刻迹 → AI → 绑定电脑"
+WEB_ENTRY = "网页：打开 TimeTrace → 设置 → 电脑与 Agent → 连接电脑"
 
 
 def char_width(ch: str) -> int:
@@ -126,13 +134,23 @@ class PairScreen:
             self.countdown_row_text(remaining),
             "╰" + "─" * (self.inner + 2) + "╯",
         ]
-        footer = [
-            "",
-            "配对链接（用于刻迹 App 内扫码）：" if phone_pair else "配对链接（扫不了码时复制到 iPhone 打开）：",
-            self.link,
-            "或在 App 中手动输入授权码：%s" % self.user_code,
-            "打开 刻迹 → AI → 绑定电脑" if phone_pair else HINT,
-        ]
+        if phone_pair:
+            footer = [
+                "",
+                "配对链接（刻迹 App 内扫码，或粘贴到网页的配对框）：",
+                self.link,
+                "配对码（在 App 或网页中手动输入）：%s" % self.user_code,
+                PHONE_ENTRY,
+                WEB_ENTRY,
+            ]
+        else:
+            footer = [
+                "",
+                "配对链接（扫不了码时复制到 iPhone 打开）：",
+                self.link,
+                "或在 App 中手动输入授权码：%s" % self.user_code,
+                HINT,
+            ]
         return header + self.qr + footer
 
     def rows_below_countdown(self) -> int:

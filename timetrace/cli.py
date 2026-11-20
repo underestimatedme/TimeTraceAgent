@@ -200,7 +200,7 @@ def pair_computer(cfg: Dict[str, Any], db: Database, home: Path, out=print, max_
                                        colours=pairscreen.black_on_white())
         for line in screen.lines():
             out(line)
-        out("手机核对电脑后会显示 4 位数字，请回到这里输入。")
+        out("在手机或网页上核对电脑后会显示 4 位数字，请回到这里输入。")
         tick = None
         if out is print and _live_countdown(screen):
             def tick(remaining, screen=screen):
@@ -241,13 +241,13 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
                 phone_window = True
             if digits is None:
                 try:
-                    answer = (input_fn or input)("输入手机上显示的 4 位数字（5 分钟内有效，最多错 3 次）：")
+                    answer = (input_fn or input)("输入手机或网页上显示的 4 位数字（5 分钟内有效，最多错 3 次）：")
                     if answer is None:
-                        out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                        out("尚未完成绑定；请在手机或网页取消，或等待验证码过期。")
                         return 1
                     digits = answer.strip()
                 except (EOFError, KeyboardInterrupt):
-                    out("尚未完成绑定；请在手机取消，或等待验证码过期。")
+                    out("尚未完成绑定；请在手机或网页取消，或等待验证码过期。")
                     return 1
             try:
                 credentials = cloud.activate_phone(auth["device_code"], digits)
@@ -1423,7 +1423,7 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
                 result = 2
     out()
 
-    out("3/4 与手机绑定")
+    out("3/4 绑定这台电脑（手机或网页）")
     try:
         existing = CredentialStore().load()
     except Exception:
@@ -1436,7 +1436,7 @@ def run_setup(args: argparse.Namespace, input_fn=input, print_fn=print) -> int:
             answer = ask("  重新绑定这台电脑？ [y/N] ")
             do_pair = bool(answer) and answer.lower() in ("y", "yes", "是")
     else:
-        do_pair = confirm("  现在用手机扫码绑定？", args.no_pair)
+        do_pair = confirm("  现在绑定这台电脑（手机扫码或网页配对）？", args.no_pair)
     if do_pair:
         try:
             code = pair_computer(cfg, db, home, out=out, input_fn=ask)

@@ -11,7 +11,7 @@
 
 ## 1. 在 Mac 安装 Agent
 
-新绑定最低要求 0.5.1，推荐使用最新版本（当前为 [0.6.2](releases/0.6.2.md)）。
+新绑定最低要求 0.5.1，推荐使用最新版本（当前为 [0.6.13](releases/0.6.13.md)）。
 
 **首次安装**推荐用 Homebrew：
 
@@ -26,7 +26,7 @@ tta setup
 也可以用 pipx 从发布 tag 安装，需要 Python 3.9 或更新版本和 Git：
 
 ```sh
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.2"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.13"
 tta --version
 tta setup
 ```
@@ -45,6 +45,8 @@ tta setup
 4. 回到手机 AI 页，确认电脑在线、至少一个 AI 终端可用。
 
 码过期或连续输错后请在电脑重新取码，不要把配对码发给别人。
+
+不用手机也可以从网页绑定：登录 TimeTrace 网页，打开 **设置 → 电脑与 Agent → 连接电脑**，粘贴终端显示的配对链接或 8 位配对码，核对电脑名称后确认，再把网页显示的 4 位数字输入电脑终端。
 
 ## 3. 一句话开始第一个任务
 

@@ -13,8 +13,24 @@ class PhonePairingTest(unittest.TestCase):
     def test_v2_guidance_matches_native_ai_entry_and_does_not_promise_url_open(self):
         from timetrace.pairscreen import PairScreen
         lines=PairScreen('timetrace://pair?code=ABCD1234&v=2','样例电脑','ABCD1234',300).lines()
-        self.assertEqual(lines[-1], '打开 刻迹 → AI → 绑定电脑')
-        self.assertEqual(lines[-4], '配对链接（用于刻迹 App 内扫码）：')
+        self.assertEqual(lines[-2], '手机：打开 刻迹 → AI → 绑定电脑')
+        self.assertEqual(lines[-5], '配对链接（刻迹 App 内扫码，或粘贴到网页的配对框）：')
+        self.assertFalse(any('iPhone 打开' in line for line in lines))
+
+    def test_v2_screen_also_tells_someone_pairing_from_the_web_where_to_go_and_what_to_paste(self):
+        from timetrace.pairscreen import PairScreen
+        screen=PairScreen('timetrace://pair?code=ABCD1234&v=2','样例电脑','ABCD1234',300)
+        lines=screen.lines()
+        self.assertEqual(lines[-1], '网页：打开 TimeTrace → 设置 → 电脑与 Agent → 连接电脑')
+        self.assertEqual(lines[-3], '配对码（在 App 或网页中手动输入）：ABCD1234')
+        self.assertEqual(lines[-4], 'timetrace://pair?code=ABCD1234&v=2')
+        # The countdown is rewritten in place from the line after the screen: the extra line is counted.
+        self.assertEqual(screen.rows_below_countdown(), len(lines)-3)
+        self.assertIn('\x1b[%dA' % (len(lines)-3), screen.update_sequence(60))
+        # A v1 link is only ever confirmed from the phone: its wording stays as it was.
+        old=PairScreen('timetrace://pair?code=ABCD1234','样例电脑','ABCD1234',300).lines()
+        self.assertEqual(old[-1], '打开 刻迹 → 我的电脑 → 绑定新电脑')
+        self.assertFalse(any('网页' in line for line in old))
 
     def test_phone_digits_are_entered_on_computer_and_retried_unchanged(self):
         seen=[]
@@ -40,6 +56,8 @@ class PhonePairingTest(unittest.TestCase):
         self.assertEqual(result,0)
         self.assertEqual(seen,['0000','0000'])
         self.assertEqual(len(questions),1)
+        # The 4 digits are shown wherever the computer was confirmed: the phone app or the web workspace.
+        self.assertEqual(questions[0], "输入手机或网页上显示的 4 位数字（5 分钟内有效，最多错 3 次）：")
         self.assertEqual(len(saved),1)
 
     def test_failure_to_revoke_retains_persisted_credentials(self):
