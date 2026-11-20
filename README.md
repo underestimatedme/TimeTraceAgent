@@ -91,7 +91,7 @@ timetrace agent install
 timetrace agent doctor
 ```
 
-首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.3"`；不要混用两套后台服务。
+首次安装用 `brew install underestimatedme/timetrace/timetraceagent`，再运行 `timetrace setup`。如果通过 pipx 安装，使用 `pipx install --force "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.13"`；不要混用两套后台服务。
 
 长来源日志在独立复核副本中提供脱敏分段和哈希；摘要明确未展示范围，缺失证据不能推定通过。Python 基础模板只检查语法，不执行脚本，也不声称功能测试已通过。
 
@@ -123,7 +123,7 @@ AI 步骤可以把文件作为交付物：在 `.timetrace/out/result.json` 里�
 
 ```sh
 brew install underestimatedme/timetrace/timetraceagent
-tta setup                          # 检查工具 → 登记仓库 → 扫码绑定手机 → 安装后台 Runner
+tta setup                          # 检查工具 → 登记仓库 → 绑定这台电脑（手机或网页） → 安装后台 Runner
 ```
 
 ## 手机远程派发（Valley Runner）
@@ -131,7 +131,7 @@ tta setup                          # 检查工具 → 登记仓库 → 扫码绑
 Claude/Codex 的登录凭据不会上传：iPhone 只把任务发给 Valley，本机 `timetrace agent` 通过出站 HTTPS 领取任务，再调用当前 macOS 用户已经登录的 CLI。
 
 ```sh
-timetrace cloud login                    # 终端显示二维码，在刻迹「我的电脑 → 绑定新电脑」扫描后确认
+timetrace cloud login                    # 终端显示二维码和配对码：刻迹 App「AI → 绑定电脑」扫描，或网页「设置 → 电脑与 Agent → 连接电脑」粘贴，核对后确认
 timetrace workspace add ~/code/TimeTrace # 只显式开放这个仓库
 timetrace agent doctor                   # 检查配对、CLI 和工作区
 timetrace agent sessions                 # 按最近更新时间列出本机保存的会话、任务、工具和保存原因
@@ -140,7 +140,7 @@ timetrace agent run --once               # 联调一轮
 timetrace agent install                  # 安装并启动登录用户的 LaunchAgent
 ```
 
-`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=2`：包含本次配对码与电脑展示信息，不包含长期凭据。手机核对电脑后显示 4 位数字，需在电脑输入并完成服务端确认才会生效。配对码也应保密。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在「我的电脑 → 绑定新电脑」里手动输入 8 位码。
+`timetrace cloud login` 打印的二维码内容是 `timetrace://pair?code=<8 位码>&name=<电脑名>&platform=darwin&v=2`：包含本次配对码与电脑展示信息，不包含长期凭据。在手机或网页上核对电脑后会显示 4 位数字，需在电脑输入并完成服务端确认才会生效。从网页绑定时，在 TimeTrace「设置 → 电脑与 Agent → 连接电脑」里粘贴二维码下方的配对链接或 8 位配对码。配对码也应保密。也可以用系统相机扫描（会打开刻迹 App）；扫不了码时，复制二维码下方的配对链接在 iPhone 上打开，或在 App「AI → 绑定电脑」里手动输入 8 位码。
 
 二维码用半块字符绘制（两行模块占一行文字，约 49×25 字符，80 列终端放得下），四周留 4 个模块的静区。彩色终端里强制白底黑码，与终端主题无关；设置了 `NO_COLOR`、`TERM=dumb` 或输出不是终端时改为不带颜色的反相字符（适合深色背景的终端）。上方框内的「2 分钟内有效（剩余 1:45）」每秒原地刷新，不会重印二维码；过期后自动换新码，最多 5 轮。一个账号可以绑定多台电脑，在手机「设备与授权」里重命名或解绑。
 
@@ -205,7 +205,7 @@ timetrace workspace check remove TimeTrace build
 
 0.5.2 包含只读开发状态采集、Git 读取失败时的正确报告，以及多电脑时间偏差导致事件回执失败的修复。先部署包含 `server_now` 的 Valley 服务端，再升级 Agent。旧服务端缺少该字段时仍使用本地时间；已持久化的事件保持原时间戳，系统时钟仍应同步。
 
-此版本正在准备发布；下面的安装命令仍指向已发布的 0.5.1。发布和 Homebrew 更新完成后再切换安装指引。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
+0.5.2 已发布，下面的安装命令安装的是当前版本。升级不要求重新绑定电脑。详情见 [0.5.2 发布清单](docs/releases/0.5.2.md)。
 
 ## 安装
 
@@ -216,7 +216,7 @@ timetrace workspace check remove TimeTrace build
 brew install underestimatedme/timetrace/timetraceagent
 
 # 2) pipx：直接从 GitHub 的发布 tag 安装；升级时把 tag 换成新版本再加 --force
-pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.3"
+pipx install "git+https://github.com/underestimatedme/TimeTraceAgent.git@v0.6.13"
 
 # 3) 从源码运行：把启动脚本软链到 PATH 里（改代码立即生效）
 git clone https://github.com/underestimatedme/TimeTraceAgent.git && cd TimeTraceAgent
@@ -236,7 +236,7 @@ tta --version
 
 1. 检查 `claude` / `codex` 是否安装、是否通过零付费核验（同 `timetrace agent doctor`）；
 2. 登记允许远程任务使用的 Git 仓库（同 `timetrace workspace add`，可登记多个，回车结束）；
-3. 与手机绑定：终端显示二维码，用 App「你的 AI → 扫码绑定」扫描（同 `timetrace cloud login`）；
+3. 绑定这台电脑：终端显示二维码和配对码，用刻迹 App「AI → 绑定电脑」扫描，或在网页「设置 → 电脑与 Agent → 连接电脑」粘贴配对码（同 `timetrace cloud login`）；
 4. 安装并启动后台 Runner LaunchAgent（同 `timetrace agent install`），找到 `claude` 时再问一次是否安装 Claude Code 状态栏钩子（默认是）。
 
 脚本化安装可以用参数代替提问：
