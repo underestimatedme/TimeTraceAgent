@@ -257,7 +257,7 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
         nonlocal limited
         wait = max(interval, exc.retry_after or 0)
         if not limited:
-            out("服务端限流，约 %d 秒后继续；配对码不变，无需重新扫码或重新输入。" % wait)
+            out("服务端限流，约 %d 秒后继续；配对码不变，无需重新扫码。" % wait)
         limited = True
         _pair_pause(wait, deadline, tick)
 

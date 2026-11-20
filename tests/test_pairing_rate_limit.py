@@ -264,6 +264,8 @@ class PairingRateLimitTest(unittest.TestCase):
         self.assertTrue(any("数字不正确" in line for line in self.out), self.out)
         self.assertTrue(any("限流" in line and "30 秒" in line for line in self.out), self.out)
         self.assertIn("剩余 3 次。", self.out, "told once the status could be read")
+        self.assertFalse(any("无需" in line and "输入" in line for line in self.out),
+                         "the digits do have to be typed again here")
 
     def test_wrong_digits_then_limited_then_locked_ends_the_pairing(self):
         result = self.pair({
