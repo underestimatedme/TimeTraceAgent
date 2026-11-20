@@ -223,16 +223,58 @@ def _pair_server_time(value):
     return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
 
 
+def _pair_pause(seconds, deadline, tick) -> None:
+    """Wait `seconds`, a second at a time, but never past the code's own expiry."""
+    end = min(deadline, time.time() + seconds)
+    while True:
+        # Read the clock once per turn: a second look could land past `end`
+        # and hand sleep() a negative time.
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        if tick is not None:
+            tick(max(0.0, deadline - end + remaining))
+        time.sleep(min(1.0, remaining))
+
+
 def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) -> Optional[int]:
     """Poll one authorization. Returns 0 once bound, None when it expired.
-    `tick(remaining_seconds)` is called every second between polls."""
+    `tick(remaining_seconds)` is called every second between polls.
+
+    A 429 from Valley is not a refusal of the pairing: the same device code (and
+    the digits already typed) are kept, the next request waits what Retry-After
+    asked (never less than the polling interval), and the code's expiry is not
+    extended. If the server is still limiting when the code expires, pairing
+    stops with 1 rather than asking a limited server for a new code."""
     deadline = time.time() + int(auth["expires_in"])
     interval = max(1, int(auth.get("interval") or 5))
     digits = None
     phone_window = False
+    limited = False
+    attempts_due = False  # wrong digits whose remaining count could not be read yet
+
+    def rate_limited(exc) -> None:
+        nonlocal limited
+        wait = max(interval, exc.retry_after or 0)
+        if not limited:
+            out("服务端限流，约 %d 秒后继续；配对码不变，无需重新扫码。" % wait)
+        limited = True
+        _pair_pause(wait, deadline, tick)
+
     while time.time() < deadline:
-        approval = cloud.poll_device_authorization(auth["device_code"])
+        try:
+            approval = cloud.poll_device_authorization(auth["device_code"])
+        except CloudError as exc:
+            if exc.status != 429:
+                raise
+            rate_limited(exc)
+            continue
+        limited = False
         status = approval.get("status")
+        if attempts_due:
+            attempts_due = False
+            if status == "waiting_phone" and "attempts_remaining" in approval:
+                out("剩余 %s 次。" % approval["attempts_remaining"])
         if status in ("waiting_phone", "activated") and auth.get("pairing_version") == 2:
             if not phone_window and approval.get("server_now") and approval.get("expires_at"):
                 start = _pair_server_time(approval["server_now"])
@@ -255,7 +297,17 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
             except CloudError as exc:
                 if exc.status == 401:
                     digits = None
-                    current = cloud.poll_device_authorization(auth["device_code"])
+                    try:
+                        current = cloud.poll_device_authorization(auth["device_code"])
+                    except CloudError as poll_exc:
+                        if poll_exc.status != 429:
+                            raise
+                        # Same backoff as any other limited request; the poll
+                        # after the wait says how many attempts are left.
+                        out("数字不正确；剩余次数待限流结束后核对。")
+                        attempts_due = True
+                        rate_limited(poll_exc)
+                        continue
                     out("数字不正确，剩余 %s 次。" % current.get("attempts_remaining", "未知"))
                     if current.get("status") == "locked":
                         out("已错 3 次，本次绑定已锁定；请重新运行绑定。")
@@ -268,6 +320,11 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
                 elif exc.status == 409:
                     out(str(exc) if exc.code == 40901 else "本次绑定已锁定或取消；请重新开始。")
                     return 1
+                elif exc.status == 429:
+                    # The gateway turned it away before the pairing handler: no
+                    # attempt was used. Same confirmation, same digits, later.
+                    rate_limited(exc)
+                    continue
                 elif exc.status and exc.status < 500:
                     raise
                 else:
@@ -291,6 +348,9 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
         for _ in range(interval):
             tick(max(0.0, deadline - time.time()))
             time.sleep(1)
+    if limited:
+        out("配对码已过期，服务端仍在限流，未能完成绑定；请稍后重新运行绑定。")
+        return 1
     return None
 
 

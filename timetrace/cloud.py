@@ -24,11 +24,23 @@ class CloudError(RuntimeError):
     """`code`: Valley's numeric envelope code. `reason`: a named refusal reason when Valley gave one (a non-numeric
     envelope code, or `code` / `reason_code` / `error_code` inside `data` or `details`), else ""."""
 
-    def __init__(self, message: str, status: int = 0, code: int = 0, reason: str = ""):
+    def __init__(self, message: str, status: int = 0, code: int = 0, reason: str = "",
+                 retry_after: Optional[int] = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.reason = reason
+        # Whole seconds a refusal asked the caller to wait (Retry-After), when it said so.
+        self.retry_after = retry_after
+
+
+def _retry_after(headers) -> Optional[int]:
+    """Valley sends Retry-After as whole seconds; an HTTP date or nonsense is ignored."""
+    try:
+        seconds = int(str(headers.get("Retry-After", "")).strip())
+    except (AttributeError, ValueError):
+        return None
+    return min(seconds, 3600) if seconds >= 0 else None
 
 
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
@@ -131,23 +143,26 @@ class CloudClient:
             try:
                 with self.opener(request, timeout=timeout or self.timeout) as response:
                     status, raw = response.status, read_bounded(response)
+                    wait = None
             except urllib.error.HTTPError as exc:
-                status, raw = exc.code, read_bounded(exc)
+                status, raw, wait = exc.code, read_bounded(exc), _retry_after(exc.headers)
         except ValueError as exc:
             raise CloudError("oversized Valley response") from exc
         if status == 204:
             return None
         if 300 <= status < 400:
             raise CloudError("Valley redirect refused", status=status)
+        # A refusal that is not Valley's envelope (a proxy's 429 page) still
+        # carries the wait its headers asked for.
         try:
             envelope = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise CloudError("invalid Valley response", status=status) from exc
+            raise CloudError("invalid Valley response", status=status, retry_after=wait) from exc
         if not isinstance(envelope, dict):
-            raise CloudError("invalid Valley response", status=status)
+            raise CloudError("invalid Valley response", status=status, retry_after=wait)
         if status >= 400 or envelope.get("code") != 0:
             raise CloudError(str(envelope.get("message") or "Valley request failed")[:300], status,
-                             _int(envelope.get("code")), _reason(envelope))
+                             _int(envelope.get("code")), _reason(envelope), retry_after=wait)
         return envelope.get("data")
 
     def upload_job_file(self, token: str, job_id: str, name: str, data: bytes) -> Dict[str, Any]:
