@@ -36,6 +36,11 @@ def limited(retry_after=None):
     return 429, {"code": 40000, "message": "rate limited"}, headers
 
 
+def limited_raw(body, retry_after):
+    """A 429 whose body is not Valley's envelope (a proxy's page, a bare list)."""
+    return 429, body, {"Retry-After": str(retry_after)}
+
+
 def refused(status, message, code=None):
     return status, {"code": code or status * 100, "message": message}, {}
 
@@ -56,7 +61,7 @@ class FakeValley:
                 fake.requests.append((fake.clock[0], path, body))
                 answers = fake.script[path]
                 status, envelope, headers = answers.pop(0) if len(answers) > 1 else answers[0]
-                raw = json.dumps(envelope).encode("utf-8")
+                raw = envelope if isinstance(envelope, bytes) else json.dumps(envelope).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
@@ -132,6 +137,45 @@ class PairingRateLimitTest(unittest.TestCase):
         self.assertEqual(seen, [7, None, None])
         self.assertEqual(client.poll_device_authorization("qa-device"), {"status": "pending"})
 
+    def test_client_keeps_retry_after_when_the_rate_limited_body_is_not_an_envelope(self):
+        bodies = [b"<html>429 Too Many Requests</html>", b"[]", b"\xff\xfe"]
+        valley = FakeValley({POLL: [limited_raw(body, 11) for body in bodies] + [ok({})]}, [0.0])
+        self.addCleanup(valley.close)
+        client = CloudClient(valley.url)
+        for _ in bodies:
+            with self.assertRaises(CloudError) as raised:
+                client.poll_device_authorization("qa-device")
+            self.assertEqual((raised.exception.status, raised.exception.retry_after), (429, 11))
+
+    def test_a_rate_limit_without_an_envelope_is_waited_out_like_any_other(self):
+        result = self.pair({
+            POLL: [limited_raw(b"<html>429 Too Many Requests</html>", 8), ok(WAITING_PHONE)],
+            ACTIVATE: [limited_raw(b"[]", 6), ok(CREDENTIALS)],
+        })
+        self.assertEqual(result, 0)
+        self.assertEqual(self.valley.at(POLL), [0, 8, 14])
+        self.assertEqual(self.valley.at(ACTIVATE), [8, 14])
+        self.assertEqual(self.device_codes(), {"qa-device"})
+
+    def test_pause_never_sleeps_a_negative_time_when_the_clock_passes_its_end(self):
+        # Every look at the clock costs 0.6 s, so the end is crossed between two looks.
+        now, slept, ticks = [0.0], [], []
+
+        def look():
+            now[0] += 0.6
+            return now[0] - 0.6
+
+        def sleep(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+
+        with patch("timetrace.cli.time.time", side_effect=look), \
+             patch("timetrace.cli.time.sleep", side_effect=sleep):
+            cli._pair_pause(1, 100.0, ticks.append)
+            cli._pair_pause(5, 0.0, None)  # already past the code's expiry
+        self.assertTrue(slept and all(0 <= seconds <= 1 for seconds in slept), slept)
+        self.assertTrue(all(remaining >= 0 for remaining in ticks), ticks)
+
     def test_waiting_then_rate_limited_then_confirmed_keeps_the_same_device_code(self):
         result = self.pair({
             POLL: [ok({"status": "pending"}), limited(7), ok(WAITING_PHONE)],
@@ -205,14 +249,31 @@ class PairingRateLimitTest(unittest.TestCase):
         self.assertEqual(self.valley.at(ACTIVATE), [0, 5])
         self.assertEqual(self.saved, [])
 
-    def test_wrong_digits_while_the_status_read_is_limited_asks_again_without_crashing(self):
+    def test_wrong_digits_then_a_limited_status_read_waits_its_retry_after(self):
         result = self.pair({
-            POLL: [ok(WAITING_PHONE), limited(3), ok(WAITING_PHONE)],
+            POLL: [ok(WAITING_PHONE), limited(30), ok(WAITING_PHONE)],
             ACTIVATE: [refused(401, "数字不正确"), ok(CREDENTIALS)],
         })
         self.assertEqual(result, 0)
+        # The status read right after the wrong digits is the limited one: the
+        # next request waits its 30 s, not the 5 s polling interval.
+        self.assertEqual(self.valley.at(POLL), [0, 0, 30])
+        self.assertEqual(self.valley.at(ACTIVATE), [0, 30])
         self.assertEqual(len(self.asked), 2)
         self.assertEqual(self.device_codes(), {"qa-device"})
+        self.assertTrue(any("数字不正确" in line for line in self.out), self.out)
+        self.assertTrue(any("限流" in line and "30 秒" in line for line in self.out), self.out)
+        self.assertIn("剩余 3 次。", self.out, "told once the status could be read")
+
+    def test_wrong_digits_then_limited_then_locked_ends_the_pairing(self):
+        result = self.pair({
+            POLL: [ok(WAITING_PHONE), limited(10), ok({"status": "locked"})],
+            ACTIVATE: [refused(401, "数字不正确")],
+        })
+        self.assertEqual(result, 1)
+        self.assertEqual(self.valley.at(POLL), [0, 0, 10])
+        self.assertEqual(self.valley.at(ACTIVATE), [0])
+        self.assertEqual(self.saved, [])
 
     def test_expiry_without_a_rate_limit_still_asks_for_a_new_code(self):
         self.assertIsNone(self.pair({POLL: [ok({"status": "pending"})]}, expires_in=12))

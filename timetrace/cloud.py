@@ -152,12 +152,14 @@ class CloudClient:
             return None
         if 300 <= status < 400:
             raise CloudError("Valley redirect refused", status=status)
+        # A refusal that is not Valley's envelope (a proxy's 429 page) still
+        # carries the wait its headers asked for.
         try:
             envelope = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise CloudError("invalid Valley response", status=status) from exc
+            raise CloudError("invalid Valley response", status=status, retry_after=wait) from exc
         if not isinstance(envelope, dict):
-            raise CloudError("invalid Valley response", status=status)
+            raise CloudError("invalid Valley response", status=status, retry_after=wait)
         if status >= 400 or envelope.get("code") != 0:
             raise CloudError(str(envelope.get("message") or "Valley request failed")[:300], status,
                              _int(envelope.get("code")), _reason(envelope), retry_after=wait)

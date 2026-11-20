@@ -226,10 +226,15 @@ def _pair_server_time(value):
 def _pair_pause(seconds, deadline, tick) -> None:
     """Wait `seconds`, a second at a time, but never past the code's own expiry."""
     end = min(deadline, time.time() + seconds)
-    while time.time() < end:
+    while True:
+        # Read the clock once per turn: a second look could land past `end`
+        # and hand sleep() a negative time.
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
         if tick is not None:
-            tick(max(0.0, deadline - time.time()))
-        time.sleep(min(1.0, end - time.time()))
+            tick(max(0.0, deadline - end + remaining))
+        time.sleep(min(1.0, remaining))
 
 
 def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) -> Optional[int]:
@@ -246,6 +251,7 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
     digits = None
     phone_window = False
     limited = False
+    attempts_due = False  # wrong digits whose remaining count could not be read yet
 
     def rate_limited(exc) -> None:
         nonlocal limited
@@ -265,6 +271,10 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
             continue
         limited = False
         status = approval.get("status")
+        if attempts_due:
+            attempts_due = False
+            if status == "waiting_phone" and "attempts_remaining" in approval:
+                out("剩余 %s 次。" % approval["attempts_remaining"])
         if status in ("waiting_phone", "activated") and auth.get("pairing_version") == 2:
             if not phone_window and approval.get("server_now") and approval.get("expires_at"):
                 start = _pair_server_time(approval["server_now"])
@@ -292,7 +302,12 @@ def _await_pairing(cloud, auth, cfg, db, home, out, tick=None, input_fn=None) ->
                     except CloudError as poll_exc:
                         if poll_exc.status != 429:
                             raise
-                        current = {}  # the next poll of the loop tells
+                        # Same backoff as any other limited request; the poll
+                        # after the wait says how many attempts are left.
+                        out("数字不正确；剩余次数待限流结束后核对。")
+                        attempts_due = True
+                        rate_limited(poll_exc)
+                        continue
                     out("数字不正确，剩余 %s 次。" % current.get("attempts_remaining", "未知"))
                     if current.get("status") == "locked":
                         out("已错 3 次，本次绑定已锁定；请重新运行绑定。")
