@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
+from timetrace import questions
+
 MAX_RESPONSE_BYTES = 1024 * 1024
 LOOPBACK_HOSTS = ("localhost",)
 
@@ -206,7 +208,8 @@ class CloudClient:
                          extras: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """`extras`: the protocol-2 fields (protocol_version, agent_version,
         accepting_local, health, reset_credits)."""
-        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1, "planning_version": 1, "operations_version": 1}
+        body = {"workspaces": workspaces, "tools": tools, "workflow_inputs_version": 1, "project_directories_version": 1, "planning_version": 1, "operations_version": 1,
+                "questions_version": questions.VERSION}
         if self.device_id:
             body["device_id"] = self.device_id
         for key in ("protocol_version", "agent_version", "accepting_local", "health", "reset_credits", "config_version", "workspace_candidates", "config_receipt"):

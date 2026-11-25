@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from timetrace import approvals, audit
+from timetrace import approvals, audit, questions
 
 APPROVAL_TIMEOUT_SECONDS = 600
 # What the AI is told (spec §4).
@@ -328,21 +328,34 @@ class RunControl:
         root = self.root
         if not root:
             return {"behavior": "deny", "message": NO_PHONE_DENY}
-        verdict = approvals.evaluate(tool, tool_input, root, home=self.user_home)
-        summary = approvals.summary(tool, tool_input)
-        if verdict.action == approvals.DENY:
-            audit.record(self.home, "approval", job_id=self.job_id, tool=tool, decision="deny", source="local",
-                         reason=verdict.reason, summary=summary)
-            return {"behavior": "deny", "message": approvals.DENY_PREFIX + verdict.reason}
-        if verdict.action == approvals.ALLOW and not request.get("require_phone"):
-            return {"behavior": "allow"}
-        key = None if self.turn_id else approvals.remember_key(tool, tool_input)
-        with self._cond:
-            remembered = key is not None and key in self._remembered
-        if remembered:
-            audit.record(self.home, "approval", job_id=self.job_id, tool=tool, decision="allow", source="remembered",
-                         summary=summary)
-            return {"behavior": "allow"}
+        # An AI question (AskUserQuestion) is always the person's to answer: no local rule or remembered approval
+        # settles it, and it travels as its questions (questions.py).
+        asked = None
+        if tool == questions.TOOL:
+            asked = questions.parse(tool_input)
+            if asked is None:
+                return {"behavior": "deny", "message": questions.INVALID_DENY}
+            wire = questions.wire_input(asked, approvals.INPUT_BYTES)
+            if wire is None:
+                return {"behavior": "deny", "message": questions.TOO_LONG_DENY}
+            summary, key = questions.summary(asked), None
+        else:
+            verdict = approvals.evaluate(tool, tool_input, root, home=self.user_home)
+            summary = approvals.summary(tool, tool_input)
+            if verdict.action == approvals.DENY:
+                audit.record(self.home, "approval", job_id=self.job_id, tool=tool, decision="deny", source="local",
+                             reason=verdict.reason, summary=summary)
+                return {"behavior": "deny", "message": approvals.DENY_PREFIX + verdict.reason}
+            if verdict.action == approvals.ALLOW and not request.get("require_phone"):
+                return {"behavior": "allow"}
+            key = None if self.turn_id else approvals.remember_key(tool, tool_input)
+            with self._cond:
+                remembered = key is not None and key in self._remembered
+            if remembered:
+                audit.record(self.home, "approval", job_id=self.job_id, tool=tool, decision="allow", source="remembered",
+                             summary=summary)
+                return {"behavior": "allow"}
+            wire = approvals.safe_input(tool_input)
         if not self.approvals_enabled:
             return {"behavior": "deny", "message": NO_PHONE_DENY}
         request_id = "perm-" + uuid.uuid4().hex[:24]
@@ -351,7 +364,7 @@ class RunControl:
                 return {"behavior": "deny", "message": NO_PHONE_DENY}
             self._pending[request_id] = {"tool": tool, "key": key}
             self._emit({"type": "approval_requested", "request_id": request_id, "tool": tool, "summary": summary,
-                        "input": approvals.safe_input(tool_input), "message": summary})
+                        "input": wire, "message": summary})
             deadline = self.clock() + self.approval_timeout
             while True:
                 if cancelled.is_set() or self._closed or self.cancel_event.is_set():
@@ -369,15 +382,26 @@ class RunControl:
                 self._cond.wait(min(left, .25))
             expired = decision.get("reason") == "expired"
             approved = decision.get("decision") == "approve" and not expired
+            # Approving a question is answering it; without a valid answer it is not approved.
+            unanswered = asked is not None and approved and not questions.valid_answers(asked, decision.get("answers"))
+            if unanswered:
+                approved = False
             remember = approved and decision.get("remember") is True and key is not None
             if remember:
                 self._remembered.add(key)
             outcome = "approved" if approved else ("expired" if expired else "denied")
             if respond is None:
                 self._resolve(request_id, outcome)
-        response = {"behavior": "allow"} if approved else {
-            "behavior": "deny", "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000],
-        }
+        if approved:
+            response = {"behavior": "allow"}
+            if asked is not None:
+                # The provider side rebuilds Claude's own input with these positions (questions.updated_input).
+                response["answers"] = [list(chosen) for chosen in decision.get("answers")]
+        elif asked is not None and not expired:
+            response = {"behavior": "deny", "message": questions.NO_ANSWER_DENY}
+        else:
+            response = {"behavior": "deny",
+                        "message": TIMEOUT_DENY if expired else str(decision.get("reason") or USER_DENY)[:2000]}
         if respond is not None:
             def approval_open():
                 return self.clock() < deadline
