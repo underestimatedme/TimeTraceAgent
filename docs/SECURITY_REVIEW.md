@@ -773,6 +773,21 @@ only), so a release run can reach `*.apple.com` without opening everything.
   and SSH) and `example.com` are refused. With real `codex exec` runs, start and resume: the same network results, the
   commit, and a read-only App Store Connect query by a script in the repository, with no key in the run's log.
 
+## Addendum 2026-11-25: AI questions (`AskUserQuestion`, questions_version 1)
+
+Claude's own `AskUserQuestion` tool reaches the host as a `can_use_tool` prompt (in every permission mode the runner
+uses, `bypassPermissions` included). It has no effect on the computer: it only asks the person something.
+
+- It is never settled locally: no allow rule, no remembered approval, no `--allowedTools` entry answers it. It always goes
+  to the person as an `approval_requested` with tool `AskUserQuestion` and the questions as its input, redacted like any
+  other input; a question that would only fit cut is refused locally (a cut question cannot be answered faithfully).
+- The answer comes back as option positions. The runner rebuilds `updatedInput.answers` from Claude's original question
+  text and labels, so neither redaction nor anything the phone sends can put text of its own into Claude's input: only
+  labels Claude itself offered.
+- An approval without a valid answer is a refusal (`approval_resolved: denied`); deny and expiry behave as before. A
+  malformed question (not 1–4 distinct questions with 2–4 distinct, non-empty options) is refused with the reason.
+- Work-session chat turns and runs without a worktree still deny every prompt, questions included.
+
 ## Verification
 
 - Conversation import: `tests/test_import_parse.py`.
