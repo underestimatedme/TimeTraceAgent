@@ -173,7 +173,7 @@ class OutboxHealthPayloadTest(ReportFixture, unittest.TestCase):
         self.assertEqual(self.reads, 0)
         self.assertEqual(len(bodies), 1, "an unchanged protocol-1 inventory is not repeated")
         self.assertEqual(set(bodies[0]), {"workspaces", "tools", "workflow_inputs_version", "project_directories_version",
-                                          "planning_version", "operations_version"})
+                                          "planning_version", "operations_version", "questions_version"})
 
 
 class OutboxHealthCadenceTest(ReportFixture, unittest.TestCase):

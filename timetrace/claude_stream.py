@@ -43,6 +43,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from timetrace import questions
 from timetrace.dispatch import enforce_spawn_authority
 from timetrace.redact import mask_structure, mask_timetrace_tokens
 from timetrace.remote_control import TIMEOUT_DENY
@@ -64,10 +65,18 @@ def user_message(text: str, message_uuid: Optional[str] = None) -> Dict[str, Any
 def permission_response(request_id: str, tool_use_id: Optional[str], decision: Dict[str, Any],
                         original_input: Any) -> Dict[str, Any]:
     """The control_response for one can_use_tool request. `decision` is
-    {"behavior": "allow"} or {"behavior": "deny", "message": …}."""
+    {"behavior": "allow"}, {"behavior": "allow", "answers": […]} (an
+    answered AskUserQuestion: option positions, rebuilt here into Claude's
+    own input, questions.py) or {"behavior": "deny", "message": …}."""
+    if decision.get("behavior") == "allow" and "answers" in decision:
+        answered = questions.updated_input(original_input, decision.get("answers"))
+        decision = ({"behavior": "allow", "updatedInput": answered} if answered is not None
+                    else {"behavior": "deny", "message": questions.NO_ANSWER_DENY})
     if decision.get("behavior") == "allow":
+        updated = decision.get("updatedInput")
         body = {"behavior": "allow",
-                "updatedInput": original_input if isinstance(original_input, dict) else {}}
+                "updatedInput": updated if isinstance(updated, dict)
+                else original_input if isinstance(original_input, dict) else {}}
     else:
         body = {"behavior": "deny", "message": str(decision.get("message") or "Permission denied.")}
     if tool_use_id:
