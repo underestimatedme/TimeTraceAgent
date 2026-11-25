@@ -57,6 +57,45 @@ class ShapeTest(unittest.TestCase):
         self.assertIsNone(questions.wire_input(questions.parse(long), 1000))
 
 
+class MaskedAgreementTest(unittest.TestCase):
+    """What the runner accepted on the masked copy is exactly what Claude gets from its original input."""
+
+    def test_a_label_masking_shortened_is_still_answered(self):
+        from timetrace.redact import mask_structure
+        original = {"questions": [{"question": "Which?", "header": "", "multiSelect": False,
+                                   "options": [{"label": "ttm_" + "a" * 210, "description": ""}, {"label": "no", "description": ""}]}]}
+        masked = mask_structure(original)
+        asked = questions.parse(masked)
+        self.assertIsNotNone(asked)
+        self.assertTrue(questions.valid_answers(asked, [[0]]))
+        rebuilt = questions.updated_input(original, [[0]])
+        self.assertEqual(rebuilt["answers"], {"Which?": "ttm_" + "a" * 210})
+        reply = permission_response("r1", "toolu_1", {"behavior": "allow", "answers": [[0]]}, original)["response"]["response"]
+        self.assertEqual(reply["behavior"], "allow")
+
+    def test_labels_that_masking_makes_alike_are_refused_before_asking(self):
+        from timetrace.redact import mask_structure
+        original = {"questions": [{"question": "Which?", "header": "", "multiSelect": False,
+                                   "options": [{"label": "ttm_" + "a" * 30, "description": ""}, {"label": "ttm_" + "b" * 30, "description": ""}]}]}
+        self.assertIsNone(questions.parse(mask_structure(original)))
+
+    def test_whatever_the_masked_copy_accepts_the_original_accepts(self):
+        from timetrace.redact import mask_structure
+        token = "ttm_" + "c" * 400
+        cases = [
+            {"questions": [{"question": token, "options": [{"label": "a"}, {"label": "b"}]}]},
+            {"questions": [{"question": "Q " + token, "multiSelect": True, "options": [{"label": token + "x"}, {"label": "b"}, {"label": " c "}]}]},
+            {"questions": [{"question": "A", "options": [{"label": "x"}, {"label": "y"}]}, {"question": "B", "options": [{"label": token}, {"label": "z"}]}]},
+        ]
+        for original in cases:
+            asked = questions.parse(mask_structure(original))
+            if asked is None:
+                continue
+            for picked in ([[0]] * len(asked), [[1]] * len(asked)):
+                with self.subTest(original=original, picked=picked):
+                    self.assertEqual(questions.valid_answers(asked, picked), questions.updated_input(original, picked) is not None)
+
+
 class RunControlQuestionTest(Base):
     def test_a_question_goes_to_the_person_and_their_pick_comes_back(self):
         box, thread, _ = self.ask_async({"tool_name": "AskUserQuestion", "input": ASK})

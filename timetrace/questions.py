@@ -35,9 +35,11 @@ TOO_LONG_DENY = "这个问题太长，无法转给用户。请缩短问题和选
 NO_ANSWER_DENY = "用户没有回答这个问题。不要替用户做选择；请说明需要用户决定什么，然后结束或换一种不需要这个回答的做法"
 
 
-def parse(tool_input: Any) -> Optional[List[Dict[str, Any]]]:
+def parse(tool_input: Any, limits: bool = True) -> Optional[List[Dict[str, Any]]]:
     """The questions of an AskUserQuestion input, or None when it is not a
-    question anybody can answer."""
+    question anybody can answer. `limits` bounds the text sent to the person;
+    rebuilding the answer from Claude's own input does not apply them (see
+    updated_input)."""
     if not isinstance(tool_input, dict):
         return None
     raw = tool_input.get("questions")
@@ -48,7 +50,7 @@ def parse(tool_input: Any) -> Optional[List[Dict[str, Any]]]:
         if not isinstance(q, dict):
             return None
         text = q.get("question")
-        if not isinstance(text, str) or not text.strip() or len(text.strip()) > TEXT_CHARS or text.strip() in asked:
+        if not isinstance(text, str) or not text.strip() or (limits and len(text.strip()) > TEXT_CHARS) or text.strip() in asked:
             return None
         asked.add(text.strip())
         options = q.get("options")
@@ -57,7 +59,7 @@ def parse(tool_input: Any) -> Optional[List[Dict[str, Any]]]:
         labels, seen = [], set()
         for o in options:
             label = o.get("label") if isinstance(o, dict) else None
-            if not isinstance(label, str) or not label.strip() or len(label.strip()) > LABEL_CHARS or label.strip() in seen:
+            if not isinstance(label, str) or not label.strip() or (limits and len(label.strip()) > LABEL_CHARS) or label.strip() in seen:
                 return None
             seen.add(label.strip())
             description = o.get("description") if isinstance(o.get("description"), str) else ""
@@ -110,8 +112,15 @@ def valid_answers(questions: List[Dict[str, Any]], picked: Any) -> bool:
 
 def updated_input(original: Any, picked: Any) -> Optional[Dict[str, Any]]:
     """Claude's own input with the answers filled in, built from its own
-    question text and labels; None when the answer does not fit it."""
-    questions = parse(original)
+    question text and labels; None when the answer does not fit it.
+
+    The runner checked the answer against the masked copy of this input it
+    was given (the same structure, every string masked). Masking only
+    replaces tokens, so whatever that copy passed — counts, non-empty and
+    distinct texts — the original passes too; the length limits, which only
+    bound what is sent to the person, are not applied here. An answer the
+    runner reported as approved is therefore always the answer Claude gets."""
+    questions = parse(original, limits=False)
     if questions is None or not valid_answers(questions, picked):
         return None
     answers = {q["question"]: ", ".join(q["options"][i]["label"] for i in chosen) for q, chosen in zip(questions, picked)}
