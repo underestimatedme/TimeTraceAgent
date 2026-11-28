@@ -487,6 +487,46 @@ class CliTest(unittest.TestCase):
         self.assertEqual(tasks[1]["any_tool"], 1)
         self.assertEqual(tasks[1]["repo"], os.path.abspath(str(self.repo)))
 
+    def test_doctor_asks_valley_whether_the_pairing_login_still_works(self):
+        import urllib.error
+        from timetrace.cloud import CloudError
+        deleted = []
+
+        class Store:
+            # Credentials in the Keychain: not proof that the login still works.
+            def load(self, account="default"):
+                return {"refresh_token": "dead", "runner": {"id": "r1", "name": "Mac"}}
+
+            def save(self, value):
+                pass
+
+            def delete(self, account="default"):
+                deleted.append(True)
+
+        for failure, line, paired in (
+                (CloudError("authentication required", 401, 40100),
+                 "配对: 登录已过期或已在手机上解绑 → 运行 timetrace cloud login 重新绑定", False),
+                (urllib.error.URLError("offline"),
+                 "配对: 已完成；这次没能连上服务器确认登录（URLError），不代表登录已过期", True),
+                (CloudError("登录暂时无法续期，请稍后重试", 503, 50300),
+                 "配对: 已完成；这次没能向服务器确认登录（HTTP 503），不代表登录已过期", True)):
+            class Cloud:
+                timeout = 30
+
+                def refresh(self, token, key):
+                    raise failure
+
+            with self.subTest(failure=failure), patch("timetrace.cli._adapters", return_value={}), \
+                 patch("timetrace.cli.CredentialStore", new=Store), patch("timetrace.cli._cloud", return_value=Cloud()), \
+                 patch("timetrace.cli._pairing_status", wraps=cli._pairing_status) as checked:
+                code, out, err = self.run_cli("agent", "doctor")
+                self.assertIn(line, out)
+                self.assertEqual(checked.call_count, 1)
+                self.assertEqual(code, 1)  # no workspaces either way; expired also counts as not paired
+                if not paired:
+                    self.assertNotIn("配对: 已完成", out)
+        self.assertEqual(deleted, [])
+
     def test_doctor_diagnoses_persistent_lock_without_clearing_it(self):
         path = self.home / "locks" / "coding-slot.lock"
         path.parent.mkdir(parents=True)

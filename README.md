@@ -316,6 +316,18 @@ launchctl kickstart -k gui/$(id -u)/com.atlaspaces.timetrace.agent   # 改配置
 
 ## 故障排查
 
+### 控制台显示电脑离线，但 Runner 在运行（电脑登录已过期）
+
+服务器拒绝续期时（电脑登录已过期，或已在手机上解绑），`daemon.log` 只写一次：
+
+```text
+电脑登录已过期或已在手机上解绑：服务器拒绝续期，暂停领取任务和上报。运行 timetrace cloud login 重新绑定；…
+```
+
+之后 Runner 不再每分钟报错：每分钟只检查钥匙串里有没有新的绑定，被拒的凭据最多每 5 分钟到 1 小时（逐次加倍）再向服务器确认一次。`timetrace agent doctor` 会向服务器确认一次，显示 `配对: 登录已过期或已在手机上解绑 → 运行 timetrace cloud login 重新绑定`；连不上服务器或服务器出错时只说明这次没能确认，不会判为过期。
+
+运行 `timetrace cloud login` 扫码并输入手机上的 4 位数字。本机凭据不会被删除，重新绑定沿用原来的电脑记录；运行中的 Runner 一分钟内自动用上新登录，日志写一行「电脑登录已恢复」，不需要重启。
+
 ### 手机上看不到 claude / codex（「工具未检测到」）
 
 launchd 启动 Runner 时不读你的 shell 配置，PATH 是固定的。通过 npm/nvm、Volta、bun、pnpm、mise、asdf 安装的

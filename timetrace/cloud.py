@@ -33,6 +33,18 @@ class CloudError(RuntimeError):
         self.reason = reason
 
 
+class LoginExpired(CloudError):
+    """Valley refused the refresh credential itself: the computer's pairing login expired, or the computer was unbound
+    from the phone (Valley answers both the same way). Only `timetrace cloud login` brings it back. The credentials stay
+    in the Keychain: the next login reuses their runner id."""
+
+
+def refresh_refused(exc: Exception) -> bool:
+    """A refresh Valley answered with its own 401 envelope (40100 for `/runner-auth/refresh`; 40101 / 40102 for the
+    account refresh). No answer, a 5xx, or a 401 without Valley's envelope (a proxy, a captive portal) is not one."""
+    return isinstance(exc, CloudError) and exc.status == 401 and 40100 <= exc.code <= 40199
+
+
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused: %s" % msg, headers, fp)
