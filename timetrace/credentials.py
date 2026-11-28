@@ -14,6 +14,13 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from timetrace.cloud import LoginExpired, refresh_refused
+
+# A refresh credential Valley refused is not sent again for this long, doubling up to the cap: it cannot come back,
+# only `timetrace cloud login` (a new credential in the Keychain) does, and that is used at the next token() call.
+REFUSED_RETRY_FIRST_SECONDS = 300
+REFUSED_RETRY_MAX_SECONDS = 3600
+
 
 def _hardware_identity() -> Optional[str]:
     try:
@@ -164,6 +171,8 @@ class SessionManager:
         self._access_token = str((self.credentials or {}).get("access_token") or "")
         self._expires_at = int((self.credentials or {}).get("expires_at") or 0)
         self._lock = threading.RLock()
+        # The refresh credential Valley refused: {"token", "error" (message, status, code, reason), "retry_at", "delay"}.
+        self._refused: Optional[Dict[str, Any]] = None
 
     def invalidate_access(self) -> None:
         # A rejected access token is not proof that the device was revoked.
@@ -184,10 +193,27 @@ class SessionManager:
         if not self.credentials:
             raise RuntimeError("computer is not paired; run `timetrace cloud login`")
         if not self._access_token or self._expires_at <= int(self.clock()) + 30:
+            refresh_token = self.credentials["refresh_token"]
+            refused = self._refused
+            if refused is not None and refused["token"] != refresh_token:
+                refused = self._refused = None  # `timetrace cloud login` stored a new credential
+            if refused is not None and self.clock() < refused["retry_at"]:
+                raise LoginExpired(*refused["error"])
             request_key = str(self.credentials.get("pending_refresh_key") or uuid.uuid4())
             self.credentials["pending_refresh_key"] = request_key
             self.store.save(self.credentials)
-            refreshed = self.cloud.refresh(self.credentials["refresh_token"], request_key)
+            try:
+                refreshed = self.cloud.refresh(refresh_token, request_key)
+            except Exception as exc:
+                if not refresh_refused(exc):
+                    raise  # no answer, or not a refusal: the credential may still be good
+                delay = (REFUSED_RETRY_FIRST_SECONDS if refused is None
+                         else min(REFUSED_RETRY_MAX_SECONDS, refused["delay"] * 2))
+                error = (str(exc), exc.status, exc.code, exc.reason)
+                self._refused = {"token": refresh_token, "error": error,
+                                 "retry_at": self.clock() + delay, "delay": delay}
+                raise LoginExpired(*error) from exc
+            self._refused = None
             self.store.save(refreshed)
             self._access_token = str(refreshed["access_token"])
             self._expires_at = int(self.clock()) + int(refreshed.get("expires_in") or 900)

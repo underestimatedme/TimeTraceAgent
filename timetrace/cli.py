@@ -24,7 +24,7 @@ from timetrace import (__version__, audit, checks, config, folder, health, limit
 from timetrace.agent import PROTOCOL_VERSION, Agent, install_stop_handlers, restore_handlers
 from timetrace.sleepguard import SleepGuard
 from timetrace.checkpoints import WORK_SESSION_PREFIX
-from timetrace.cloud import CloudClient, CloudError
+from timetrace.cloud import CloudClient, CloudError, LoginExpired
 from timetrace.credentials import CredentialStore, SessionManager, device_identity
 from timetrace.db import Database
 from timetrace.local_sessions import Importer as LocalSessionImporter
@@ -1171,13 +1171,41 @@ def cmd_agent_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+# Doctor waits this long for Valley's answer to its one refresh.
+DOCTOR_CLOUD_TIMEOUT_SECONDS = 10
+
+
+def _pairing_status(cfg: Dict[str, Any]):
+    """The doctor's 配对 line and whether the computer counts as paired. Credentials in the Keychain are not enough:
+    Valley is asked once (one refresh, under the session lock a running Runner shares, so it picks up the rotated
+    credential). Only a refresh Valley itself refused (401) is an expired login; no answer, a 5xx or any other error
+    leaves the binding standing and says the check did not happen."""
+    store = CredentialStore()
+    credentials = store.load()
+    if credentials is None:
+        return "未完成 → 运行 timetrace cloud login", False
+    if not isinstance(credentials, dict) or not credentials.get("refresh_token"):
+        return "本机绑定记录不完整 → 运行 timetrace cloud login 重新绑定", False
+    try:
+        cloud = _cloud(cfg)
+        cloud.timeout = DOCTOR_CLOUD_TIMEOUT_SECONDS
+        SessionManager(store, cloud).token()
+    except LoginExpired:
+        return "登录已过期或已在手机上解绑 → 运行 timetrace cloud login 重新绑定（本机凭据已保留，沿用原电脑记录）", False
+    except CloudError as exc:
+        return "已完成；这次没能向服务器确认登录（HTTP %d），不代表登录已过期" % exc.status, True
+    except Exception as exc:
+        return "已完成；这次没能连上服务器确认登录（%s），不代表登录已过期" % exc.__class__.__name__, True
+    return "已完成，服务器已确认登录有效", True
+
+
 def cmd_agent_doctor(args: argparse.Namespace) -> int:
     home, cfg, db = _open(args)
     user_home = Path.home()
     cfg, resolutions = _discover_tools(home, user_home)
-    paired = CredentialStore().load() is not None
     print("Valley: %s" % cfg["cloud_base_url"])
-    print("配对: %s" % ("已完成" if paired else "未完成 → 运行 timetrace cloud login"))
+    pairing, paired = _pairing_status(cfg)
+    print("配对: %s" % pairing)
     for line in _runner_lines(home, user_home):
         print(line)
     print(_local_sessions_line(home))

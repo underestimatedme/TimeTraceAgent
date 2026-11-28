@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from timetrace import __version__
-from timetrace.cloud import CloudError
+from timetrace.cloud import CloudError, LoginExpired
 from timetrace.db import HOLD_CONFIRMED, HOLD_LEGACY_REFUSED, OUTBOX_REFUSED_PAUSE_AFTER, Database
 from timetrace import (approvals, audit, checks, dev_status, folder, local_sessions, pause, quota, results,
                        run_facts, runner_state, sync, usage, worktree)
@@ -83,6 +83,12 @@ DISK_ERROR_GB = 1.0
 VERSION_REJECTED_CODE = 42210
 # Claim outcomes after which the loop only does upkeep and waits.
 HOLD_OUTCOMES = ("idle", "paused", "disk_full")
+# Claim outcomes after which the loop waits for `timetrace cloud login` (checked every minute, without a restart).
+LOGIN_OUTCOMES = ("revoked", "unpaired", "login_expired")
+# Written once when Valley refuses the refresh credential, and once when a login works again.
+LOGIN_EXPIRED_LOG = ("电脑登录已过期或已在手机上解绑：服务器拒绝续期，暂停领取任务和上报。"
+                     "运行 timetrace cloud login 重新绑定；本机凭据已保留，绑定后自动恢复，无需重启 Runner。")
+LOGIN_RESTORED_LOG = "电脑登录已恢复，继续领取任务和上报。"
 # The message of a run the user interrupted from the phone.
 INTERRUPTED_MESSAGE = "已按你的要求中断，改动保留在工作副本里"
 # The instruction a resumed (previously interrupted) job continues with.
@@ -351,6 +357,9 @@ class Agent:
         # Called once when Valley says this computer's binding was revoked
         # (unbound from the phone): the caller forgets the local credentials.
         self._on_revoked = on_revoked or (lambda: None)
+        # Valley refused the refresh credential (LoginExpired): logged once, until a token works again.
+        self._login_expired = False
+        self._login_lock = threading.Lock()
         # Shutdown: once set, nothing new is claimed or spawned, and the
         # cancel event of every running job is set (its process group killed).
         self._stop = threading.Event()
@@ -555,9 +564,11 @@ class Agent:
                                     inventory_tools=len(current[1]),
                                     inventory_outbox_reported="outbox" in ((extras or {}).get("health") or {}))
                 self.log("inventory pushed: %d workspaces, %d tools" % (len(current[0]), len(current[1])))
+                self._note_login_works()
             except Exception as exc:
                 self._note_cloud_error(exc, "inventory")
-                self.log("inventory push failed: %s" % exc.__class__.__name__)
+                if not isinstance(exc, LoginExpired):
+                    self.log("inventory push failed: %s" % exc.__class__.__name__)
 
     def _refresh_work_session_retention(self, now: float) -> None:
         lookup = getattr(self.cloud, "work_session_retention", None)
@@ -620,7 +631,7 @@ class Agent:
     def _start_local_sessions(self) -> None:
         """One import round on its own thread, so a large first scan never holds up the heartbeat, a claim or a run.
         Never two rounds at once; nothing at all while the switch is off."""
-        if self._local_sessions is None or not self._local_session_import:
+        if self._local_sessions is None or not self._local_session_import or self._login_expired:
             return
         if not callable(getattr(self.cloud, "post_local_sessions", None)):
             return
@@ -782,10 +793,30 @@ class Agent:
             runner_state.record(self.home, reset_credits=entries)
 
     def _note_cloud_error(self, exc: Exception, where: str) -> None:
+        if self._note_login_expired(exc):
+            return
         if where == "renew":
             self.log("renew failed: %s: %s" % (type(exc).__name__, str(exc)[:200]))
         if isinstance(exc, CloudError) and exc.code == VERSION_REJECTED_CODE:
             audit.record(self.home, "version_rejected", where=where, message=str(exc)[:200])
+
+    def _note_login_expired(self, exc: Exception) -> bool:
+        """True when `exc` says Valley refused the refresh credential. The first one is logged; later ones (every call
+        that needs a token fails the same way, without asking Valley again for a while) are not."""
+        if not isinstance(exc, LoginExpired):
+            return False
+        with self._login_lock:
+            first, self._login_expired = not self._login_expired, True
+        if first:
+            self.log(LOGIN_EXPIRED_LOG)
+        return True
+
+    def _note_login_works(self) -> None:
+        """A request with a fresh token succeeded: after an expired login (a new `timetrace cloud login`), say so once."""
+        with self._login_lock:
+            restored, self._login_expired = self._login_expired, False
+        if restored:
+            self.log(LOGIN_RESTORED_LOG)
 
     def run_once(self) -> str:
         if self.remote_config is not None and self.remote_config(self, False):
@@ -796,8 +827,9 @@ class Agent:
         return self.handle(claim)
 
     def _next_claim(self):
-        """A claim, or "revoked" / "unpaired" / "idle" / "paused" (local
-        pause, running jobs continue) / "disk_full" (self-check error)."""
+        """A claim, or "revoked" (Valley refused the access token) / "login_expired" (Valley refused the refresh
+        credential: `timetrace cloud login`) / "unpaired" / "idle" / "paused" (local pause, running jobs continue) /
+        "disk_full" (self-check error)."""
         try:
             try:
                 self.flush_outbox()
@@ -814,6 +846,8 @@ class Agent:
         except CloudError as exc:
             if exc.status == 401:
                 self._on_revoked()
+                if self._note_login_expired(exc):
+                    return "login_expired"
                 if not getattr(self, "_auth_failure_reported", False):
                     self.log("刻迹连接授权失败，已暂停领取任务；保留本机凭据并尝试刷新登录。此状态不代表电脑断网或已解绑。")
                     self._auth_failure_reported = True
@@ -824,6 +858,7 @@ class Agent:
                 return "unpaired"
             raise
         self._auth_failure_reported = False
+        self._note_login_works()
         return claim or "idle"
 
     @staticmethod
@@ -2500,7 +2535,7 @@ class Agent:
                     outcome = self.run_once()
                     backoff = interval
                     self._loop_errors.clear()
-                    if outcome in ("revoked", "unpaired"):
+                    if outcome in LOGIN_OUTCOMES:
                         # Wait for `timetrace cloud login`; the access_token callable
                         # picks up new credentials without restarting the service.
                         self._stop.wait(60)
@@ -2581,7 +2616,7 @@ class Agent:
                     backoff = min(60, max(interval, backoff * 2))
                     continue
                 self._loop_errors.clear()
-                if claim in ("revoked", "unpaired"):
+                if claim in LOGIN_OUTCOMES:
                     self._stop.wait(60)
                     continue
                 if claim in HOLD_OUTCOMES:
