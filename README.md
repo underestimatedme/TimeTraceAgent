@@ -4,6 +4,10 @@
 
 命令是 `timetrace`，短名 `tts`，保留兼容入口 `tta`，三者完全等价。Python 3.9+，目前支持 macOS；浏览器验收使用安装包声明的 Playwright 依赖，首次使用时下载 Chromium。Apache-2.0 许可（见 `LICENSE`）；安全问题请按 `SECURITY.md` 私下报告。
 
+## 0.6.15：电脑登录过期时直接说明
+
+服务器拒绝续期时（电脑登录已过期，或已在手机上解绑），`daemon.log` 只写一次，并提示运行 `timetrace cloud login` 重新绑定，不再每分钟写 `inventory push failed`。`timetrace agent doctor` 会向服务器确认一次登录，不再只凭钥匙串里有凭据就显示「配对: 已完成」。本机凭据保留，重新绑定后 Runner 自动恢复，不需要重启。不需要更新服务端。详见 [0.6.15 发布说明](docs/releases/0.6.15.md)。
+
 ## 0.6.14：在 TimeTrace 回答 AI 的提问
 
 Claude Code 在派发的任务里用 AskUserQuestion 提问时，问题会出现在网页工作项里，你选好的回答会交给 Claude，它接着做。AI 的问题总是交给你回答，本机规则不会替你回答；不回答或超时时，Claude 会被提示不要替你选择。发布前没有在真实的 Claude 进程上实测这一问答，测试使用仓库内模拟的 Claude 进程；升级后可在网页「电脑与 Agent」用「试跑一次」核对。使用前需要更新配套的 TimeTrace 用户控制台和 Valley。详见 [0.6.14 发布说明](docs/releases/0.6.14.md)。
